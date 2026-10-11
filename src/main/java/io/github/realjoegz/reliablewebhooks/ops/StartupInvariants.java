@@ -15,6 +15,8 @@ import java.util.Properties;
 import javax.sql.DataSource;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.env.Environment;
+import org.springframework.core.env.Profiles;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
@@ -30,20 +32,26 @@ public class StartupInvariants implements InitializingBean {
   private static final List<String> PROXY_HOST_PROPERTIES =
       List.of("http.proxyHost", "https.proxyHost", "socksProxyHost");
 
+  /** The profile for tests and docker compose, where the receiver is not on a public address. */
+  static final String UNSAFE_LOCAL = "unsafe-local";
+
   private final WebhooksProperties properties;
   private final SessionSettingsRepository sessions;
   private final DataSource api;
   private final DataSource worker;
+  private final Environment environment;
 
   StartupInvariants(
       WebhooksProperties properties,
       SessionSettingsRepository sessions,
       @Qualifier("apiDataSource") DataSource api,
-      @Qualifier("workerDataSource") DataSource worker) {
+      @Qualifier("workerDataSource") DataSource worker,
+      Environment environment) {
     this.properties = properties;
     this.sessions = sessions;
     this.api = api;
     this.worker = worker;
+    this.environment = environment;
   }
 
   @Override
@@ -54,7 +62,8 @@ public class StartupInvariants implements InitializingBean {
             sessions.read(api),
             sessions.read(worker),
             exitsOnOutOfMemoryError(),
-            System.getProperties());
+            System.getProperties(),
+            environment.acceptsProfiles(Profiles.of(UNSAFE_LOCAL)));
     if (!violations.isEmpty()) {
       throw new IllegalStateException(
           "Startup invariants violated:\n  " + String.join("\n  ", violations));
@@ -66,7 +75,8 @@ public class StartupInvariants implements InitializingBean {
       SessionSettings apiSession,
       SessionSettings workerSession,
       boolean exitsOnOutOfMemoryError,
-      Properties systemProperties) {
+      Properties systemProperties,
+      boolean unsafeLocal) {
     List<String> violations = new ArrayList<>();
 
     String adminToken = properties.adminToken();
@@ -84,6 +94,26 @@ public class StartupInvariants implements InitializingBean {
       violations.add(
           "webhooks.delivery.lease must be at least the attempt deadline plus %d s"
               .formatted(LEASE_MARGIN.toSeconds()));
+    }
+    // A request that starts just before the start cutoff can take the whole attempt deadline.
+    // Its result is recorded after that and before the finalize cutoff, which lies inside the
+    // lease.
+    if (delivery.startCutoff().plus(delivery.attemptDeadline()).compareTo(delivery.finalizeCutoff())
+        > 0) {
+      violations.add(
+          "webhooks.delivery.start-cutoff plus the attempt deadline must not be above the finalize"
+              + " cutoff");
+    }
+    if (delivery.finalizeCutoff().compareTo(delivery.lease()) >= 0) {
+      violations.add("webhooks.delivery.finalize-cutoff must be below the lease");
+    }
+    // With no attempt allowed, every delivery is dead-lettered by its first claim. With no room
+    // for an attempt, the replica never claims.
+    if (delivery.maxAttempts() < 1) {
+      violations.add("webhooks.delivery.max-attempts must be at least 1");
+    }
+    if (delivery.maxInFlight() < 1) {
+      violations.add("webhooks.delivery.max-in-flight must be at least 1");
     }
 
     violations.addAll(
@@ -107,6 +137,19 @@ public class StartupInvariants implements InitializingBean {
     }
     if (!proxyProperties.isEmpty()) {
       violations.add("JVM proxy properties must not be set: " + String.join(", ", proxyProperties));
+    }
+
+    if (!unsafeLocal) {
+      if (!properties.ssrf().allowCidrs().isEmpty()) {
+        violations.add(
+            "webhooks.ssrf.allow-cidrs must be empty unless the %s profile is active"
+                .formatted(UNSAFE_LOCAL));
+      }
+      if (properties.ssrf().allowHttp()) {
+        violations.add(
+            "webhooks.ssrf.allow-http must be false unless the %s profile is active"
+                .formatted(UNSAFE_LOCAL));
+      }
     }
 
     return violations;

@@ -2,6 +2,7 @@ package io.github.realjoegz.reliablewebhooks;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -29,8 +30,13 @@ import org.springframework.stereotype.Repository;
  * :t}. The tables with tenant data are all tables but {@code tenant}, whose rows are addressed by
  * their own id. An {@code INSERT} that only supplies values is left out: it creates a row and can
  * neither read nor change a row of another tenant.
+ *
+ * <p>The repositories of the worker and of the jobs are left out by class. No tenant calls them:
+ * they serve every tenant, and what the worker may write is decided by the lease token.
  */
 class SqlTenantScopeTest {
+
+  private static final Set<Class<?>> WORKER_AND_JOB_REPOSITORIES = Set.of(DeliveryRepository.class);
 
   private static final Path MIGRATIONS = Path.of("src/main/resources/db/migration");
   private static final Pattern CREATE_TABLE = Pattern.compile("CREATE TABLE (\\w+)");
@@ -118,9 +124,12 @@ class SqlTenantScopeTest {
         new ClassPathScanningCandidateComponentProvider(false);
     scanner.addIncludeFilter(new AnnotationTypeFilter(Repository.class));
     List<Class<?>> repositories = new ArrayList<>();
-    for (BeanDefinition repository :
+    for (BeanDefinition candidate :
         scanner.findCandidateComponents(ReliableWebhooksApplication.class.getPackageName())) {
-      repositories.add(Class.forName(repository.getBeanClassName()));
+      Class<?> repository = Class.forName(candidate.getBeanClassName());
+      if (!WORKER_AND_JOB_REPOSITORIES.contains(repository)) {
+        repositories.add(repository);
+      }
     }
 
     Map<String, String> statements = new LinkedHashMap<>();

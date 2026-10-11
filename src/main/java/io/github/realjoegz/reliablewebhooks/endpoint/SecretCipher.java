@@ -32,7 +32,7 @@ public class SecretCipher {
 
   private final SecretKey key;
 
-  SecretCipher(WebhooksProperties properties) {
+  public SecretCipher(WebhooksProperties properties) {
     String configured = properties.secretEncryptionKey();
     Assert.isTrue(isUsableKey(configured), KEY_REQUIREMENT);
     this.key = new SecretKeySpec(Base64.getDecoder().decode(configured), "AES");

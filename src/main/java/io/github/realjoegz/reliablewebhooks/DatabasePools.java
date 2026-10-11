@@ -45,6 +45,16 @@ public class DatabasePools {
     return new TransactionTemplate(new JdbcTransactionManager(api));
   }
 
+  @Bean
+  JdbcClient workerJdbc(@Qualifier("workerDataSource") DataSource worker) {
+    return JdbcClient.create(worker);
+  }
+
+  @Bean
+  TransactionTemplate workerTransactions(@Qualifier("workerDataSource") DataSource worker) {
+    return new TransactionTemplate(new JdbcTransactionManager(worker));
+  }
+
   private static HikariDataSource pool(String name, Database database, Pool bounds) {
     Assert.hasText(database.url(), "webhooks.database.url must be set");
 

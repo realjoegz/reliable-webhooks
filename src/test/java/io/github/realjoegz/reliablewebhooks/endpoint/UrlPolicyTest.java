@@ -3,6 +3,8 @@ package io.github.realjoegz.reliablewebhooks.endpoint;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
+import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
+import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Ssrf;
 import io.github.realjoegz.reliablewebhooks.endpoint.UrlPolicy.Verdict;
 import io.github.realjoegz.reliablewebhooks.harness.StubDns;
 import io.github.realjoegz.reliablewebhooks.http.AddressPolicy;
@@ -10,6 +12,7 @@ import io.github.realjoegz.reliablewebhooks.http.DnsLookups;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -23,11 +26,14 @@ class UrlPolicyTest {
 
   private static final String HOST = "hooks.example.com";
   private static final UUID TENANT = UUID.randomUUID();
+  private static final WebhooksProperties NO_ALLOWANCE =
+      new WebhooksProperties(null, null, null, null, null, new Ssrf(List.of(), false));
 
   private final StubDns dns = new StubDns();
   private final MeterRegistry meters = new SimpleMeterRegistry();
-  private final DnsLookups lookups = new DnsLookups(dns, new AddressPolicy(), meters);
-  private final UrlPolicy policy = new UrlPolicy(lookups);
+  private final DnsLookups lookups =
+      new DnsLookups(dns, new AddressPolicy(NO_ALLOWANCE, meters), meters);
+  private final UrlPolicy policy = new UrlPolicy(lookups, false);
 
   // The host of nearly every URL below is public, so a URL is refused for its form alone.
   @BeforeEach
@@ -71,6 +77,44 @@ class UrlPolicyTest {
       })
   void urlThatIsNotAnHttpsUrlWithAHostIsRefusedWithoutALookup(String url) {
     assertRefusedWithoutALookup(url);
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "http://hooks.example.com:8080/hook",
+        "HTTP://hooks.example.com:1024/hook",
+        "http://hooks.example.com:443/hook",
+        "https://hooks.example.com/hook"
+      })
+  void policyThatTakesHttpAllowsItOnTheSamePortsAsHttps(String url) {
+    UrlPolicy takesHttp = new UrlPolicy(lookups, true);
+
+    assertThat(takesHttp.check(TENANT, url)).isEqualTo(Verdict.ALLOWED);
+  }
+
+  // Without a port, an http URL means port 80, which is below the ports that are allowed.
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "http://hooks.example.com/hook",
+        "http://hooks.example.com:80/hook",
+        "http://user@hooks.example.com:8080/hook",
+        "ftp://hooks.example.com:8080/hook"
+      })
+  void policyThatTakesHttpKeepsEveryOtherRule(String url) {
+    UrlPolicy takesHttp = new UrlPolicy(lookups, true);
+
+    assertThat(takesHttp.check(TENANT, url)).isEqualTo(Verdict.NOT_ALLOWED);
+    assertThat(lookupsMade()).isZero();
+  }
+
+  @Test
+  void policyThatTakesHttpStillRefusesAHostWithAPrivateAddress() {
+    UrlPolicy takesHttp = new UrlPolicy(lookups, true);
+
+    assertThat(takesHttp.check(TENANT, "http://127.0.0.1:8080/hook"))
+        .isEqualTo(Verdict.NOT_ALLOWED);
   }
 
   @ParameterizedTest

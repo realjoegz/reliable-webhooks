@@ -1,0 +1,6 @@
+# What a replica under test is allowed that production is not: FaultReceiver listens on the
+# loopback address and speaks plain http.
+webhooks:
+  ssrf:
+    allow-cidrs: 127.0.0.1/32
+    allow-http: true

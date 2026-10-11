@@ -1,13 +1,16 @@
 package io.github.realjoegz.reliablewebhooks.harness;
 
 import java.util.Map;
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.boot.test.util.TestPropertyValues;
 import org.springframework.context.ApplicationContextInitializer;
 import org.springframework.context.ConfigurableApplicationContext;
 
 /**
  * The settings a replica under test needs beyond the shipped configuration. As a context
- * initializer it applies them to a replica that runs inside the test JVM.
+ * initializer it applies them to a replica that runs inside the test JVM, and keeps the delivery
+ * worker of that replica from starting with it.
  */
 public final class ReplicaSettings
     implements ApplicationContextInitializer<ConfigurableApplicationContext> {
@@ -20,18 +23,35 @@ public final class ReplicaSettings
   private static final String SECRET_ENCRYPTION_KEY =
       "c2VjcmV0LWtleS1mb3ItaW50ZWdyYXRpb24tdGVzdHM=";
 
-  public static Map<String, String> properties() {
+  /** The settings of a replica with the given id, which is also its application_name. */
+  public static Map<String, String> properties(String replicaId) {
     return Map.of(
-        "webhooks.database.url", jdbcUrlAs(IN_PROCESS_REPLICA),
-        "webhooks.database.username", TestDatabase.username(),
-        "webhooks.database.password", TestDatabase.password(),
-        "webhooks.admin-token", ADMIN_TOKEN,
-        "webhooks.secret-encryption-key", SECRET_ENCRYPTION_KEY);
+        "webhooks.replica-id",
+        replicaId,
+        "webhooks.database.url",
+        jdbcUrlAs(replicaId),
+        "webhooks.database.username",
+        TestDatabase.username(),
+        "webhooks.database.password",
+        TestDatabase.password(),
+        "webhooks.admin-token",
+        ADMIN_TOKEN,
+        "webhooks.secret-encryption-key",
+        SECRET_ENCRYPTION_KEY);
   }
 
   @Override
   public void initialize(ConfigurableApplicationContext context) {
-    TestPropertyValues.of(properties()).applyTo(context);
+    TestPropertyValues.of(properties(IN_PROCESS_REPLICA)).applyTo(context);
+    context.addBeanFactoryPostProcessor(ReplicaSettings::leaveTheWorkerToTheTests);
+  }
+
+  // Spring starts a lifecycle bean only if it is a singleton. As prototypes, the worker lifecycle
+  // and its poller are not started with the replica, and ReplicaWorker gets a new pair of them
+  // for every start.
+  private static void leaveTheWorkerToTheTests(ConfigurableListableBeanFactory beans) {
+    beans.getBeanDefinition("workerLifecycle").setScope(BeanDefinition.SCOPE_PROTOTYPE);
+    beans.getBeanDefinition("deliveryPoller").setScope(BeanDefinition.SCOPE_PROTOTYPE);
   }
 
   private static String jdbcUrlAs(String applicationName) {

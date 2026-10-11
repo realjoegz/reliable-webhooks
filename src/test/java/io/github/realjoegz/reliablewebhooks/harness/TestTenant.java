@@ -35,8 +35,15 @@ public record TestTenant(UUID id, String apiKey) {
     return "key-" + UUID.randomUUID();
   }
 
+  /** An endpoint with the signing secret that its registration showed. */
+  public record Endpoint(UUID id, String secret) {}
+
   /** Registers an endpoint for the URL and the event types, and returns its id. */
   public UUID register(RestTestClient http, String url, String... eventTypes) {
+    return registerForSecret(http, url, eventTypes).id();
+  }
+
+  public Endpoint registerForSecret(RestTestClient http, String url, String... eventTypes) {
     Map<String, String> created =
         http.post()
             .uri("/v1/endpoints")
@@ -49,7 +56,7 @@ public record TestTenant(UUID id, String apiKey) {
             .expectBody(new ParameterizedTypeReference<Map<String, String>>() {})
             .returnResult()
             .getResponseBody();
-    return UUID.fromString(created.get("id"));
+    return new Endpoint(UUID.fromString(created.get("id")), created.get("secret"));
   }
 
   /** Sends an event. The body goes out as these bytes. */
@@ -65,6 +72,18 @@ public record TestTenant(UUID id, String apiKey) {
 
   public RestTestClient.ResponseSpec send(RestTestClient http, String idempotencyKey, String body) {
     return send(http, idempotencyKey, body.getBytes(StandardCharsets.UTF_8));
+  }
+
+  /** Sends an event under a key of its own, expects it to be accepted, and returns its id. */
+  public UUID accept(RestTestClient http, String body) {
+    Map<String, String> accepted =
+        send(http, newIdempotencyKey(), body)
+            .expectStatus()
+            .isAccepted()
+            .expectBody(new ParameterizedTypeReference<Map<String, String>>() {})
+            .returnResult()
+            .getResponseBody();
+    return UUID.fromString(accepted.get("id"));
   }
 
   public int eventRows() {

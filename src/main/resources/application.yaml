@@ -43,6 +43,9 @@ management:
 # webhooks.database.url, .username and .password, webhooks.admin-token and
 # webhooks.secret-encryption-key have no default. They come from the environment.
 webhooks:
+  # What this replica writes to the attempt rows it records. A container has its own name as
+  # HOSTNAME. Without one the id is random and lasts as long as the process.
+  replica-id: ${HOSTNAME:${random.uuid}}
   database:
     api:
       max-size: 16
@@ -66,6 +69,14 @@ webhooks:
     attempt-deadline: 15s
     lease: 60s
     start-cutoff: 35s
+    finalize-cutoff: 55s
+    max-attempts: 12
+    max-in-flight: 64
+  ssrf:
+    # Both are for tests and docker compose. The service refuses to start with either of them
+    # set unless the unsafe-local profile is active.
+    allow-cidrs: []
+    allow-http: false
 
 ---
 spring:

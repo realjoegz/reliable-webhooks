@@ -30,12 +30,12 @@ class DnsLookupsTest {
 
   private final StubDns dns = new StubDns();
   private final MeterRegistry meters = new SimpleMeterRegistry();
-  private final DnsLookups lookups = new DnsLookups(dns, new AddressPolicy(), meters);
+  private final DnsLookups lookups = new DnsLookups(dns, new AddressPolicy(List.of()), meters);
 
   // A lookup that is held never answers, however long the wait. The short wait only keeps the
   // tests of that case short.
   private final DnsLookups impatient =
-      new DnsLookups(dns, new AddressPolicy(), meters, Duration.ofMillis(20));
+      new DnsLookups(dns, new AddressPolicy(List.of()), meters, Duration.ofMillis(20));
 
   private final ExecutorService callers = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -66,7 +66,7 @@ class DnsLookupsTest {
   @Test
   void answerWithoutAnAddressIsFailed() {
     try (DnsLookups empty =
-        new DnsLookups(host -> new InetAddress[0], new AddressPolicy(), meters)) {
+        new DnsLookups(host -> new InetAddress[0], new AddressPolicy(List.of()), meters)) {
       assertThat(empty.lookup(TENANT, HOST)).isEqualTo(Refusal.FAILED);
     }
   }
@@ -79,7 +79,7 @@ class DnsLookupsTest {
           throw fault;
         };
 
-    try (DnsLookups broken = new DnsLookups(faulty, new AddressPolicy(), meters)) {
+    try (DnsLookups broken = new DnsLookups(faulty, new AddressPolicy(List.of()), meters)) {
       assertThatThrownBy(() -> broken.lookup(TENANT, HOST))
           .isInstanceOf(IllegalStateException.class)
           .cause()
@@ -192,7 +192,7 @@ class DnsLookupsTest {
   }
 
   private DnsLookups systemLookups() {
-    return new DnsLookups(new SystemHostResolver(), new AddressPolicy(), meters);
+    return new DnsLookups(new SystemHostResolver(), new AddressPolicy(List.of()), meters);
   }
 
   private double count(String result) {

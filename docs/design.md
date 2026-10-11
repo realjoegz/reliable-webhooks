@@ -42,7 +42,7 @@ Packages:
 | `delivery/` | `DeliveryPoller`, `DeliveryWorker`, `DeliveryRepository`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
 | `http/` | `WebhookHttpClient`, `SsrfGuardDnsResolver`, `AddressPolicy`, `DnsLookups`, `Signer` |
 | `ops/` | `WorkerLifecycle`, `StartupInvariants`, `ExpiryJob`, `CancelJob`, `RetentionJob`, `QueueGauges`, `PollerHealth` |
-| test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `TestTenant` |
+| test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `UnsafeLocalReplica`, `ReplicaWorker`, `TestTenant` |
 | test `tools/` | `FailureTableCheck` |
 
 The table names the classes that carry the design. The value types and helpers next to them are not listed.
@@ -319,19 +319,20 @@ WITH eligible AS MATERIALIZED (            -- 1. endpoints this replica may serv
 UPDATE delivery d                          -- 4. lease
 SET attempts = d.attempts + 1,
     lease_token = gen_random_uuid(),
-    next_attempt_at = now() + interval '60 seconds'        -- the lease
+    next_attempt_at = now() + :lease                       -- the lease
 FROM picked p
 WHERE d.id = p.id
 RETURNING d.id, d.tenant_id, d.event_id, d.endpoint_id, d.attempts, d.replays,
           d.lease_token, p.abandoned, p.circuit;
 ```
 
+- **`:lease`** is the configured lease, `webhooks.delivery.lease`, which is 60 s. It is a parameter so that the statement and the startup invariant on the lease read the same value.
 - **Two replicas racing.** `FOR UPDATE SKIP LOCKED` gives each due row to at most one claimer. After commit the row is no longer due, and a claimer whose snapshot predates that commit re-checks the predicate under the lock and skips the row.
 - **Backlog depth is invisible to the claim.** Each eligible endpoint contributes one probe of `delivery_head` and at most one row, whether it has one due delivery or a million. An endpoint with a deep backlog and a fast receiver gets one row per claim, like every other endpoint. Held rows are never scanned, because their endpoints are not in `eligible`.
 - **Cost.** One claim does one index probe per eligible endpoint and locks one head row per endpoint with due work. Rows locked but not picked unlock at commit. The cost grows with the number of active endpoints, not with the queue (limitation 4).
 - **Bulkheads without a release path.** A claim takes at most one delivery per endpoint and four per tenant. `Bulkhead` lists an endpoint as full at 4 in flight and a tenant as full above 12, so the per-replica caps (4 per endpoint, 16 per tenant) are never exceeded.
 - **Abandoned attempts are logged.** For each returned row with `abandoned = true`, the same transaction inserts `delivery_attempt (delivery_id, run, attempt_no = attempts - 1, outcome 'unknown', error 'lease_expired')`. It means the holder recorded no result before its lease ran out, and the request may or may not have arrived.
-- **Poison deliveries.** `attempts` is counted at claim, so a delivery that kills its worker every time still runs out. On the 13th claim the worker dead-letters it (`exhausted`) before the gate and without sending: F1 only, no attempt row.
+- **Poison deliveries.** `attempts` is counted at claim, so a delivery that kills its worker every time still runs out. On the 13th claim the worker dead-letters it (`exhausted`) before the gate and without sending: the finalize transaction with F1 only, and no attempt row.
 
 **Release.** Two steps below give a row back without cost. They use one statement:
 
@@ -365,7 +366,22 @@ No row means the delivery was cancelled or reclaimed, or its endpoint was delete
 **Step 5: classify.**
 - 2xx is success. The status line decides; the body is not part of the outcome.
 - Everything else is a failure and is retried on the schedule: any other status (3xx included, redirects are not followed), any I/O error, the deadline, a response head over the size limits, a DNS timeout, a blocked or unresolvable destination.
+- Once the head of a response has arrived, the attempt has its outcome. A body that is too long, breaks off or is still arriving at the deadline costs the connection, which is closed and not used again. It does not change the outcome.
 - This step picks the next state, the delay and which F3 statement applies.
+
+An attempt that got a response is recorded with its status and no error. An attempt without a response is recorded with one of these errors and no status:
+
+| What happened | `error` in the attempt row | `reason` on the meter |
+|---|---|---|
+| The host resolves to an address that the policy denies | `destination_not_allowed` | `blocked` |
+| The host does not resolve | `destination_not_allowed` | `dns` |
+| The lookup did not answer inside its 2 s | `timeout` | `timeout` |
+| No connection could be made, or the connection ended before it had carried a response head | `connect` | `connect` |
+| The TLS handshake failed | `tls` | `tls` |
+| The attempt deadline passed before a response head had arrived | `deadline` | `deadline` |
+| The response head is over the size limits | `response_too_large` | `response_too_large` |
+
+On the meter a response counts by the class of its status. A status outside 2xx, 3xx and 4xx counts as `http_5xx`.
 
 **Step 6: finalize.** One transaction:
 
@@ -380,10 +396,16 @@ WHERE id = :id AND lease_token = :token;
 
 -- F2: the attempt row
 INSERT INTO delivery_attempt (delivery_id, run, attempt_no, probe, outcome, http_status, error,
-                              remote_addr, started_at, duration_ms, replica) VALUES (...);
+                              remote_addr, started_at, duration_ms, replica)
+VALUES (:id, :run, :attempt_no, false, :outcome, :http_status, :error, :remote_addr::inet,
+        now() - :duration_ms * interval '1 millisecond', :duration_ms, :replica);
 
 -- F3: one of three circuit statements (section 9)
 ```
+
+- `:duration_ms` is how long the request took on the monotonic clock of the replica. `started_at` is that long before the `now()` of the finalize transaction, so `started_at` plus `duration_ms` is the database time at which the attempt was recorded.
+- `:replica` is `webhooks.replica-id`. It defaults to the `HOSTNAME` of the container, and to a random id where there is none.
+- `probe` is `false` until the gate of section 9 exists.
 
 Timing rules:
 
@@ -391,8 +413,8 @@ Timing rules:
 |---|---|---|---|
 | Attempt deadline | 15 s, hard | Covers DNS (2 s wait), connect (3 s), TLS, request and the whole response. A watchdog aborts the request at the deadline, so a drip-fed response cannot outlive it. | `SlowEndpointIsolationIT#drippingResponseIsCutAtDeadline` |
 | Lease | 60 s | `StartupInvariants` requires lease >= deadline + 30 s. | `StartupInvariantsTest` |
-| Start cutoff | 35 s after the claim call began | A worker that could not finish inside its lease does not send. The row stays leased and is reclaimed. | `DeliveryWorkerTest#doesNotSendAfterStartCutoff` (injected monotonic time source) |
-| Finalize retry | Until 55 s after the claim call began, transient errors only | Covers a database restart; after that the row is left for reclaim. | `DatabaseRestartIT` (one request, one `success` row across the restart), `FinalizeRetryTest` |
+| Start cutoff | 35 s after the claim call began | A worker that could not finish inside its lease does not send. The row stays leased and is reclaimed. `StartupInvariants` requires start cutoff + deadline <= finalize cutoff. | `DeliveryWorkerTest#doesNotSendAfterStartCutoff` (injected monotonic time source), `StartupInvariantsTest` |
+| Finalize retry | Until 55 s after the claim call began, transient errors only | Covers a database restart; after that the row is left for reclaim. `StartupInvariants` requires finalize cutoff < lease. | `DatabaseRestartIT` (one request, one `success` row across the restart), `FinalizeRetryTest`, `StartupInvariantsTest` |
 
 - **The lease is liveness, the token is safety.** If a replica stalls past its lease, another replica reclaims and both may send. That is a duplicate with the same `webhook-id`, which at-least-once allows. Only the current token holder can pass F1, so the stale replica's result, attempt row and circuit update all roll back.
 - **Clocks.** Lease expiry is decided by Postgres. The replica's cutoffs use `System.nanoTime()` measured from before the claim was sent, so its view of the lease is always the shorter one. Wall-clock skew between replica and database has no effect, including on the signature timestamp.
@@ -404,6 +426,8 @@ Timing rules:
 
   Anything else, such as a data or constraint error (classes 22, 23), is a bug. It is not retried, it is counted on `webhooks_finalize_errors_total` and logged at error, and the row is left for reclaim.
 
+  A retry starts 200 ms after the failure before it, and none starts after the 55 s.
+
 ## 8. Retry schedule, dead letter, replay
 
 `RetrySchedule.delay(n, random)` is a pure function. After failed attempt `n`, with `d(n) = min(4 h, 10 s * 2^(n-1))`, the wait is `d(n)/2 + random(0, d(n)/2)` (equal jitter).
@@ -412,6 +436,7 @@ Timing rules:
 - The whole schedule spans between 2 h 51 min and 5 h 41 min.
 - The 4 h cap is not reached at twelve attempts. It exists so that raising `max-attempts` cannot produce multi-day waits.
 - `Retry-After` on any failure response is honoured as `max(own delay, min(Retry-After, 1 h))`. It can lengthen a wait up to one hour and can never shorten it.
+- Only a `Retry-After` that is a number of seconds is read. One that is a date counts as absent, because a date would have to be compared with the wall clock of the replica.
 - The schedule is a lower bound. Attempt `n+1` never starts sooner than `d(n)/2` after attempt `n` was recorded. An open circuit can make it later, never earlier.
 
 Dead letter. `dead` is a state of the delivery row, not a second table.
@@ -534,6 +559,8 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 | `webhooks_dns_lookups_total` | `result` = ok, timeout, busy, failed, blocked |
 | `webhooks_ssrf_allowlist_entries` (gauge) | none; must be 0 in production |
 
+`webhooks_delivery_attempts_total` counts attempt rows: an attempt is counted when its finalize has committed, and an abandoned attempt (`unknown`, `lease_expired`) when the claim that found it has. An attempt whose finalize lost its lease is counted on `webhooks_finalize_lost_lease_total` only.
+
 `webhooks_ingest_requests_total` counts a request that the ingest route answered with one of these results, once, when the request is over. `invalid` is a `400`, a `413` or a `422`, and `busy` is a `503`. Nothing else is counted:
 - a request that is refused before it reaches the route, by authentication or for its media type;
 - a request to any other route;
@@ -582,7 +609,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 | `webhook-signature` | `v1,<base64 HMAC-SHA256(secret, "{id}.{timestamp}.{body}")>` |
 
 - The timestamp is inside the MAC input, and the body is the stored bytes.
-- The README ships a reference verifier that rejects timestamps older than 5 minutes. Because the timestamp comes from Postgres, a replica with a wrong wall clock cannot get deliveries rejected.
+- The README ships a reference verifier that rejects a timestamp more than 5 minutes away from the time of the check, whether it is older or lies ahead. Because the timestamp comes from Postgres, a replica with a wrong wall clock cannot get deliveries rejected.
 - After rotation both signatures are sent, space separated, for 24 h. Then the old secret is ignored and later purged. The database clock decides when the overlap ends.
 - A signing secret is `whsec_` plus 32 random bytes in base64, shown once. The 32 bytes are the MAC key.
 - Secrets are encrypted at rest with AES-256-GCM under a key from the environment, with a one-byte key-version prefix. The key is 32 bytes, given in base64. A stored value is the version byte, a random 96-bit nonce, then the ciphertext with its tag.
@@ -594,7 +621,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
   - No cookie store: a `Set-Cookie` from one tenant's endpoint can never reach another tenant's request.
   - No automatic retries: the library default would re-send on 429 and 503, which would be a second request for one attempt row.
   - No compression: no `Accept-Encoding` is sent, so a compressed response is never inflated.
-- **Bounded response.** The status line and each header line are limited to 8 KiB and a response to 100 headers. Exceeding either fails the attempt as `response_too_large`. The body is read through a bounded stream. At 64 KiB the connection is aborted, not drained.
+- **Bounded response.** The status line and each header line are limited to 8 KiB, counted with the two bytes that end a line, and a response to 100 headers. Exceeding either fails the attempt as `response_too_large`. The body is read through a bounded stream. At 64 KiB the connection is aborted, not drained.
 - **Connect-time check.** `SsrfGuardDnsResolver` is the client's `DnsResolver`. The addresses it returns are the addresses the socket connects to, so there is no gap between check and use, and DNS rebinding is covered. If any resolved address is blocked, the whole lookup is rejected. Reused keep-alive connections were validated when they were opened.
 - **Address policy.** An explicit CIDR list, not JDK predicates.
   - IPv4 deny: 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4.
@@ -615,7 +642,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
   - `busy` is this replica's admission decision, not evidence about the endpoint. At delivery the row is released with a 2 s delay: no attempt is consumed, no attempt row is written and the circuit is not touched (section 7). At registration it is `429 lookup_busy`.
   - A timeout is different: the lookup was admitted and the endpoint's DNS did not answer. At delivery it is a failed attempt that counts toward the breaker, so a tarpit endpoint is down to one lookup per probe interval after five failures. At registration it is the same 422.
   - The tenant id reaches the resolver through the one `ThreadLocal` in the codebase, set and cleared in `WebhookHttpClient.send`.
-- **Local allowance.** `webhooks.ssrf.allow-cidrs` and plain `http` exist for tests and docker compose. `StartupInvariants` refuses to start with either set unless the `unsafe-local` profile is active, and the allowlist size is exported as a gauge.
+- **Local allowance.** `webhooks.ssrf.allow-cidrs` and plain `http` (`webhooks.ssrf.allow-http`) exist for tests and docker compose. `StartupInvariants` refuses to start with either set unless the `unsafe-local` profile is active, and the allowlist size is exported as a gauge. An allowed range lets its addresses through at registration and at connect. With `http` allowed, an `http` URL must name its port, which has to be 443 or 1024 to 65535 like any other.
 
 **11.5 Limits.**
 
@@ -814,6 +841,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
     - A probe that wins the gate and is then refused a lookup wastes that probe slot.
 30. **No storage quota.** The byte-weighted charge bounds what a tenant can store per second (section 12). There is no cap on stored bytes or on pending rows beyond rate times retention.
 31. **The delivery list is narrow.** It needs an endpoint and a state. There is no tenant-wide listing, and the attempt log is read one run at a time.
+32. **A request on a connection that the subscriber has just closed fails.** The client keeps connections for reuse and repeats no request by itself, so such a request is a failed attempt and waits for its retry. A connection that was idle for more than 2 s is tested before it is used again, which leaves the short window after a request.
 
 ## 15. Operations
 
@@ -823,6 +851,8 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 - `default_transaction_isolation` is `read committed`.
 - `synchronous_commit` is not `off`.
 - Lease >= attempt deadline + 30 s.
+- Start cutoff + attempt deadline <= finalize cutoff, and finalize cutoff < lease. A request that starts at the start cutoff then ends inside its lease, with time left to record it.
+- `max-attempts` and `max-in-flight` are at least 1. With 0 attempts every delivery would be dead-lettered by its first claim, and with no room the replica would never claim.
 - For each pool:
   - the borrow wait, `connectTimeout` and `socketTimeout` are set, and `tcpKeepAlive` is on;
   - `lock_timeout < statement_timeout < socketTimeout`;
@@ -913,23 +943,28 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
 Rules:
 
 - No test sleeps to "let things happen". Waits are condition polls with a timeout.
-- **Time is aged in the data, not in the clock.** `Rows.age(...)` subtracts an interval from the time columns of a row: `next_attempt_at`, `expires_at`, `completed_at`, `next_probe_at`, `refilled_at`, `prev_secret_expires_at`. Production code and `now()` run unchanged. This drives lease expiry, the twelve-step schedule, the probe interval, the 72 h budget and retention.
+- **Time is aged in the data, not in the clock.** `Rows` ages a row: it subtracts an interval from its time columns, which are `next_attempt_at`, `expires_at`, `completed_at`, `next_probe_at`, `refilled_at` and `prev_secret_expires_at`. Production code and `now()` run unchanged. This drives lease expiry, the twelve-step schedule, the probe interval, the 72 h budget and retention.
 - **A negative claim needs a witness.** "Nothing was claimed" or "no attempt was used" is asserted only after something observable proves the poller ran in the state under test. The witness is either a canary (a delivery to another endpoint or tenant, ingested after that state was reached, has succeeded) or a positive signal such as `poller_stopped`.
 - **Ordering assertions, not clocks.** Where a test is about who goes first, it reads the receiver's request log.
-- Integration tests run with production retry, breaker, lease and timeout settings. The test-profile differences are the `unsafe-local` allowance for the loopback receiver with its `http` scheme, and in `TracingIT` only, the sampler probability.
+- Integration tests run with production retry, breaker, lease and timeout settings. The test-profile differences are the `unsafe-local` allowance for the loopback receiver with its `http` scheme, in the classes that deliver to the receiver, and in `TracingIT` only, the sampler probability.
+- Three tests of `WebhookHttpClientIT` wait for a time bound to end a request, and their clients have a short one: an attempt deadline of 500 ms in the two that are cut at the deadline, and a lookup wait of 20 ms in the one whose lookup does not answer. The client with the short deadline is built from settings, as the application builds its client, so the bound that cuts those requests is `attempt-deadline`. A replica under test always runs with the shipped values.
+- **A replica inside the test JVM does not start its worker by itself.** The replicas of a build share one database, so a worker that ran all the time would take the deliveries of tests that are about something else, and those of a test that has to claim them itself. A test that wants deliveries sent starts the worker of its replica, or builds the pollers it needs. The worker is stopped when the test ends. One test is the exception: `WorkerLifecycleIT#replicaStartsItsWorkerByItselfAndStopsItWhenItCloses` starts a second replica the way the application starts, with nothing taken from Spring, and closes it before it ends. The attempt is recorded under the id of that replica, which shows that Spring started its worker. Its pools hold 4 connections each, because the replicas that the build keeps have theirs open.
+- **Every test of such a replica begins with an empty queue.** The pending deliveries that earlier tests left are deleted first. A worker that a test starts therefore sends the deliveries of that test and no others.
 
 Harness:
 
 | Piece | What it does |
 |---|---|
-| `FaultReceiver` | In-process HTTP server. Per-path scripts: status with optional response headers, delay, hold until released, drip, close without response, redirect, `endlessHeader`, `endlessBody`. Records every request with its headers, counts accepted connections and peak concurrency per path, and for the endless scripts the bytes written and whether the peer closed first. |
+| `FaultReceiver` | In-process HTTP server. Per-path scripts: status with optional response headers, a body of a given length, delay, hold until released, drip, close without response, redirect, `endlessHeader`, `endlessBody`. Records every request with its headers, counts accepted connections and peak concurrency per path, and for the endless scripts the bytes written and whether the peer closed first. |
 | `ReplicaProcess` | Starts the packaged jar as a child JVM against the Testcontainers database, with the replica id as `application_name`. Captures stdout. `kill()` is SIGKILL, `terminate()` is SIGTERM, `exitCode()` waits for the process to end by itself. |
 | `PgWait` | `untilBlocked(sqlFragment, replica)` polls `pg_stat_activity` for a backend of that replica waiting on a lock in a statement containing the fragment. The lock timeout of the replica's pool ends that wait, so the test has that long to act. `untilGone(replica)` waits until its backends have left. |
 | `StubDns` | The resolver behind `DnsLookups` in a replica inside the test JVM, in place of the system resolver: scripted answers per call, or block until released. A name that no test scripted does not resolve. |
 | `TcpProxy` | In-process TCP forwarder between one replica and Postgres. `blackhole()` keeps every existing connection open and relays nothing more on it, ever; new connections are accepted and ignored. `heal()` lets new connections relay again. |
 | `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. |
 | `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection with the replica id as `application_name`, an admin token and a secret-encryption key. |
-| `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings. All such classes share one application context, and so one pair of pools. |
+| `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker of the replica is left to the tests, and the queue is emptied before each test. |
+| `UnsafeLocalReplica` | An `InProcessReplica` with the `unsafe-local` profile and its allowance: plain `http` and the loopback address, where `FaultReceiver` listens. The classes with this annotation share a second application context. |
+| `ReplicaWorker` | Starts and stops the delivery worker of a replica inside the test JVM. Each start gets a `WorkerLifecycle` and a poller of its own from the application context, wired as the application wires them, and runs the start and stop that Spring runs. |
 | `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint and sends an event as that tenant, and counts the tenant's event and delivery rows. |
 
 How each proof is forced.
@@ -953,9 +988,12 @@ How each proof is forced.
   - **K3 in detail.** The delivery is inserted not yet due. The test locks `event`, makes the row due from a second connection, waits until the load is blocked, kills, and releases. The surviving replica is started after the kill.
   - **K4 and K6** use the receiver's hold, not a lock.
   - No hook exists in production code and no timing is assumed. The pool `lock_timeout` values (2 s and 5 s) leave room for a 10 ms poll.
-- **(b) Claim race.** `secondClaimerSkipsLockedRow` runs the real claim on connection A without committing, then on connection B. B returns zero rows without waiting. After A commits, B still gets zero rows. The four-poller test is a volume check on top of this, not the proof.
+- **(b) Claim race.** `secondClaimerSkipsLockedRow` runs the real claim on connection A without committing. A second delivery for the same endpoint is accepted then, and the claim runs on connection B, whose transaction begins with it. B returns without waiting, and with the second delivery only: it saw the due rows and passed over the locked one. B has a lock timeout, so a claim that waited would fail. After both commit, a claim gets zero rows. The four-poller test is a volume check on top of this, not the proof.
 - **(c) One probe.** `oneProbeAdmittedAcrossConcurrentClaimers` runs the gate on connection A uncommitted, sees connection B block on the row, commits A, and asserts B updated zero rows. A second phase runs 4 replicas against a down endpoint and counts exactly one request per aged probe interval.
-- **(d) SSRF.** `rebindingIsBlockedAtConnect` runs without the loopback allowance. `StubDns` answers with a public address at registration and 127.0.0.1 at delivery, where the receiver is listening. It asserts the attempt error, `webhooks_dns_lookups_total{result="blocked"}` (the operator reason), and zero accepted connections. Every other integration test is the control that the receiver is reachable when allowed.
+- **(d) SSRF.** `SsrfIT` runs in the replica without the loopback allowance.
+  - `rebindingIsBlockedAtConnect`: `StubDns` answers with a public address at registration and 127.0.0.1 at delivery, where the receiver is listening. It asserts the attempt error, `webhooks_dns_lookups_total{result="blocked"}` (the operator reason), and zero accepted connections. The control is a connection that the test itself opens to that address afterwards, which the same listener counts. Every integration test that delivers to the receiver is a control too: the receiver is reachable when allowed.
+  - `redirectIsNotFollowed` cannot go through that replica, which reaches no receiver. It sends one request with a `WebhookHttpClient` whose address policy allows the loopback address. The receiver answers with a redirect to another of its paths. The client reports the 302, and the receiver has seen one request. That a 3xx is a failed attempt is the classification of step 5, which `DeliveryWorkerTest` covers.
+  - `WebhookHttpClientIT#hostIsConnectedAtTheAddressThatTheGuardedLookupReturned` sends to a name that only `StubDns` resolves, to the address of the receiver. The request arrives, so the socket connects to the address that the guarded lookup returned. A client that had the name checked and then resolved it again by itself would find no address.
 - **(e) Shutdown.** `GracefulShutdownIT` uses the endpoint bulkhead as the witness.
   1. Five due deliveries for one endpoint; the receiver holds.
   2. Wait until the receiver holds 4 requests. The fifth is due and unclaimed only because the endpoint is full.
@@ -967,7 +1005,7 @@ How each proof is forced.
   - `limitIsExactAcrossReplicas` sets rate 0 and burst 20 and sends 200 requests to 4 replicas, 8 at a time per replica so the request permits never reject. It asserts exactly 20 accepted and that every other response is a well-formed `429 rate_limit_unsatisfiable` problem document without `Retry-After`.
   - `refillIsExact` uses rate 0.01 per second and ages `refilled_at` by 500 s. Exactly 5 are accepted, and the next token is 100 s away.
   - `ninthConcurrentRequestTakesNoConnection` opens eight requests whose bodies are never finished, so each holds a permit before any database work. The ninth gets `429 concurrency_limit`, and the `api` pool's acquire count is unchanged across it. Tenant B is served meanwhile.
-- **(g) Long durations.** The 72 h budget and the schedule are driven by `Rows.age`.
+- **(g) Long durations.** The 72 h budget and the schedule are driven by `Rows`.
   - `RetryScheduleTest` asserts the eleven production windows as a pure function.
   - `exhaustedAfterTwelveAttempts` asserts that each `next_attempt_at` written by finalize lies inside the window for its attempt number, before ageing the row.
 - **(h) Half-open connections.** Both `DatabaseBlackholeIT` tests first make the replica provably busy in a statement, then cut it off.

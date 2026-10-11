@@ -60,16 +60,23 @@ class DatabasePoolsIT {
     assertThat(boundsOf(worker)).isEqualTo(WORKER);
   }
 
+  // The reset also takes away what the driver set after it had connected, among it the
+  // application name that PgWait knows the replica by. The connection is therefore closed at the
+  // end and does not go back into the pool, where a later test would get it.
   @Test
   void resetDoesNotRemoveTheSessionLimits() throws SQLException {
     try (Connection connection = api.getConnection();
         Statement statement = connection.createStatement()) {
-      statement.execute("RESET ALL");
+      try {
+        statement.execute("RESET ALL");
 
-      assertThat(show(statement, "lock_timeout")).isEqualTo(API.lockTimeout());
-      assertThat(show(statement, "statement_timeout")).isEqualTo(API.statementTimeout());
-      assertThat(show(statement, "idle_in_transaction_session_timeout"))
-          .isEqualTo(API.idleInTransactionTimeout());
+        assertThat(show(statement, "lock_timeout")).isEqualTo(API.lockTimeout());
+        assertThat(show(statement, "statement_timeout")).isEqualTo(API.statementTimeout());
+        assertThat(show(statement, "idle_in_transaction_session_timeout"))
+            .isEqualTo(API.idleInTransactionTimeout());
+      } finally {
+        api.evictConnection(connection);
+      }
     }
   }
 
@@ -85,9 +92,11 @@ class DatabasePoolsIT {
         new WebhooksProperties(
             properties.adminToken(),
             properties.secretEncryptionKey(),
+            properties.replicaId(),
             new Database(
                 url, database.username(), database.password(), database.api(), database.worker()),
-            properties.delivery());
+            properties.delivery(),
+            properties.ssrf());
 
     try (HikariDataSource pool = new DatabasePools().apiDataSource(withUrlParameters)) {
       assertThat(boundsOf(pool)).isEqualTo(API);

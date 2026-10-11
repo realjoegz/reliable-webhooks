@@ -2,11 +2,13 @@ package io.github.realjoegz.reliablewebhooks.ops;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Database;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Delivery;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Pool;
+import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Ssrf;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
@@ -17,6 +19,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.mock.env.MockEnvironment;
 
 class StartupInvariantsTest {
 
@@ -24,8 +27,13 @@ class StartupInvariantsTest {
   private static final String SECRET_KEY = base64OfBytes(32);
   private static final Pool API_POOL = pool(Duration.ofSeconds(3), Duration.ofSeconds(10), true);
   private static final Pool WORKER_POOL = pool(Duration.ofSeconds(3), Duration.ofSeconds(15), true);
+  private static final Duration DEADLINE = Duration.ofSeconds(15);
+  private static final Duration LEASE = Duration.ofSeconds(60);
+  private static final Duration START_CUTOFF = Duration.ofSeconds(35);
+  private static final Duration FINALIZE_CUTOFF = Duration.ofSeconds(55);
   private static final Delivery DELIVERY =
-      new Delivery(Duration.ofSeconds(15), Duration.ofSeconds(60), Duration.ofSeconds(35));
+      new Delivery(DEADLINE, LEASE, START_CUTOFF, FINALIZE_CUTOFF, 12, 64);
+  private static final Ssrf NO_ALLOWANCE = new Ssrf(List.of(), false);
   private static final SessionSettings API_SESSION = session(2, 5, 10);
   private static final SessionSettings WORKER_SESSION = session(5, 10, 10);
 
@@ -64,22 +72,59 @@ class StartupInvariantsTest {
         .containsExactly("webhooks.secret-encryption-key must be 32 bytes in base64");
   }
 
+  // The cutoffs of these two are short enough for either lease: a request that starts at 20 s
+  // ends by 35 s, and the finalize cutoff of 40 s is below both leases.
   @Test
   void leaseMayEqualAttemptDeadlinePlusThirtySeconds() {
-    Delivery delivery =
-        new Delivery(Duration.ofSeconds(15), Duration.ofSeconds(45), Duration.ofSeconds(35));
-
-    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, delivery)))
-        .isEmpty();
+    assertThat(violations(delivery(45, 20, 40))).isEmpty();
   }
 
   @Test
   void leaseMustCoverAttemptDeadlinePlusThirtySeconds() {
-    Delivery delivery =
-        new Delivery(Duration.ofSeconds(15), Duration.ofSeconds(44), Duration.ofSeconds(35));
-
-    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, delivery)))
+    assertThat(violations(delivery(44, 20, 40)))
         .containsExactly("webhooks.delivery.lease must be at least the attempt deadline plus 30 s");
+  }
+
+  @Test
+  void requestThatStartsAtTheStartCutoffMayEndAtTheFinalizeCutoff() {
+    assertThat(violations(delivery(60, 35, 50))).isEmpty();
+  }
+
+  // A request that starts just before 35 s can run until 50 s, and from 49 s on no finalize is
+  // tried again.
+  @Test
+  void startCutoffPlusAttemptDeadlineMustNotBeAboveTheFinalizeCutoff() {
+    assertThat(violations(delivery(60, 35, 49)))
+        .containsExactly(
+            "webhooks.delivery.start-cutoff plus the attempt deadline must not be above the"
+                + " finalize cutoff");
+  }
+
+  @Test
+  void finalizeCutoffMayEndOneSecondBeforeTheLease() {
+    assertThat(violations(delivery(60, 35, 59))).isEmpty();
+  }
+
+  @Test
+  void finalizeCutoffMustBeBelowTheLease() {
+    assertThat(violations(delivery(60, 35, 60)))
+        .containsExactly("webhooks.delivery.finalize-cutoff must be below the lease");
+  }
+
+  @Test
+  void atLeastOneAttemptMustBeAllowed() {
+    Delivery noAttempt = new Delivery(DEADLINE, LEASE, START_CUTOFF, FINALIZE_CUTOFF, 0, 64);
+
+    assertThat(violations(noAttempt))
+        .containsExactly("webhooks.delivery.max-attempts must be at least 1");
+  }
+
+  @Test
+  void atLeastOneAttemptMustHaveRoomToRun() {
+    Delivery noRoom = new Delivery(DEADLINE, LEASE, START_CUTOFF, FINALIZE_CUTOFF, 12, 0);
+
+    assertThat(violations(noRoom))
+        .containsExactly("webhooks.delivery.max-in-flight must be at least 1");
   }
 
   @Test
@@ -207,7 +252,8 @@ class StartupInvariantsTest {
                 API_SESSION,
                 WORKER_SESSION,
                 false,
-                new Properties()))
+                new Properties(),
+                false))
         .containsExactly("the JVM must run with -XX:+ExitOnOutOfMemoryError");
   }
 
@@ -230,6 +276,58 @@ class StartupInvariantsTest {
         .containsExactly("JVM proxy properties must not be set: java.net.useSystemProxies");
   }
 
+  @Test
+  void allowlistMustBeEmptyWithoutTheUnsafeLocalProfile() {
+    Ssrf allowlist = new Ssrf(List.of("127.0.0.1/32"), false);
+
+    assertThat(violations(allowlist, false))
+        .containsExactly(
+            "webhooks.ssrf.allow-cidrs must be empty unless the unsafe-local profile is active");
+  }
+
+  @Test
+  void httpMustBeOffWithoutTheUnsafeLocalProfile() {
+    Ssrf http = new Ssrf(List.of(), true);
+
+    assertThat(violations(http, false))
+        .containsExactly(
+            "webhooks.ssrf.allow-http must be false unless the unsafe-local profile is active");
+  }
+
+  @Test
+  void unsafeLocalProfilePermitsTheAllowlistAndHttp() {
+    Ssrf allowance = new Ssrf(List.of("127.0.0.1/32"), true);
+
+    assertThat(violations(allowance, true)).isEmpty();
+  }
+
+  // The same allowance is refused and accepted. Only the active profile of the environment
+  // differs.
+  @Test
+  void unsafeLocalProfileIsReadFromTheEnvironment() {
+    Ssrf allowance = new Ssrf(List.of("127.0.0.1/32"), true);
+    WebhooksProperties properties =
+        properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY, allowance);
+    DataSource api = new DriverManagerDataSource();
+    DataSource worker = new DriverManagerDataSource();
+    SessionSettingsRepository sessions =
+        new SessionSettingsRepository() {
+          @Override
+          public SessionSettings read(DataSource pool) {
+            return pool == worker ? WORKER_SESSION : API_SESSION;
+          }
+        };
+    MockEnvironment production = new MockEnvironment();
+    MockEnvironment unsafeLocal = new MockEnvironment();
+    unsafeLocal.setActiveProfiles("unsafe-local");
+
+    assertThat(refusalOf(new StartupInvariants(properties, sessions, api, worker, production)))
+        .contains(
+            "webhooks.ssrf.allow-cidrs must be empty", "webhooks.ssrf.allow-http must be false");
+    assertThat(refusalOf(new StartupInvariants(properties, sessions, api, worker, unsafeLocal)))
+        .doesNotContain("webhooks.ssrf");
+  }
+
   // The session limits are missing in the worker pool only, so the pool violations show that each
   // pool is judged by its own session. The JVM flag and the proxy property are read from this
   // JVM: the unit tests run without the flag, and the test sets the property.
@@ -249,7 +347,8 @@ class StartupInvariantsTest {
             properties("short", SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY),
             sessions,
             api,
-            worker);
+            worker,
+            new MockEnvironment());
 
     System.setProperty("http.proxyHost", "proxy.internal");
     try {
@@ -266,9 +365,21 @@ class StartupInvariantsTest {
     }
   }
 
+  // The violations that the invariants name, or nothing when they name none. Whether they name
+  // the JVM flag depends on the JVM that runs the test, so a test of something else must not need
+  // a refusal.
+  private static String refusalOf(StartupInvariants invariants) {
+    Throwable refusal = catchThrowable(invariants::afterPropertiesSet);
+    return refusal == null ? "" : refusal.getMessage();
+  }
+
   private static List<String> violations(WebhooksProperties properties) {
     return StartupInvariants.violations(
-        properties, API_SESSION, WORKER_SESSION, true, new Properties());
+        properties, API_SESSION, WORKER_SESSION, true, new Properties(), false);
+  }
+
+  private static List<String> violations(Delivery delivery) {
+    return violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, delivery));
   }
 
   private static List<String> violations(SessionSettings api, SessionSettings worker) {
@@ -277,7 +388,18 @@ class StartupInvariantsTest {
         api,
         worker,
         true,
-        new Properties());
+        new Properties(),
+        false);
+  }
+
+  private static List<String> violations(Ssrf ssrf, boolean unsafeLocal) {
+    return StartupInvariants.violations(
+        properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY, ssrf),
+        API_SESSION,
+        WORKER_SESSION,
+        true,
+        new Properties(),
+        unsafeLocal);
   }
 
   private static List<String> violations(Properties systemProperties) {
@@ -286,7 +408,8 @@ class StartupInvariantsTest {
         API_SESSION,
         WORKER_SESSION,
         true,
-        systemProperties);
+        systemProperties,
+        false);
   }
 
   private static String base64OfBytes(int bytes) {
@@ -295,8 +418,30 @@ class StartupInvariantsTest {
 
   private static WebhooksProperties properties(
       String adminToken, String secretEncryptionKey, Pool api, Pool worker, Delivery delivery) {
+    return properties(adminToken, secretEncryptionKey, api, worker, delivery, NO_ALLOWANCE);
+  }
+
+  private static WebhooksProperties properties(
+      String adminToken,
+      String secretEncryptionKey,
+      Pool api,
+      Pool worker,
+      Delivery delivery,
+      Ssrf ssrf) {
     Database database = new Database("jdbc:postgresql://db/webhooks", "user", "pw", api, worker);
-    return new WebhooksProperties(adminToken, secretEncryptionKey, database, delivery);
+    return new WebhooksProperties(
+        adminToken, secretEncryptionKey, "replica", database, delivery, ssrf);
+  }
+
+  private static Delivery delivery(
+      int leaseSeconds, int startCutoffSeconds, int finalizeCutoffSeconds) {
+    return new Delivery(
+        DEADLINE,
+        Duration.ofSeconds(leaseSeconds),
+        Duration.ofSeconds(startCutoffSeconds),
+        Duration.ofSeconds(finalizeCutoffSeconds),
+        12,
+        64);
   }
 
   private static Pool pool(Duration borrowTimeout, Duration socketTimeout, boolean tcpKeepAlive) {

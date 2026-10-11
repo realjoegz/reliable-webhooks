@@ -1,10 +1,16 @@
 package io.github.realjoegz.reliablewebhooks.http;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
+import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Ssrf;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -12,7 +18,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 class AddressPolicyTest {
 
-  private final AddressPolicy policy = new AddressPolicy();
+  private final AddressPolicy policy = new AddressPolicy(List.of());
 
   @ParameterizedTest
   @CsvSource({
@@ -135,6 +141,74 @@ class AddressPolicyTest {
     assertThat(mapped).isInstanceOf(Inet6Address.class);
     assertThat(mapped.getAddress()).hasSize(16);
     assertThat(policy.allows(mapped)).isFalse();
+  }
+
+  @Test
+  void allowedRangeLetsItsAddressesThroughAndNoOthers() throws UnknownHostException {
+    AddressPolicy withAllowance =
+        new AddressPolicy(List.of("127.0.0.1/32", "10.20.0.0/16", "fd00::/8"));
+
+    assertThat(withAllowance.allows(address("127.0.0.1"))).isTrue();
+    assertThat(withAllowance.allows(ipv4Mapped("127.0.0.1"))).isTrue();
+    assertThat(withAllowance.allows(address("10.20.0.0"))).isTrue();
+    assertThat(withAllowance.allows(address("10.20.255.255"))).isTrue();
+    assertThat(withAllowance.allows(address("fd00:ec2::254"))).isTrue();
+    assertThat(withAllowance.allows(address("93.184.216.34"))).isTrue();
+
+    assertThat(withAllowance.allows(address("127.0.0.2"))).isFalse();
+    assertThat(withAllowance.allows(address("10.19.255.255"))).isFalse();
+    assertThat(withAllowance.allows(address("10.21.0.0"))).isFalse();
+    assertThat(withAllowance.allows(address("::1"))).isFalse();
+    assertThat(withAllowance.allows(address("fc00::1"))).isFalse();
+    assertThat(withAllowance.allows(address("169.254.169.254"))).isFalse();
+  }
+
+  // What is not an address literal with a prefix length is refused, and no name among it is
+  // looked up.
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "",
+        "127.0.0.1",
+        "127.0.0.1/",
+        "127.0.0.1/33",
+        "256.0.0.1/8",
+        "127.1/8",
+        "localhost/8",
+        "bad.cafe/16",
+        "::1/129",
+        "fd00::/x",
+        "fd00::/8 "
+      })
+  void allowedRangeThatIsNotInCidrNotationIsRefused(String notation) {
+    assertThatThrownBy(() -> new AddressPolicy(List.of(notation)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(notation);
+  }
+
+  @Test
+  void gaugeCountsTheAllowedRanges() {
+    MeterRegistry meters = new SimpleMeterRegistry();
+    WebhooksProperties properties =
+        new WebhooksProperties(
+            null, null, null, null, null, new Ssrf(List.of("127.0.0.1/32", "10.20.0.0/16"), true));
+
+    AddressPolicy withAllowance = new AddressPolicy(properties, meters);
+
+    assertThat(meters.get("webhooks.ssrf.allowlist.entries").gauge().value()).isEqualTo(2);
+    assertThat(withAllowance.allows(InetAddress.getLoopbackAddress())).isTrue();
+  }
+
+  @Test
+  void gaugeIsZeroWithoutAnAllowance() {
+    MeterRegistry meters = new SimpleMeterRegistry();
+    WebhooksProperties properties =
+        new WebhooksProperties(null, null, null, null, null, new Ssrf(List.of(), false));
+
+    AddressPolicy production = new AddressPolicy(properties, meters);
+
+    assertThat(meters.get("webhooks.ssrf.allowlist.entries").gauge().value()).isZero();
+    assertThat(production.allows(InetAddress.getLoopbackAddress())).isFalse();
   }
 
   private static InetAddress address(String literal) throws UnknownHostException {

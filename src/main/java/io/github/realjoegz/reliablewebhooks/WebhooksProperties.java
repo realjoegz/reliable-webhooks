@@ -1,18 +1,25 @@
 package io.github.realjoegz.reliablewebhooks;
 
 import java.time.Duration;
+import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 @ConfigurationProperties("webhooks")
 public record WebhooksProperties(
-    String adminToken, String secretEncryptionKey, Database database, Delivery delivery) {
+    String adminToken,
+    String secretEncryptionKey,
+    String replicaId,
+    Database database,
+    Delivery delivery,
+    Ssrf ssrf) {
 
   /**
    * Leaves out the admin token and the secret-encryption key, so that printing cannot leak them.
    */
   @Override
   public String toString() {
-    return "WebhooksProperties[database=%s, delivery=%s]".formatted(database, delivery);
+    return "WebhooksProperties[replicaId=%s, database=%s, delivery=%s, ssrf=%s]"
+        .formatted(replicaId, database, delivery, ssrf);
   }
 
   public record Database(String url, String username, String password, Pool api, Pool worker) {
@@ -34,5 +41,18 @@ public record WebhooksProperties(
       Duration statementTimeout,
       Duration idleInTransactionTimeout) {}
 
-  public record Delivery(Duration attemptDeadline, Duration lease, Duration startCutoff) {}
+  /**
+   * The start cutoff and the finalize cutoff count from the moment a replica began the claim that
+   * leased the delivery, on the clock of that replica.
+   */
+  public record Delivery(
+      Duration attemptDeadline,
+      Duration lease,
+      Duration startCutoff,
+      Duration finalizeCutoff,
+      int maxAttempts,
+      int maxInFlight) {}
+
+  /** What the address policy lets through on top of public addresses. Empty in production. */
+  public record Ssrf(List<String> allowCidrs, boolean allowHttp) {}
 }

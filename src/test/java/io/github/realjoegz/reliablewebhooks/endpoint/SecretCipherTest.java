@@ -131,7 +131,7 @@ class SecretCipherTest {
   }
 
   private static SecretCipher cipherWithKey(String key) {
-    return new SecretCipher(new WebhooksProperties(null, key, null, null));
+    return new SecretCipher(new WebhooksProperties(null, key, null, null, null, null));
   }
 
   private static String keyOf(int fill, int bytes) {

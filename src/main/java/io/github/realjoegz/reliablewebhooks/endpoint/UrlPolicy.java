@@ -1,5 +1,6 @@
 package io.github.realjoegz.reliablewebhooks.endpoint;
 
+import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
 import io.github.realjoegz.reliablewebhooks.http.DnsLookups;
 import io.github.realjoegz.reliablewebhooks.http.DnsLookups.Refusal;
 import io.github.realjoegz.reliablewebhooks.http.DnsLookups.Resolved;
@@ -7,6 +8,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Optional;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -14,6 +16,9 @@ import org.springframework.stereotype.Component;
  * 65535, no userinfo, at most 2048 characters, and a host that resolves to allowed addresses only.
  * The verdict holds for the moment of the check. A host can resolve to other addresses later, so an
  * allowed URL is not by that a safe one to connect to.
+ *
+ * <p>A policy can be told to take {@code http} as well. That exists for tests and docker compose,
+ * where the receiver has no certificate.
  */
 @Component
 public class UrlPolicy {
@@ -31,9 +36,16 @@ public class UrlPolicy {
   }
 
   private final DnsLookups lookups;
+  private final boolean allowHttp;
 
-  UrlPolicy(DnsLookups lookups) {
+  @Autowired
+  UrlPolicy(DnsLookups lookups, WebhooksProperties properties) {
+    this(lookups, properties.ssrf().allowHttp());
+  }
+
+  UrlPolicy(DnsLookups lookups, boolean allowHttp) {
     this.lookups = lookups;
+    this.allowHttp = allowHttp;
   }
 
   public Verdict check(UUID tenantId, String url) {
@@ -48,7 +60,7 @@ public class UrlPolicy {
     };
   }
 
-  private static Optional<String> hostOfWellFormed(String url) {
+  private Optional<String> hostOfWellFormed(String url) {
     if (url.length() > MAX_LENGTH) {
       return Optional.empty();
     }
@@ -60,18 +72,20 @@ public class UrlPolicy {
     }
     // The host is null for an authority that is not host and port, such as a host with an
     // underscore or a port that is not a number.
-    if (!"https".equalsIgnoreCase(uri.getScheme())
+    boolean https = "https".equalsIgnoreCase(uri.getScheme());
+    boolean http = allowHttp && "http".equalsIgnoreCase(uri.getScheme());
+    if (!(https || http)
         || uri.getHost() == null
         || uri.getRawUserInfo() != null
-        || !allowedPort(uri.getPort())) {
+        || !allowedPort(uri.getPort(), https)) {
       return Optional.empty();
     }
     return Optional.of(uri.getHost());
   }
 
-  // -1 means the URL names no port, which is 443 for https.
-  private static boolean allowedPort(int port) {
-    return port == -1
+  // -1 means the URL names no port. That is 443 for https, and 80 for http, which is not allowed.
+  private static boolean allowedPort(int port, boolean https) {
+    return (port == -1 && https)
         || port == HTTPS_PORT
         || (port >= FIRST_UNPRIVILEGED_PORT && port <= LAST_PORT);
   }

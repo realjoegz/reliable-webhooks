@@ -11,6 +11,7 @@ import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.env.Environment;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 
 @InProcessReplica
@@ -18,6 +19,7 @@ class StartupInvariantsIT {
 
   @Autowired WebhooksProperties properties;
   @Autowired SessionSettingsRepository sessions;
+  @Autowired Environment environment;
 
   @Autowired
   @Qualifier("apiDataSource")
@@ -42,7 +44,7 @@ class StartupInvariantsIT {
     assertThat(sessions.read(withoutLimits)).isEqualTo(session(0, 0, 0));
 
     StartupInvariants invariants =
-        new StartupInvariants(properties, sessions, withoutLimits, worker);
+        new StartupInvariants(properties, sessions, withoutLimits, worker, environment);
 
     assertThatThrownBy(invariants::afterPropertiesSet)
         .isInstanceOf(IllegalStateException.class)

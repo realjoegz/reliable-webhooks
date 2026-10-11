@@ -4,11 +4,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
+import io.github.realjoegz.reliablewebhooks.harness.FaultReceiver;
 import io.github.realjoegz.reliablewebhooks.harness.InProcessReplica;
+import io.github.realjoegz.reliablewebhooks.harness.ReplicaSettings;
+import io.github.realjoegz.reliablewebhooks.harness.ReplicaWorker;
+import io.github.realjoegz.reliablewebhooks.harness.Rows;
 import io.github.realjoegz.reliablewebhooks.harness.StubDns;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
+import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Response;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -34,6 +44,9 @@ import tools.jackson.databind.json.JsonMapper;
 class SsrfIT {
 
   private static final String PUBLIC_ADDRESS = "93.184.216.34";
+  private static final String EVENT =
+      """
+      {"type":"order.created","data":{"order":17}}""";
   private static final int MAX_UNRETURNED_LOOKUPS_PER_TENANT = 4;
   private static final Duration DNS_WAIT = Duration.ofSeconds(2);
   private static final Duration ANSWER_MARGIN = Duration.ofSeconds(8);
@@ -62,6 +75,8 @@ class SsrfIT {
   @Autowired StubDns dns;
   @Autowired MeterRegistry meters;
   @Autowired JsonMapper json;
+  @Autowired ReplicaWorker worker;
+  @Autowired WebhooksProperties properties;
 
   @Autowired
   @Qualifier("apiDataSource")
@@ -162,6 +177,77 @@ class SsrfIT {
             () ->
                 assertThat(register(tenant, answeringHost).getStatus())
                     .isEqualTo(HttpStatus.CREATED));
+  }
+
+  // The replica of this class has no allowance for the loopback address, where the receiver
+  // listens. The endpoint is registered while its host resolves to a public address, and by the
+  // time of the delivery the host resolves to the receiver. The lookup that the connection
+  // would use is refused, so no connection is made.
+  //
+  // The last step is the control for the count of zero: a connection from the test to the
+  // address that the host resolves to is counted by the same listener.
+  @Test
+  void rebindingIsBlockedAtConnect() throws Exception {
+    try (FaultReceiver receiver = FaultReceiver.start()) {
+      TestTenant tenant = TestTenant.create(http, "rebinding");
+      String host = host("rebinding");
+      dns.answerOnce(host, PUBLIC_ADDRESS);
+      dns.answer(host, "127.0.0.1");
+      tenant.register(http, "https://%s:%d/hook".formatted(host, receiver.port()), "*");
+      double blockedBefore = lookups("blocked");
+      worker.start();
+
+      UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
+      await().untilAsserted(() -> assertThat(Rows.attempts(delivery)).hasSize(1));
+
+      assertThat(Rows.attempts(delivery))
+          .containsExactly(
+              new Rows.Attempt(
+                  0,
+                  1,
+                  false,
+                  "failure",
+                  null,
+                  "destination_not_allowed",
+                  null,
+                  ReplicaSettings.IN_PROCESS_REPLICA));
+      assertThat(Rows.delivery(delivery))
+          .isEqualTo(new Rows.Delivery("pending", 1, 0, false, null, false));
+      assertThat(lookups("blocked") - blockedBefore).isEqualTo(1);
+      assertThat(receiver.acceptedConnections()).isZero();
+
+      try (Socket fromTheTest = new Socket(InetAddress.getByName("127.0.0.1"), receiver.port())) {
+        await().until(() -> receiver.acceptedConnections() == 1);
+      }
+      assertThat(receiver.requests()).isEmpty();
+    }
+  }
+
+  // The client of this test is built like the one of the service, with the loopback address
+  // allowed so that it can reach the receiver. The receiver answers with a redirect to another
+  // of its paths. The client reports the 302, and the receiver has seen one request.
+  @Test
+  void redirectIsNotFollowed() throws Exception {
+    try (FaultReceiver receiver = FaultReceiver.start();
+        DnsLookups lookups =
+            new DnsLookups(
+                dns, new AddressPolicy(List.of("127.0.0.1/32")), new SimpleMeterRegistry());
+        WebhookHttpClient client = new WebhookHttpClient(lookups, properties)) {
+      receiver.answer("/moved", FaultReceiver.redirect(receiver.url("/target")));
+      receiver.answer("/target", FaultReceiver.status(200));
+
+      WebhookHttpClient.Outcome outcome =
+          client.send(
+              UUID.randomUUID(),
+              URI.create(receiver.url("/moved")),
+              Map.of(),
+              EVENT.getBytes(StandardCharsets.UTF_8));
+
+      assertThat(outcome).isEqualTo(new Response(302, null, InetAddress.getByName("127.0.0.1")));
+      assertThat(receiver.requests())
+          .extracting(FaultReceiver.Request::path)
+          .containsExactly("/moved");
+    }
   }
 
   private void assertBlockedLike(ExchangeResult reference, TestTenant tenant, String host) {
