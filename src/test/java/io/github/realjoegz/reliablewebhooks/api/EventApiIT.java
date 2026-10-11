@@ -11,6 +11,7 @@ import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -47,9 +48,9 @@ class EventApiIT {
       """
       {"type":"order.created","data":{"order":17}}""";
   private static final String INVALID_BODY =
-      "The body must be a JSON object with a type of 1 to 128 characters of [a-z0-9_.-] and an"
-          + " object as data. It must keep to the limits on numbers, member names and nesting"
-          + " depth.";
+      "The body must be a JSON object in UTF-8 without a byte order mark, with a type of 1 to"
+          + " 128 characters of [a-z0-9_.-] and an object as data. It must keep to the limits on"
+          + " numbers, member names and nesting depth.";
   private static final String INVALID_KEY =
       "Idempotency-Key is required and must have 1 to 255 printable ASCII characters";
 
@@ -244,6 +245,51 @@ class EventApiIT {
     expectBadRequest(tenant.send(http, TestTenant.newIdempotencyKey(), body), INVALID_BODY);
 
     assertThat(tenant.eventRows()).isZero();
+  }
+
+  static Stream<Arguments> eventsInUtf16OrUtf32() {
+    return Stream.of("UTF-16BE", "UTF-16LE", "UTF-32BE", "UTF-32LE")
+        .map(
+            encoding ->
+                arguments(named(encoding, ORDER_CREATED.getBytes(Charset.forName(encoding)))));
+  }
+
+  // The other tests of this class send the same event in UTF-8, and it is accepted.
+  @ParameterizedTest
+  @MethodSource("eventsInUtf16OrUtf32")
+  void eventBodyInUtf16OrUtf32IsRejected(byte[] body) {
+    TestTenant tenant = TestTenant.create(http, "event-not-in-utf-8");
+
+    expectBadRequest(tenant.send(http, TestTenant.newIdempotencyKey(), body), INVALID_BODY);
+
+    assertThat(tenant.eventRows()).isZero();
+  }
+
+  // The mark is the character U+FEFF in front of the body.
+  @Test
+  void eventBodyThatStartsWithAByteOrderMarkIsRejected() {
+    TestTenant tenant = TestTenant.create(http, "event-with-a-mark");
+
+    expectBadRequest(
+        tenant.send(http, TestTenant.newIdempotencyKey(), "\uFEFF" + ORDER_CREATED), INVALID_BODY);
+
+    assertThat(tenant.eventRows()).isZero();
+  }
+
+  // In ISO-8859-1 the é is the one byte E9, which begins a UTF-8 sequence that the quotation
+  // mark after it breaks off. The first event is the same text in UTF-8.
+  @Test
+  void eventBodyWhoseUtf8SequenceBreaksOffIsRejected() {
+    TestTenant tenant = TestTenant.create(http, "event-in-iso-8859-1");
+    String event = eventWith("{\"note\":\"café\"}");
+
+    accept(tenant, event);
+    expectBadRequest(
+        tenant.send(
+            http, TestTenant.newIdempotencyKey(), event.getBytes(StandardCharsets.ISO_8859_1)),
+        INVALID_BODY);
+
+    assertThat(tenant.eventRows()).isEqualTo(1);
   }
 
   @Test

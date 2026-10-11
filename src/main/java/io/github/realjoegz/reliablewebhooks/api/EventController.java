@@ -60,9 +60,10 @@ public class EventController {
                 () ->
                     new ResponseStatusException(
                         HttpStatus.BAD_REQUEST,
-                        "The body must be a JSON object with a type of 1 to 128 characters of"
-                            + " [a-z0-9_.-] and an object as data. It must keep to the limits on"
-                            + " numbers, member names and nesting depth."));
+                        "The body must be a JSON object in UTF-8 without a byte order mark,"
+                            + " with a type of 1 to 128 characters of [a-z0-9_.-] and an object"
+                            + " as data. It must keep to the limits on numbers, member names and"
+                            + " nesting depth."));
     return switch (service.ingest(tenant.id(), idempotencyKey, request)) {
       case Accepted accepted -> {
         ResponseEntity.BodyBuilder response = ResponseEntity.accepted();

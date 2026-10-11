@@ -202,6 +202,27 @@ class IngestMeterIT {
     awaitCounts(before.plusAccepted(1));
   }
 
+  // The ingest route answers a charset other than UTF-8 with a 415, which has no result. The
+  // accepted event at the end is the witness, as above.
+  @Test
+  void requestRefusedForItsCharsetIsNotCounted() {
+    TestTenant tenant = TestTenant.create(http, "meter-charset");
+    Counts before = counts();
+
+    http.post()
+        .uri("/v1/events")
+        .headers(headers -> headers.setBearerAuth(tenant.apiKey()))
+        .header("Idempotency-Key", TestTenant.newIdempotencyKey())
+        .contentType(new MediaType(MediaType.APPLICATION_JSON, StandardCharsets.ISO_8859_1))
+        .body(ORDER_17.getBytes(StandardCharsets.UTF_8))
+        .exchange()
+        .expectStatus()
+        .isEqualTo(HttpStatus.UNSUPPORTED_MEDIA_TYPE);
+
+    tenant.send(http, TestTenant.newIdempotencyKey(), ORDER_17).expectStatus().isAccepted();
+    awaitCounts(before.plusAccepted(1));
+  }
+
   // The accepted event at the end is the witness, as above. The first two requests are refused
   // on the way to the ingest route. The other three are answered by another route, each with a
   // status that is a result on the ingest route, so a meter that looked at more than the ingest

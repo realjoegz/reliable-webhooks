@@ -4,7 +4,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.realjoegz.reliablewebhooks.harness.InProcessReplica;
 import io.github.realjoegz.reliablewebhooks.harness.StubDns;
-import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -88,7 +87,7 @@ class RequestBodyLimitIT {
     register(tenant, registrationOf(LIMIT)).expectStatus().isCreated();
     expectContentTooLarge(register(tenant, registrationOf(LIMIT + 1)));
 
-    assertThat(endpointRowsOf(tenant)).isEqualTo(1);
+    assertThat(tenant.endpointRows()).isEqualTo(1);
   }
 
   private static void expectContentTooLarge(RestTestClient.ResponseSpec response) {
@@ -131,13 +130,5 @@ class RequestBodyLimitIT {
   private static byte[] padded(String head, String tail, int bytes) {
     String body = head + "x".repeat(bytes - head.length() - tail.length()) + tail;
     return body.getBytes(StandardCharsets.US_ASCII);
-  }
-
-  private static int endpointRowsOf(TestTenant tenant) {
-    return TestDatabase.jdbc()
-        .sql("SELECT count(*) FROM endpoint WHERE tenant_id = :t")
-        .param("t", tenant.id())
-        .query(Integer.class)
-        .single();
   }
 }

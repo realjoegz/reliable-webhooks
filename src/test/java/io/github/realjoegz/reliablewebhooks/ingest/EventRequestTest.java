@@ -1,10 +1,12 @@
 package io.github.realjoegz.reliablewebhooks.ingest;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Named.named;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 import java.lang.reflect.Field;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -15,16 +17,38 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.exc.StreamConstraintsException;
+import tools.jackson.core.json.JsonFactory;
 import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.cfg.JsonNodeFeature;
+import tools.jackson.databind.json.JsonMapper;
 
 class EventRequestTest {
 
+  private static final Charset UTF_32BE = Charset.forName("UTF-32BE");
   private static final UUID ID = UUID.fromString("0190a8f4-5d7e-7c3a-9b1f-2e4d6a8c0b12");
   private static final Instant CREATED_AT = Instant.parse("2026-03-04T05:06:07.089Z");
   private static final String RENDERED_UP_TO_DATA =
       """
       {"id":"0190a8f4-5d7e-7c3a-9b1f-2e4d6a8c0b12","type":"%s",\
       "created_at":"2026-03-04T05:06:07.089Z","data":""";
+
+  // The parser of an event body as it would be with the detection of the library left on. The
+  // limits are those of EventRequest.
+  private static final JsonMapper WITH_DETECTION =
+      JsonMapper.builder(
+              JsonFactory.builder()
+                  .streamReadConstraints(
+                      StreamReadConstraints.builder()
+                          .maxNumberLength(1000)
+                          .maxNameLength(1024)
+                          .maxNestingDepth(500)
+                          .build())
+                  .build())
+          .enable(JsonNodeFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+          .build();
 
   @Test
   void bodyIsRenderedAsIdTypeCreatedAtAndData() {
@@ -187,6 +211,89 @@ class EventRequestTest {
   @MethodSource("bodiesOutsideTheLimits")
   void bodyOutsideTheLimitsDoesNotParse(String body) {
     assertThat(EventRequest.parse(bytes(body))).isEmpty();
+  }
+
+  // The library can detect each of these encodings, with the mark and without it. The mark is
+  // the character U+FEFF in front of the body. The same event in UTF-8 parses.
+  static Stream<Arguments> eventsInUtf16OrUtf32() {
+    String event = "{\"type\":\"a\",\"data\":{}}";
+    return Stream.of("UTF-16BE", "UTF-16LE", "UTF-32BE", "UTF-32LE")
+        .flatMap(
+            encoding ->
+                Stream.of(
+                    arguments(named(encoding, event.getBytes(Charset.forName(encoding)))),
+                    arguments(
+                        named(
+                            encoding + " with a byte order mark",
+                            ("\uFEFF" + event).getBytes(Charset.forName(encoding))))));
+  }
+
+  @ParameterizedTest
+  @MethodSource("eventsInUtf16OrUtf32")
+  void bodyInUtf16OrUtf32DoesNotParse(byte[] body) {
+    assertThat(EventRequest.parse(body)).isEmpty();
+  }
+
+  // RFC 8259 forbids a sender the mark and lets a parser refuse it.
+  @Test
+  void bodyInUtf8ThatStartsWithAByteOrderMarkDoesNotParse() {
+    String event = "{\"type\":\"a\",\"data\":{}}";
+
+    assertThat(EventRequest.parse(bytes(event))).isPresent();
+    assertThat(EventRequest.parse(bytes("\uFEFF" + event))).isEmpty();
+  }
+
+  // In ISO-8859-1 the é is the one byte E9. In UTF-8 that byte begins a sequence of three, and
+  // the quotation mark after it cannot continue one.
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "{\"type\":\"a\",\"data\":{\"note\":\"café\"}}",
+        "{\"type\":\"a\",\"data\":{\"café\":1}}"
+      })
+  void bodyWhoseUtf8SequenceBreaksOffDoesNotParse(String event) {
+    assertThat(EventRequest.parse(bytes(event))).isPresent();
+    assertThat(EventRequest.parse(event.getBytes(StandardCharsets.ISO_8859_1))).isEmpty();
+  }
+
+  // The library reads a body in UTF-16 or UTF-32 with its parser for characters when it is left
+  // to detect the encoding. That parser counts a member name by its characters and a number in
+  // another way, so it lets each of these bodies through: the names have 1,024 and 513
+  // characters, and the fraction has 1,001 digits.
+  static Stream<Arguments> bodiesOutsideTheLimitsInAnotherEncoding() {
+    String nameOfThreeThousandSeventyTwoBytes = withData("{\"" + "€".repeat(1024) + "\":1}");
+    return Stream.of(
+        arguments(
+            named(
+                "member name of 1,024 characters in 3,072 bytes",
+                nameOfThreeThousandSeventyTwoBytes),
+            StandardCharsets.UTF_16BE),
+        arguments(
+            named(
+                "member name of 1,024 characters in 3,072 bytes",
+                nameOfThreeThousandSeventyTwoBytes),
+            UTF_32BE),
+        arguments(
+            named(
+                "member name of 513 characters in 1,025 bytes",
+                withData("{\"k" + "é".repeat(512) + "\":1}")),
+            StandardCharsets.UTF_16BE),
+        arguments(
+            named("fraction of 1,001 digits", withData("{\"n\":0." + "7".repeat(1000) + "}")),
+            StandardCharsets.UTF_16BE));
+  }
+
+  // The hazard comes first: a parser with the limits and the detection refuses the body in
+  // UTF-8 and reads it in the other encoding, with the one member of its data.
+  @ParameterizedTest
+  @MethodSource("bodiesOutsideTheLimitsInAnotherEncoding")
+  void bodyOutsideTheLimitsDoesNotParseInAnotherEncoding(String body, Charset encoding) {
+    byte[] encoded = body.getBytes(encoding);
+
+    assertThatThrownBy(() -> WITH_DETECTION.readTree(bytes(body)))
+        .isInstanceOf(StreamConstraintsException.class);
+    assertThat(WITH_DETECTION.readTree(encoded).get("data").size()).isEqualTo(1);
+    assertThat(EventRequest.parse(encoded)).isEmpty();
   }
 
   @Test

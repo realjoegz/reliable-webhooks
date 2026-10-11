@@ -11,7 +11,7 @@ import org.springframework.test.web.servlet.client.RestTestClient;
 /**
  * A tenant created through the admin API of a replica, with the API key it was shown. It makes the
  * requests that the tests of several classes send as a tenant: it registers an endpoint, sends an
- * event and replays a delivery. It also counts the event and delivery rows of the tenant.
+ * event and replays a delivery. It also counts the event, endpoint and delivery rows of the tenant.
  */
 public record TestTenant(UUID id, String apiKey) {
 
@@ -98,6 +98,14 @@ public record TestTenant(UUID id, String apiKey) {
   public int eventRows() {
     return TestDatabase.jdbc()
         .sql("SELECT count(*) FROM event WHERE tenant_id = :t")
+        .param("t", id)
+        .query(Integer.class)
+        .single();
+  }
+
+  public int endpointRows() {
+    return TestDatabase.jdbc()
+        .sql("SELECT count(*) FROM endpoint WHERE tenant_id = :t")
         .param("t", id)
         .query(Integer.class)
         .single();

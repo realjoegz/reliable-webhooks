@@ -9,6 +9,7 @@ import java.util.Optional;
 import java.util.UUID;
 import tools.jackson.core.JacksonException;
 import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.TokenStreamFactory;
 import tools.jackson.core.json.JsonFactory;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.cfg.JsonNodeFeature;
@@ -35,9 +36,14 @@ public final class EventRequest {
 
   // Not the mapper of the API: a change to how responses are written must not change the bytes
   // that subscribers receive.
+  //
+  // A body is read as UTF-8, the one encoding that RFC 8259 allows. With its detection of the
+  // encoding left on, the library reads a body in UTF-16 or UTF-32 with another parser, which
+  // counts a name by its characters and keeps the names in a second table.
   private static final JsonMapper JSON =
       JsonMapper.builder(
               JsonFactory.builder()
+                  .disable(TokenStreamFactory.Feature.CHARSET_DETECTION)
                   .streamReadConstraints(
                       StreamReadConstraints.builder()
                           .maxNumberLength(MAX_NUMBER_DIGITS)
@@ -63,9 +69,9 @@ public final class EventRequest {
   }
 
   /**
-   * Empty unless the body is one JSON object inside the limits, with an event type as {@code type}
-   * and an object as {@code data}. Other members are ignored. Of members with the same name in one
-   * object, the last one counts.
+   * Empty unless the body, read as UTF-8, is one JSON object inside the limits, with an event type
+   * as {@code type} and an object as {@code data}. Other members are ignored. Of members with the
+   * same name in one object, the last one counts.
    */
   public static Optional<EventRequest> parse(byte[] body) {
     JsonNode root;

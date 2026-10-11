@@ -189,7 +189,7 @@ Every writer other than the claim sets `lease_token = NULL`: finalize, release, 
 
 ## 5. API
 
-Tenant routes take `Authorization: Bearer <api key>`. Errors are RFC 9457 problem documents. An id that belongs to another tenant returns 404.
+Tenant routes take `Authorization: Bearer <api key>`. A request body is JSON in UTF-8 (section 11.5). Errors are RFC 9457 problem documents. An id that belongs to another tenant returns 404.
 
 A named problem type such as `rate_limited` is sent as the `type` member, as a relative reference. Any other error (401, 404, a malformed request, 500) carries no `type`, which RFC 9457 reads as `about:blank`.
 
@@ -242,7 +242,8 @@ The delivery rows are the outbox. They are written in the same transaction as th
 Order of work for `POST /v1/events`:
 
 1. **Authenticate**, then take a per-tenant request permit (section 12). A request rejected here has not acquired a database connection.
-2. **Validate** size, JSON, type and key against the limits of section 11.5. Render the body `{"id","type","created_at","data"}` once.
+2. **Validate** charset, size, JSON, type and key against the limits of section 11.5. Render the body `{"id","type","created_at","data"}` once.
+   - The body is read as UTF-8 and as nothing else. A `Content-Type` that names another charset answers `415`, before the size of the body is looked at. A body in UTF-16 or UTF-32, or one that starts with a byte order mark, is not JSON here and answers `400`.
    - `data` must be a JSON object. Its numbers keep their exact value. None is read into a double.
    - Of members with the same name in one object, the last one counts.
    - `created_at` is the replica's wall clock at this step, in milliseconds and always with three fraction digits. It is information for the subscriber. Nothing is scheduled from it, and it is never compared with a database timestamp.
@@ -568,7 +569,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 `webhooks_ingest_requests_total` counts a request that the ingest route answered with one of these results, once, when the request is over. `invalid` is a `400`, a `413` or a `422`, and `busy` is a `503`. Nothing else is counted:
 - a request that is refused before it reaches the route, by authentication or for its media type;
 - a request to any other route;
-- a request that the ingest route answered with any other status. A `500` is such an answer, so a failure that the service maps to none of the results does not appear in this counter.
+- a request that the ingest route answered with any other status. A `500` is such an answer, so a failure that the service maps to none of the results does not appear in this counter. The `415` for a charset other than UTF-8 (section 11.5) is another.
 
 `QueueGauges` runs one aggregate query over the pending index every 15 s per replica. It uses the claim's eligibility predicates: `due` counts rows a claim could take, and `held` counts due rows behind an open circuit or a suspended tenant.
 
@@ -653,6 +654,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 | Limit | Value |
 |---|---|
 | Request body | 256 KiB (413 above) |
+| Encoding of a request body | UTF-8, without a byte order mark |
 | Event type | 128 characters of `[a-z0-9_.-]` |
 | Idempotency key | 255 characters |
 | Number in an event body | 1,000 digits, those of its exponent included, and an exponent that fits a Java `BigDecimal`, which is about plus or minus 2.1 billion |
@@ -668,7 +670,14 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 
 The three limits on an event body are set in the code and not left to the defaults of the JSON library. A body beyond one of them answers `400`, like a body that is not JSON.
 
-The limit on a member name also holds on the other routes that read a body, where it is set for the JSON mapper of the API. It is far below the 50,000 bytes that the library allows, for this reason: the parser keeps the member names it has read in a table that all requests share, so a name stays in memory after its request has ended. The limit bounds what one name can add to that table. The library bounds the number of names in it: once the table holds more than 6,000, it is emptied. That number cannot be set, so `EventRequestTest#memberNameIsKeptAfterItsBodyAndDroppedOnceMoreThanSixThousandAreKept` holds the library to it for an event body in UTF-8. A name of 1,024 bytes is still in the table after its request, and it has left the table after 6,001 further bodies with one new name each.
+The limit on a member name also holds on the other routes that read a body, where it is set for the JSON mapper of the API. It is far below the 50,000 bytes that the library allows, for this reason: the parser keeps the member names it has read in a table that all requests share, so a name stays in memory after its request has ended. The limit bounds what one name can add to that table. The library bounds the number of names in it: once the table holds more than 6,000, it is emptied. That number cannot be set, so `EventRequestTest#memberNameIsKeptAfterItsBodyAndDroppedOnceMoreThanSixThousandAreKept` holds the library to it for an event body. A name of 1,024 bytes is still in the table after its request, and it has left the table after 6,001 further bodies with one new name each.
+
+Every request body is read as UTF-8, the one encoding that RFC 8259 allows. The limits above depend on it. The library has a second parser, for characters. That parser counts a member name by its characters and the digits of a number in another way, and it keeps the names it has read in a second table. A name of 1,024 euro signs, which is 3,072 bytes, passes it, and so does a fraction of 1,001 digits. `EventRequestTest#bodyOutsideTheLimitsDoesNotParseInAnotherEncoding` holds the library to that: a parser that has the limits of an event body and is left to detect the encoding refuses both in UTF-8 and reads both in UTF-16. A body reaches the second parser in two ways, and both are closed:
+
+- **Detection.** Left to itself, the library detects UTF-16 and UTF-32 by the first bytes of a body and reads such a body as characters. The detection is turned off, for the parser of an event body and for the JSON mapper of the API. A body in UTF-16 or UTF-32 is then not JSON and answers `400`. So does a body in UTF-8 that starts with a byte order mark, because the detection was what skipped the mark. RFC 8259 forbids a sender the mark and lets a parser refuse it. `EventRequestTest#bodyInUtf16OrUtf32DoesNotParse`, `#bodyInUtf8ThatStartsWithAByteOrderMarkDoesNotParse` and `#bodyOutsideTheLimitsDoesNotParseInAnotherEncoding` show it for the parser, `EventApiIT#eventBodyInUtf16OrUtf32IsRejected` and `#eventBodyThatStartsWithAByteOrderMarkIsRejected` for ingest, and `RequestBodyCharsetIT#registrationInUtf16OrUtf32IsRejected` and `#registrationThatStartsWithAByteOrderMarkIsRejected` for a route that the JSON mapper of the API reads.
+- **Declared charset.** The JSON converter of Spring decodes a body itself when the `Content-Type` names a charset that is not a Unicode one, and hands the library characters. `RequestBodyCharset` therefore refuses a body whose `Content-Type` names any charset other than UTF-8, with a `415`, on every route that reads a body. A `Content-Type` without a charset, or with UTF-8, is read. `RequestBodyCharsetIT#bodyDeclaredInACharsetOtherThanUtf8IsRefused` and `#bodyDeclaredAsUtf8IsRead` show it for ingest and for a registration. The check reads the header only and comes before the limit on the size of a body, so a request that breaks both rules answers `415`: `RequestBodyCharsetIT#bodyAboveTheLimitDeclaredInAnotherCharsetIsRefusedForItsCharset`.
+
+A body in another encoding whose `Content-Type` does not say so is read as UTF-8 like any other. Where that leaves a UTF-8 sequence that breaks off, as at the `é` of `café` in ISO-8859-1, an event body is not JSON and answers `400`. `EventRequestTest#bodyWhoseUtf8SequenceBreaksOffDoesNotParse` shows it for the parser and `EventApiIT#eventBodyWhoseUtf8SequenceBreaksOffIsRejected` for ingest. Beyond that, what the decoder of the library accepts is read. The service makes no check of its own that a body is well-formed UTF-8.
 
 The endpoint cap is exact, and an endpoint is never created without its circuit row:
 
@@ -984,7 +993,7 @@ Harness:
 | `UnsafeLocalReplica` | An `InProcessReplica` with the `unsafe-local` profile and its allowance: plain `http` and the loopback address, where `FaultReceiver` listens. The classes with this annotation share a second application context. |
 | `ReplicaWorker` | Starts and stops the delivery worker of a replica inside the test JVM. Each start gets a `WorkerLifecycle` and a poller of its own from the application context, wired as the application wires them, and runs the start and stop that Spring runs. |
 | `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker and its expiry job, and closing it stops them. A test can give it the heartbeat of its poller, built on a clock that the test moves. |
-| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, sends an event and replays a delivery as that tenant, and counts the tenant's event and delivery rows. |
+| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, sends an event and replays a delivery as that tenant, and counts the tenant's event, endpoint and delivery rows. |
 
 How each proof is forced.
 
@@ -1095,6 +1104,10 @@ How each proof is forced.
 | Redirects off | Follow and re-validate each hop | More code on the most attacked path, for a feature webhooks do not need. |
 | No stored response bodies | Store a snippet for debugging | It is the read primitive of an SSRF. |
 | Member names limited to 1,024 bytes | Turning off the table of names in the parser of an event body | The library then reads the body with its parser for characters, which counts a name by its characters. A name of 513 characters in 1,025 bytes is accepted, and so is a fraction of 1,001 digits. |
+| Every request body is read as UTF-8 | Leaving the JSON library to detect UTF-16 and UTF-32 | The same parser for characters reads such a body, so the limits on names and numbers would hold for UTF-8 only (section 11.5). |
+| The same | Skipping a byte order mark in front of a body in UTF-8 | RFC 8259 forbids a sender the mark. Skipping it is code in front of two parsers, and the same event with and without the mark would be two different bodies under one idempotency key. |
+| A declared charset other than UTF-8 answers `415` | Reading every body as UTF-8 whatever its `Content-Type` says | It takes a JSON converter written for this service in place of the one of Spring. A client that names another charset and sends it would be told that its JSON is wrong, when its encoding is. |
+| The same | A `consumes` condition with the charset on every route that reads a body | A route added later would have to repeat it. The check sits where the body limit sits, in front of every body. |
 | `JdbcClient` and explicit SQL | JPA | The locking clauses are the design; they must be visible. |
 | READ COMMITTED plus row locks | SERIALIZABLE | Retry loops everywhere, and `SKIP LOCKED` queues do not need it. |
 | SHA-256 for API keys | bcrypt | Slow hashes defend low-entropy secrets; these are 256-bit random. |

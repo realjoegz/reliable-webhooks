@@ -159,9 +159,9 @@ class EndpointApiIT {
       blocker.rollback();
     }
 
-    assertThat(endpointRowsOf(tenant)).isZero();
+    assertThat(tenant.endpointRows()).isZero();
     create(tenant, URL, List.of("*"));
-    assertThat(endpointRowsOf(tenant)).isEqualTo(1);
+    assertThat(tenant.endpointRows()).isEqualTo(1);
   }
 
   @Test
@@ -342,7 +342,7 @@ class EndpointApiIT {
     expectInvalidEventTypes(register(tenant, URL, eventTypes));
     expectInvalidEventTypes(patch(tenant, existing, Map.of("event_types", eventTypes)));
 
-    assertThat(endpointRowsOf(tenant)).isEqualTo(1);
+    assertThat(tenant.endpointRows()).isEqualTo(1);
     read(tenant, existing).expectBody().jsonPath("$.event_types[0]").isEqualTo("*");
   }
 
@@ -360,7 +360,7 @@ class EndpointApiIT {
         .jsonPath("$.detail")
         .isEqualTo("url is required");
 
-    assertThat(endpointRowsOf(tenant)).isEqualTo(1);
+    assertThat(tenant.endpointRows()).isEqualTo(1);
   }
 
   // A registration ignores the extra member, so the name of that member is the only thing that
@@ -380,7 +380,7 @@ class EndpointApiIT {
         .expectHeader()
         .contentType(MediaType.APPLICATION_PROBLEM_JSON);
 
-    assertThat(endpointRowsOf(tenant)).isEqualTo(1);
+    assertThat(tenant.endpointRows()).isEqualTo(1);
   }
 
   // The host of each URL is public, so the form of the URL is the only reason to refuse it.
@@ -404,7 +404,7 @@ class EndpointApiIT {
         .jsonPath("$.type")
         .isEqualTo("endpoint_url_not_allowed");
 
-    assertThat(endpointRowsOf(tenant)).isZero();
+    assertThat(tenant.endpointRows()).isZero();
   }
 
   private static void expectNotFound(RestTestClient.ResponseSpec response) {
@@ -519,14 +519,6 @@ class EndpointApiIT {
                     row.getInt("probe_failures"),
                     row.getBoolean("ever_opened"),
                     row.getBoolean("probe_scheduled")))
-        .single();
-  }
-
-  private static int endpointRowsOf(TestTenant tenant) {
-    return TestDatabase.jdbc()
-        .sql("SELECT count(*) FROM endpoint WHERE tenant_id = :t")
-        .param("t", tenant.id())
-        .query(Integer.class)
         .single();
   }
 }
