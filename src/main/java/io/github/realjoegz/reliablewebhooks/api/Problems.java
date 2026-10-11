@@ -36,6 +36,34 @@ public class Problems extends ResponseEntityExceptionHandler {
     return new ErrorResponseException(HttpStatus.FORBIDDEN, problem, null);
   }
 
+  /**
+   * One answer for every URL the policy refuses. It does not say whether the host resolved, so a
+   * registration cannot be used to look into the network of the service.
+   */
+  public static ErrorResponseException endpointUrlNotAllowed() {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.UNPROCESSABLE_CONTENT,
+            "endpoint_url_not_allowed",
+            "Endpoint URL not allowed",
+            "The URL must use https, have no userinfo, use port 443 or 1024 to 65535, have at"
+                + " most 2048 characters and name a host that resolves to public addresses only.");
+    return new ErrorResponseException(HttpStatus.UNPROCESSABLE_CONTENT, problem, null);
+  }
+
+  public static ErrorResponseException lookupBusy() {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.TOO_MANY_REQUESTS,
+            "lookup_busy",
+            "Lookup busy",
+            "The host of the URL could not be looked up right now.");
+    ErrorResponseException rejection =
+        new ErrorResponseException(HttpStatus.TOO_MANY_REQUESTS, problem, null);
+    rejection.getHeaders().set(HttpHeaders.RETRY_AFTER, "2");
+    return rejection;
+  }
+
   @ExceptionHandler(Exception.class)
   ResponseEntity<ProblemDetail> unhandled(Exception failure) {
     if (databaseBusy(failure)) {

@@ -95,6 +95,25 @@ class ProblemsTest {
     assertThat(rejection.getBody().getStatus()).isEqualTo(403);
   }
 
+  @Test
+  void refusedEndpointUrlIsUnprocessableWithItsOwnType() {
+    ErrorResponseException rejection = Problems.endpointUrlNotAllowed();
+
+    assertThat(rejection.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_CONTENT);
+    assertThat(rejection.getBody().getType()).isEqualTo(URI.create("endpoint_url_not_allowed"));
+    assertThat(rejection.getBody().getStatus()).isEqualTo(422);
+  }
+
+  @Test
+  void busyLookupAsksTheCallerToComeBackInTwoSeconds() {
+    ErrorResponseException rejection = Problems.lookupBusy();
+
+    assertThat(rejection.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    assertThat(rejection.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("2");
+    assertThat(rejection.getBody().getType()).isEqualTo(URI.create("lookup_busy"));
+    assertThat(rejection.getBody().getStatus()).isEqualTo(429);
+  }
+
   private static void assertDatabaseBusy(ResponseEntity<ProblemDetail> response) {
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
     assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");

@@ -42,7 +42,7 @@ Packages:
 | `delivery/` | `DeliveryPoller`, `DeliveryWorker`, `DeliveryRepository`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
 | `http/` | `WebhookHttpClient`, `SsrfGuardDnsResolver`, `AddressPolicy`, `DnsLookups`, `Signer` |
 | `ops/` | `WorkerLifecycle`, `StartupInvariants`, `ExpiryJob`, `CancelJob`, `RetentionJob`, `QueueGauges`, `PollerHealth` |
-| test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica` |
+| test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `TestTenant` |
 | test `tools/` | `FailureTableCheck` |
 
 The table names the classes that carry the design. The value types and helpers next to them are not listed.
@@ -75,7 +75,7 @@ Each row is a SIGKILL of a real replica process, landed deterministically with t
 - K2 is state-equivalent to a lost response. The test discards the first response, kills the replica and retries on another.
 - A SIGKILL during graceful drain is K4 or K5.
 - K7 shows what its setup can show. That the re-arm itself is all-or-nothing is single-statement atomicity, not something the kill proves.
-- **Orphaned statements.** Killing a replica does not cancel the statement its backend is running. That statement may still execute, and an autocommit statement may still commit. Safety relies on the lease token and on every autocommit write being harmless when orphaned, not on the statement having stopped. The autocommit writes are the gate, the release, the bucket charge, the delete flip, the admin patches and the key rotation. Each of the first five leaves a state another row of this table or the strict-side limiter already covers. A rotation whose response was lost leaves a key that nobody holds, and the operator repeats the call.
+- **Orphaned statements.** Killing a replica does not cancel the statement its backend is running. That statement may still execute, and an autocommit statement may still commit. Safety relies on the lease token and on every autocommit write being harmless when orphaned, not on the statement having stopped. The autocommit writes are the gate, the release, the bucket charge, the delete flip, the admin patches, the endpoint patch and the key rotation. Each of the first five leaves a state another row of this table or the strict-side limiter already covers. An orphaned endpoint patch sets the event types the tenant asked for, and repeating the call changes nothing. A rotation whose response was lost leaves a key that nobody holds, and the operator repeats the call.
 
 ## 4. Data model
 
@@ -195,15 +195,17 @@ A named problem type such as `rate_limited` is sent as the `type` member, as a r
 |---|---|
 | `POST /v1/events` | Body `{"type": "...", "data": {...}}`, header `Idempotency-Key` (required, 1 to 255 printable ASCII). Returns `202 {"id"}`. |
 | `GET /v1/events/{id}` | Event with its deliveries (at most 50). |
-| `POST /v1/endpoints` | `{url, event_types}`. Returns the signing secret once. |
+| `POST /v1/endpoints` | `{url, event_types}`. Returns `201 {"id", "secret"}`. The signing secret is shown this once. At the endpoint cap it answers `409` (section 11.5). |
 | `GET /v1/endpoints`, `GET /v1/endpoints/{id}` | Includes derived circuit state. At most 50 rows by the endpoint cap. |
-| `PATCH /v1/endpoints/{id}` | `event_types` only. A new URL is a new endpoint. |
+| `PATCH /v1/endpoints/{id}` | `event_types` only. Returns `204`. A new URL is a new endpoint. |
 | `DELETE /v1/endpoints/{id}` | Soft delete in one statement. Delivery to the endpoint stops at commit; its pending deliveries become `cancelled` in batches (section 15). |
 | `POST /v1/endpoints/{id}/secret/rotate` | New secret; the old one stays valid for 24 h. |
 | `POST /v1/endpoints/{id}/replay` | `{limit}`; re-arms up to `limit` dead deliveries. Returns `{replayed, remaining}`. |
 | `GET /v1/deliveries?endpoint_id=&state=` | Both filters are required. Keyset pages on `(created_at, id)`, `limit` at most 100, with a `next` cursor. The endpoint is resolved under the tenant first (404 otherwise). |
 | `GET /v1/deliveries/{id}` | The delivery and the attempt log of its current run (at most 13 rows). `?run=n` selects an earlier run. |
 | `POST /v1/deliveries/{id}/replay` | Re-arms one dead delivery. |
+
+**Derived circuit state.** An endpoint reads as `closed`, `open` or `half_open`. Only `closed` and `open` are stored (section 9). `half_open` is an open circuit whose `next_probe_at` has passed, which means the next claim may take one delivery to the endpoint as a probe. The read statement decides it with the database clock.
 
 Problem types used for rejection:
 
@@ -557,6 +559,8 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 **11.2 Tenant scoping.**
 - Every statement behind a tenant route carries `tenant_id = :t`. A mutating route whose first statement matches no row answers 404 and runs nothing else.
 - `SqlTenantScopeTest` scans the repository SQL constants and fails on a tenant-table statement without it. The exemption list holds worker and job statements only, by class.
+  - A tenant table is every table but `tenant`, whose rows are addressed by their own id.
+  - An `INSERT` that only supplies values is not checked. It creates a row and can neither read nor change a row of another tenant.
 - `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` calls every mutating route (patch, delete, rotate, single and bulk replay) with a foreign id. It snapshots the foreign tenant's endpoint, delivery and circuit rows before the call and asserts they are identical after it, in addition to the 404. Read routes are checked for the 404.
 
 **11.3 Signatures.** The format follows Standard Webhooks.
@@ -570,11 +574,12 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 - The timestamp is inside the MAC input, and the body is the stored bytes.
 - The README ships a reference verifier that rejects timestamps older than 5 minutes. Because the timestamp comes from Postgres, a replica with a wrong wall clock cannot get deliveries rejected.
 - After rotation both signatures are sent, space separated, for 24 h. Then the old secret is ignored and later purged. The database clock decides when the overlap ends.
-- Secrets are encrypted at rest with AES-256-GCM under a key from the environment, with a one-byte key-version prefix.
+- A signing secret is `whsec_` plus 32 random bytes in base64, shown once. The 32 bytes are the MAC key.
+- Secrets are encrypted at rest with AES-256-GCM under a key from the environment, with a one-byte key-version prefix. The key is 32 bytes, given in base64. A stored value is the version byte, a random 96-bit nonce, then the ciphertext with its tag.
 
 **11.4 SSRF and the outbound client.**
 - `WebhookHttpClient` is the only class that builds an HTTP client; an `ArchitectureTest` rule enforces it.
-- Its constructor requires an `AddressPolicy` and a `DnsLookups`. There is no default, so an unguarded client cannot be constructed.
+- Its constructor requires a `DnsLookups`, and a `DnsLookups` cannot be built without an `AddressPolicy`. There is no default, so an unguarded client cannot be constructed.
 - **Stateless client.** One client serves all tenants, so it must carry nothing from one request to the next. It is built with cookie management, automatic retries, auth caching, content compression and redirect handling all disabled, without proxy support and without system properties.
   - No cookie store: a `Set-Cookie` from one tenant's endpoint can never reach another tenant's request.
   - No automatic retries: the library default would re-send on 429 and 503, which would be a second request for one attempt row.
@@ -589,11 +594,13 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 - **Proxy.** `StartupInvariants` refuses to start if JVM proxy properties are set, because the guard would then validate the proxy and not the target.
 - **URL policy at registration.** `https` only, port 443 or 1024 to 65535, no userinfo, at most 2048 characters, and the host must resolve to allowed addresses. The lookup runs before the create transaction opens.
 - **No oracle.**
-  - "Does not resolve" and "resolves to a blocked address" return the same `422 endpoint_url_not_allowed`.
+  - "Does not resolve" and "resolves to a blocked address" return the same `422 endpoint_url_not_allowed`. A URL that breaks a rule of form gets that answer too, without a lookup.
   - In the attempt log both appear as `destination_not_allowed`, with no status. The specific reason goes to operator metrics and logs only.
   - No response body is ever stored or returned, so the attempt log cannot read from a destination.
 - **Bounded DNS.** All lookups, at registration and at delivery, go through `DnsLookups`.
   - It is a pool of 32 platform threads with a hard 2 s wait.
+  - It checks every answer against the address policy and counts the lookup by its result. A caller gets either addresses it may connect to or a refusal: `busy`, `timeout`, `failed` or `blocked`.
+  - An address literal takes the same path as a name. The resolver answers it with itself.
   - At most 4 lookups per tenant may be unreturned at once. Beyond that, or when the pool is full, the lookup answers `busy` at once.
   - `busy` is this replica's admission decision, not evidence about the endpoint. At delivery the row is released with a 2 s delay: no attempt is consumed, no attempt row is written and the circuit is not touched (section 7). At registration it is `429 lookup_busy`.
   - A timeout is different: the lookup was admitted and the endpoint's DNS did not answer. At delivery it is a failed attempt that counts toward the breaker, so a tarpit endpoint is down to one lookup per probe interval after five failures. At registration it is the same 422.
@@ -607,7 +614,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 | Request body | 256 KiB (413 above) |
 | Event type | 128 characters of `[a-z0-9_.-]` |
 | Idempotency key | 255 characters |
-| Event-type filter | 20 entries |
+| Event-type filter | 1 to 20 entries, each `*` or an event type |
 | Endpoints per tenant | `max_endpoints`, default 20, at most 50 |
 | Response status line and each header line | 8 KiB |
 | Response headers | 100 |
@@ -700,7 +707,7 @@ RETURNING b.tokens;
 
 ## 13. Failure table
 
-The checked copy of this table lives in `docs/failure-table.md`, where a row appears only once the test that proves it exists. The README shows the headline rows. `FailureTableCheck` (section 16) fails the build unless every test linked from either file ran and passed in the same build.
+The checked copy of this table lives in `docs/failure-table.md`, where a row appears only once the test that proves it exists. The README shows the headline rows. `FailureTableCheck` (section 16) fails the build unless every test linked from a table in either file ran and passed in the same build.
 
 | # | Failure | Proven behaviour | Test | Forced by |
 |---|---|---|---|---|
@@ -721,7 +728,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 | 15 | One tenant's backlog starving another tenant | Held case: tenant A never exceeds 16 in flight per replica and tenant B completes meanwhile. Fast case: with a deep backlog on A's instantly answering endpoint, B's request arrives before A's 200th of 2,000 | `TenantIsolationIT#backlogOfOneTenantDoesNotStarveAnother`, `#deepBacklogOnFastEndpointDoesNotStarveAnother` | Held case: A has 5 endpoints and the receiver holds 4 requests on each, so the tenant cap binds before the endpoint caps. Fast case: 2,000 aged due rows for A, one newer row for B; ordering read from the receiver's request log |
 | 16 | Tenant floods ingest | Admitted units equal the bucket exactly across replicas; large bodies cost more; the 9th concurrent request gets 429 without acquiring a database connection; an unsatisfiable request gets 429 without `Retry-After`; tenant B is served | `RateLimitIT#limitIsExactAcrossReplicas`, `#refillIsExact`, `#fanOutIsChargedPerDelivery`, `#largeBodiesAreChargedBySize`, `#costAboveBurstIsUnsatisfiable`, `#ninthConcurrentRequestTakesNoConnection`, `#floodingTenantDoesNotBlockOtherTenant` | Rate 0 and fixed burst; eight requests with unfinished bodies hold A's permits; A's bucket row locked by the test |
 | 17 | Tenant replays a huge dead-letter backlog | At most `limit` rows per call, charged per row, spread over 60 s; a kill after the charge re-arms nothing | `ReplayIT#bulkReplayIsBoundedAndCharged`, `#killedMidReplayRearmsNothing` | Dead rows inserted directly; test lock on the endpoint row blocks the replay's share lock |
-| 18 | Subscriber URL points at, or rebinds to, a private address | Rejected at registration; blocked at connect with zero accepted connections; redirects not followed | `SsrfIT#registrationRejectsPrivateTargets`, `#rebindingIsBlockedAtConnect`, `#redirectIsNotFollowed`, `AddressPolicyTest` | `StubDns` answers public first, loopback later; listener counts accepts |
+| 18 | Subscriber URL points at, or rebinds to, a private address | Rejected at registration; blocked at connect with zero accepted connections; redirects not followed | `SsrfIT#registrationRejectsPrivateTargets`, `#rebindingIsBlockedAtConnect`, `#redirectIsNotFollowed`, `AddressPolicyTest`, `DnsLookupsTest#systemResolverDoesNotLetADeniedAddressLiteralPast` | `StubDns` answers public first, loopback later; listener counts accepts; denied address literals given to the system resolver |
 | 19 | Absurd `Retry-After` | Clamped to between the own delay and one hour | `RetryAfterIT#clampedAtBothEnds` | Receiver sends 0 and 10^9 |
 | 20 | Rolling deploy (SIGTERM) | Nothing is claimed after the poller stopped; in-flight attempts finish and are recorded; the process exits by itself with code 143 before lease expiry | `GracefulShutdownIT#drainsInFlightAndExits` | Receiver holds 4 requests; a 5th delivery is due and unclaimed only because the endpoint is full; SIGTERM; `poller_stopped` seen; receiver released |
 | 21 | Endpoint deleted while deliveries are pending or being created | Delivery to it stops when the delete commits; pending rows become `cancelled`; nothing is created or re-armed for it afterwards; a delete by another tenant changes nothing | `EndpointDeleteIT#deleteStopsDeliveryAndCancelsPending`, `#ingestRacingDeleteLeavesNoOrphan`, `#replayRacingDeleteLeavesNoOrphan`, `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` | Receiver holds 4 requests with 2 rows still due; canary as witness; both race orders forced with two test-managed transactions |
@@ -795,7 +802,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 
 **Startup invariants** (`StartupInvariants`; the process exits non-zero on any failure):
 - Admin token present and long enough.
-- Secret-encryption key present.
+- Secret-encryption key present and usable: 32 bytes in base64.
 - `default_transaction_isolation` is `read committed`.
 - `synchronous_commit` is not `off`.
 - Lease >= attempt deadline + 30 s.
@@ -901,11 +908,12 @@ Harness:
 | `FaultReceiver` | In-process HTTP server. Per-path scripts: status with optional response headers, delay, hold until released, drip, close without response, redirect, `endlessHeader`, `endlessBody`. Records every request with its headers, counts accepted connections and peak concurrency per path, and for the endless scripts the bytes written and whether the peer closed first. |
 | `ReplicaProcess` | Starts the packaged jar as a child JVM against the Testcontainers database, with the replica id as `application_name`. Captures stdout. `kill()` is SIGKILL, `terminate()` is SIGTERM, `exitCode()` waits for the process to end by itself. |
 | `PgWait` | `untilBlocked(sqlFragment, replica)` polls `pg_stat_activity` for a backend of that replica waiting on a lock in a statement containing the fragment. `untilGone(replica)` waits until its backends have left. |
-| `StubDns` | Delegate resolver for `SsrfGuardDnsResolver`: scripted answers per call, or block until released. |
+| `StubDns` | The resolver behind `DnsLookups` in a replica inside the test JVM, in place of the system resolver: scripted answers per call, or block until released. A name that no test scripted does not resolve. |
 | `TcpProxy` | In-process TCP forwarder between one replica and Postgres. `blackhole()` keeps every existing connection open and relays nothing more on it, ever; new connections are accepted and ignored. `heal()` lets new connections relay again. |
 | `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use. Hands its JDBC URL and credentials to replicas and gives a test its own `JdbcClient` outside the pools of the service. |
 | `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection, an admin token and a secret-encryption key. |
 | `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings. All such classes share one application context, and so one pair of pools. |
+| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. |
 
 How each proof is forced.
 

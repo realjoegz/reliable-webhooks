@@ -8,6 +8,7 @@ import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Database;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Delivery;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Pool;
 import java.time.Duration;
+import java.util.Base64;
 import java.util.List;
 import java.util.Properties;
 import javax.sql.DataSource;
@@ -20,6 +21,7 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 class StartupInvariantsTest {
 
   private static final String ADMIN_TOKEN = "a".repeat(32);
+  private static final String SECRET_KEY = base64OfBytes(32);
   private static final Pool API_POOL = pool(Duration.ofSeconds(3), Duration.ofSeconds(10), true);
   private static final Pool WORKER_POOL = pool(Duration.ofSeconds(3), Duration.ofSeconds(15), true);
   private static final Delivery DELIVERY =
@@ -29,28 +31,37 @@ class StartupInvariantsTest {
 
   @Test
   void designValuesHold() {
-    assertThat(violations(properties(ADMIN_TOKEN, "key", API_POOL, WORKER_POOL, DELIVERY)))
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY)))
         .isEmpty();
   }
 
   @Test
   void adminTokenMustBePresent() {
-    assertThat(violations(properties(null, "key", API_POOL, WORKER_POOL, DELIVERY)))
+    assertThat(violations(properties(null, SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY)))
         .containsExactly("webhooks.admin-token must have at least 32 characters");
   }
 
   @Test
   void adminTokenMustHaveThirtyTwoCharacters() {
-    assertThat(violations(properties("a".repeat(31), "key", API_POOL, WORKER_POOL, DELIVERY)))
+    assertThat(violations(properties("a".repeat(31), SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY)))
         .containsExactly("webhooks.admin-token must have at least 32 characters");
   }
 
   @ParameterizedTest
   @NullAndEmptySource
-  @ValueSource(strings = " ")
-  void secretEncryptionKeyMustBePresent(String key) {
+  @ValueSource(strings = {" ", "not base64!"})
+  void secretEncryptionKeyMustBePresentAndBase64(String key) {
     assertThat(violations(properties(ADMIN_TOKEN, key, API_POOL, WORKER_POOL, DELIVERY)))
-        .containsExactly("webhooks.secret-encryption-key must be set");
+        .containsExactly("webhooks.secret-encryption-key must be 32 bytes in base64");
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {31, 33})
+  void secretEncryptionKeyMustHaveThirtyTwoBytes(int bytes) {
+    assertThat(
+            violations(
+                properties(ADMIN_TOKEN, base64OfBytes(bytes), API_POOL, WORKER_POOL, DELIVERY)))
+        .containsExactly("webhooks.secret-encryption-key must be 32 bytes in base64");
   }
 
   @Test
@@ -58,7 +69,7 @@ class StartupInvariantsTest {
     Delivery delivery =
         new Delivery(Duration.ofSeconds(15), Duration.ofSeconds(45), Duration.ofSeconds(35));
 
-    assertThat(violations(properties(ADMIN_TOKEN, "key", API_POOL, WORKER_POOL, delivery)))
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, delivery)))
         .isEmpty();
   }
 
@@ -67,7 +78,7 @@ class StartupInvariantsTest {
     Delivery delivery =
         new Delivery(Duration.ofSeconds(15), Duration.ofSeconds(44), Duration.ofSeconds(35));
 
-    assertThat(violations(properties(ADMIN_TOKEN, "key", API_POOL, WORKER_POOL, delivery)))
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, delivery)))
         .containsExactly("webhooks.delivery.lease must be at least the attempt deadline plus 30 s");
   }
 
@@ -104,7 +115,7 @@ class StartupInvariantsTest {
   void borrowWaitMustBeSet() {
     Pool pool = pool(Duration.ZERO, Duration.ofSeconds(10), true);
 
-    assertThat(violations(properties(ADMIN_TOKEN, "key", pool, WORKER_POOL, DELIVERY)))
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, pool, WORKER_POOL, DELIVERY)))
         .containsExactly("api pool: borrow wait must be set");
   }
 
@@ -112,7 +123,7 @@ class StartupInvariantsTest {
   void connectTimeoutBelowOneSecondCountsAsUnset() {
     Pool pool = pool(Duration.ofSeconds(3), Duration.ofMillis(999), Duration.ofSeconds(15), true);
 
-    assertThat(violations(properties(ADMIN_TOKEN, "key", API_POOL, pool, DELIVERY)))
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, pool, DELIVERY)))
         .containsExactly("worker pool: connectTimeout must be set");
   }
 
@@ -120,7 +131,7 @@ class StartupInvariantsTest {
   void socketTimeoutBelowOneSecondCountsAsUnset() {
     Pool pool = pool(Duration.ofSeconds(3), Duration.ofMillis(999), true);
 
-    assertThat(violations(properties(ADMIN_TOKEN, "key", pool, WORKER_POOL, DELIVERY)))
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, pool, WORKER_POOL, DELIVERY)))
         .contains("api pool: socketTimeout must be set");
   }
 
@@ -128,7 +139,7 @@ class StartupInvariantsTest {
   void tcpKeepAliveMustBeOn() {
     Pool pool = pool(Duration.ofSeconds(3), Duration.ofSeconds(15), false);
 
-    assertThat(violations(properties(ADMIN_TOKEN, "key", API_POOL, pool, DELIVERY)))
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, pool, DELIVERY)))
         .containsExactly("worker pool: tcpKeepAlive must be on");
   }
 
@@ -174,7 +185,7 @@ class StartupInvariantsTest {
   void stuckCallMayEndOneSecondBeforeTheStartCutoff() {
     Pool pool = pool(Duration.ofSeconds(18), Duration.ofSeconds(15), true);
 
-    assertThat(violations(properties(ADMIN_TOKEN, "key", API_POOL, pool, DELIVERY))).isEmpty();
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, pool, DELIVERY))).isEmpty();
   }
 
   // 19 s of borrow wait, 1 s of aliveness test and 15 s of socket timeout are the 35 s cutoff.
@@ -182,7 +193,7 @@ class StartupInvariantsTest {
   void borrowWaitPlusAlivenessTestPlusSocketTimeoutMustBeBelowTheStartCutoff() {
     Pool pool = pool(Duration.ofSeconds(19), Duration.ofSeconds(15), true);
 
-    assertThat(violations(properties(ADMIN_TOKEN, "key", API_POOL, pool, DELIVERY)))
+    assertThat(violations(properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, pool, DELIVERY)))
         .containsExactly(
             "worker pool: borrow wait plus aliveness test plus socketTimeout must be below the"
                 + " start cutoff");
@@ -192,7 +203,7 @@ class StartupInvariantsTest {
   void jvmMustExitOnOutOfMemoryError() {
     assertThat(
             StartupInvariants.violations(
-                properties(ADMIN_TOKEN, "key", API_POOL, WORKER_POOL, DELIVERY),
+                properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY),
                 API_SESSION,
                 WORKER_SESSION,
                 false,
@@ -235,7 +246,10 @@ class StartupInvariantsTest {
         };
     StartupInvariants invariants =
         new StartupInvariants(
-            properties("short", "key", API_POOL, WORKER_POOL, DELIVERY), sessions, api, worker);
+            properties("short", SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY),
+            sessions,
+            api,
+            worker);
 
     System.setProperty("http.proxyHost", "proxy.internal");
     try {
@@ -259,7 +273,7 @@ class StartupInvariantsTest {
 
   private static List<String> violations(SessionSettings api, SessionSettings worker) {
     return StartupInvariants.violations(
-        properties(ADMIN_TOKEN, "key", API_POOL, WORKER_POOL, DELIVERY),
+        properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY),
         api,
         worker,
         true,
@@ -268,11 +282,15 @@ class StartupInvariantsTest {
 
   private static List<String> violations(Properties systemProperties) {
     return StartupInvariants.violations(
-        properties(ADMIN_TOKEN, "key", API_POOL, WORKER_POOL, DELIVERY),
+        properties(ADMIN_TOKEN, SECRET_KEY, API_POOL, WORKER_POOL, DELIVERY),
         API_SESSION,
         WORKER_SESSION,
         true,
         systemProperties);
+  }
+
+  private static String base64OfBytes(int bytes) {
+    return Base64.getEncoder().encodeToString(new byte[bytes]);
   }
 
   private static WebhooksProperties properties(

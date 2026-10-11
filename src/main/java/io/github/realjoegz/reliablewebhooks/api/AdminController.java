@@ -21,9 +21,23 @@ public class AdminController {
 
   record CreateTenant(String name) {}
 
-  record CreatedTenant(UUID id, String apiKey) {}
+  record CreatedTenant(UUID id, String apiKey) {
 
-  record RotatedApiKey(String apiKey) {}
+    /** Leaves out the API key, so that printing cannot leak it. */
+    @Override
+    public String toString() {
+      return "CreatedTenant[id=%s]".formatted(id);
+    }
+  }
+
+  record RotatedApiKey(String apiKey) {
+
+    /** Leaves out the API key, so that printing cannot leak it. */
+    @Override
+    public String toString() {
+      return "RotatedApiKey[redacted]";
+    }
+  }
 
   private final TenantRepository tenants;
   private final ApiKeyCache cache;

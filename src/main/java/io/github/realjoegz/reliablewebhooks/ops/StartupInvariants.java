@@ -5,6 +5,7 @@ import io.github.realjoegz.reliablewebhooks.DatabasePools;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Delivery;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Pool;
+import io.github.realjoegz.reliablewebhooks.endpoint.SecretCipher;
 import java.lang.management.ManagementFactory;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
@@ -74,8 +75,8 @@ public class StartupInvariants implements InitializingBean {
           "webhooks.admin-token must have at least %d characters"
               .formatted(MIN_ADMIN_TOKEN_LENGTH));
     }
-    if (!StringUtils.hasText(properties.secretEncryptionKey())) {
-      violations.add("webhooks.secret-encryption-key must be set");
+    if (!SecretCipher.isUsableKey(properties.secretEncryptionKey())) {
+      violations.add(SecretCipher.KEY_REQUIREMENT);
     }
 
     Delivery delivery = properties.delivery();

@@ -11,17 +11,22 @@ Built and tested:
 - **Schema.** The complete data model of the design, as one Flyway migration.
 - **Tenant administration.** `POST /admin/tenants` creates a tenant together with its rate bucket and returns the API key once. `POST /admin/tenants/{id}/api-key/rotate` replaces the key, and the replica that handled the call rejects the old key from then on.
 - **Authentication.** The health endpoints are open, admin routes take a static admin token, and every other path takes a tenant API key, whether a route exists there or not. Only the SHA-256 of a key is stored. A key that is missing, malformed, unknown, rotated away or owned by a suspended tenant is rejected. A replica caches a key it has looked up for 30 seconds.
+- **Endpoints.** `POST /v1/endpoints` registers an endpoint for a URL and 1 to 20 event types, and returns its signing secret once. `GET /v1/endpoints` and `GET /v1/endpoints/{id}` read endpoints with their circuit state, and `PATCH /v1/endpoints/{id}` replaces the event types. The id of another tenant's endpoint answers 404. An endpoint and its circuit row are created in one transaction. A tenant has room for 20 endpoints unless its cap is changed, and concurrent creates cannot exceed the cap.
+- **URL policy.** An endpoint is registered only for an `https` URL on port 443 or 1024 to 65535, without userinfo, of at most 2048 characters, whose host resolves to public addresses only. The address ranges that count as not public are an explicit list. A refused URL gets `422 endpoint_url_not_allowed`, and the answer is the same for a private address, for a host that does not resolve and for a lookup that timed out.
+- **Bounded DNS.** A registration waits 2 seconds for a lookup and is refused if the resolver has not answered by then. A replica runs at most 32 lookups at a time and at most 4 for one tenant, counting every lookup that has not returned. Beyond that a registration gets `429 lookup_busy` at once. A lookup that is stuck holds no database connection, and other tenants register meanwhile.
+- **Encrypted secrets.** A signing secret is stored encrypted with AES-256-GCM under `webhooks.secret-encryption-key`, with a random nonce per secret.
+- **Tenant scope.** A test reads the SQL of every repository and fails on a statement that names a table of the schema other than `tenant` without `tenant_id = :t`. An `INSERT` that only supplies values is not checked.
 - **Errors.** Errors are RFC 9457 problem documents. A lock timeout, a statement timeout and a borrow wait that ran out are mapped to `503 database_busy` with `Retry-After: 1`.
 - **Bounded database calls.** Two connection pools, `api` and `worker`. Each sets a bound on the borrow wait, the aliveness test of a borrowed connection, the TCP connect, the lock wait, the statement, the socket read and the idle transaction. A parameter in the JDBC URL cannot remove a bound.
-- **Startup invariants.** The service refuses to start if the admin token is shorter than 32 characters, the secret-encryption key is missing, a pool lacks a time limit or TCP keepalive or has its limits in the wrong order, the database is not at `read committed` or has `synchronous_commit` off, the lease is shorter than the attempt deadline plus 30 seconds, the JVM runs without `-XX:+ExitOnOutOfMemoryError`, or JVM proxy properties are set.
+- **Startup invariants.** The service refuses to start if the admin token is shorter than 32 characters, the secret-encryption key is not 32 bytes in base64, a pool lacks a time limit or TCP keepalive or has its limits in the wrong order, the database is not at `read committed` or has `synchronous_commit` off, the lease is shorter than the attempt deadline plus 30 seconds, the JVM runs without `-XX:+ExitOnOutOfMemoryError`, or JVM proxy properties are set.
 - **Logging.** Console logs are JSON. The `local` profile turns the JSON format off, so Spring Boot logs its usual plain text.
 - **The failure-table check.** The build deletes the old test reports, runs the tests and then fails unless every test linked from a failure table ran and passed.
 
-Not built yet: endpoints, event ingest, delivery, retries, the circuit breaker, rate limiting, signatures, the SSRF guard, the background jobs, metrics and tracing. No tenant route exists yet, so an API key can authenticate and nothing more.
+Not built yet: event ingest, delivery, retries, the circuit breaker, rate limiting, the request body limit, the per-tenant request permits, signatures, the address check at connect time, endpoint delete, secret rotation, replay, the background jobs, the metrics endpoint and tracing. An endpoint can be registered, and nothing is delivered to it yet. No circuit opens yet, so every endpoint reads `closed`.
 
 ## Guarantees
 
-The design commits the finished service to the guarantees below. None of them is implemented yet. A guarantee counts as delivered only once the tests that prove it are listed in the failure table. Section numbers refer to [docs/design.md](docs/design.md).
+The design commits the finished service to the guarantees below. None of them holds yet. Of G7 the part about registration exists: an endpoint cannot be registered for a host with a non-public address. A guarantee counts as delivered only once the tests that prove it are listed in the failure table. Section numbers refer to [docs/design.md](docs/design.md).
 
 | # | Guarantee | Enforced by |
 |---|---|---|
@@ -99,8 +104,11 @@ The headline rows of [docs/failure-table.md](docs/failure-table.md). Each row na
 
 | # | Failure | Proven behaviour | Test |
 |---|---|---|---|
+| 18 | Subscriber URL points at a private address | Rejected at registration | `SsrfIT#registrationRejectsPrivateTargets`, `AddressPolicyTest`, `DnsLookupsTest#systemResolverDoesNotLetADeniedAddressLiteralPast` |
 
-There is no row yet, because no row of the design has all of its tests. Tenant creation is built, and the design has a row for it: a replica killed between the tenant insert and the bucket insert. The test of that row kills a replica that runs as a process of its own, and the test harness cannot start one yet.
+Row 18 is the first row. It covers registration only. The design row also covers the address check at connect time and redirects, which arrive with delivery.
+
+Tenant and endpoint creation are built, and the design has a row for them: a replica killed between the two inserts of either transaction. The tests of that row kill a replica that runs as a process of its own, and the test harness cannot start one yet.
 
 ## Documents
 
