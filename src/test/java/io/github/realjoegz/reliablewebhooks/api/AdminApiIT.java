@@ -9,7 +9,6 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Map;
@@ -61,11 +60,8 @@ class AdminApiIT {
   void failedBucketInsertLeavesNoTenant() throws SQLException {
     String name = "no-bucket-" + UUID.randomUUID();
 
-    try (Connection blocker =
-            DriverManager.getConnection(
-                TestDatabase.jdbcUrl(), TestDatabase.username(), TestDatabase.password());
+    try (Connection blocker = TestDatabase.connection();
         Statement statement = blocker.createStatement()) {
-      blocker.setAutoCommit(false);
       statement.execute("LOCK TABLE rate_bucket IN ACCESS EXCLUSIVE MODE");
 
       http.post()

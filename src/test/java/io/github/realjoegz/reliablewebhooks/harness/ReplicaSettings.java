@@ -14,12 +14,15 @@ public final class ReplicaSettings
 
   public static final String ADMIN_TOKEN = "admin-token-for-integration-tests-only";
 
+  /** The application_name of the replica inside the test JVM. {@link PgWait} finds it by this. */
+  public static final String IN_PROCESS_REPLICA = "in-process-replica";
+
   private static final String SECRET_ENCRYPTION_KEY =
       "c2VjcmV0LWtleS1mb3ItaW50ZWdyYXRpb24tdGVzdHM=";
 
   public static Map<String, String> properties() {
     return Map.of(
-        "webhooks.database.url", TestDatabase.jdbcUrl(),
+        "webhooks.database.url", jdbcUrlAs(IN_PROCESS_REPLICA),
         "webhooks.database.username", TestDatabase.username(),
         "webhooks.database.password", TestDatabase.password(),
         "webhooks.admin-token", ADMIN_TOKEN,
@@ -29,5 +32,10 @@ public final class ReplicaSettings
   @Override
   public void initialize(ConfigurableApplicationContext context) {
     TestPropertyValues.of(properties()).applyTo(context);
+  }
+
+  private static String jdbcUrlAs(String applicationName) {
+    String url = TestDatabase.jdbcUrl();
+    return url + (url.contains("?") ? "&" : "?") + "ApplicationName=" + applicationName;
   }
 }

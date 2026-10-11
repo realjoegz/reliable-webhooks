@@ -6,6 +6,13 @@ spring:
       enabled: true
   jackson:
     property-naming-strategy: SNAKE_CASE
+    factory:
+      constraints:
+        read:
+          # The limit that EventRequest sets for an event body, for the bodies of the other
+          # routes. The parser keeps the member names it has read in a table that all requests
+          # share, and without this a name of up to 50,000 bytes stays in it.
+          max-name-length: 1024
   web:
     resources:
       add-mappings: false

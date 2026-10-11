@@ -8,7 +8,6 @@ import io.github.realjoegz.reliablewebhooks.harness.StubDns;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Arrays;
@@ -144,11 +143,8 @@ class EndpointApiIT {
   void failedCircuitInsertLeavesNoEndpoint() throws SQLException {
     TestTenant tenant = TestTenant.create(http, "no-circuit");
 
-    try (Connection blocker =
-            DriverManager.getConnection(
-                TestDatabase.jdbcUrl(), TestDatabase.username(), TestDatabase.password());
+    try (Connection blocker = TestDatabase.connection();
         Statement statement = blocker.createStatement()) {
-      blocker.setAutoCommit(false);
       statement.execute("LOCK TABLE endpoint_circuit IN ACCESS EXCLUSIVE MODE");
 
       register(tenant, URL, List.of("*"))
@@ -363,6 +359,26 @@ class EndpointApiIT {
         .expectBody()
         .jsonPath("$.detail")
         .isEqualTo("url is required");
+
+    assertThat(endpointRowsOf(tenant)).isEqualTo(1);
+  }
+
+  // A registration ignores the extra member, so the name of that member is the only thing that
+  // differs between the body that is accepted and the body that is refused. The name is made of
+  // two-byte characters, so the refused one has 513 characters: the bytes are what is counted.
+  @Test
+  void memberNameAboveOneThousandTwentyFourBytesIsRejected() {
+    TestTenant tenant = TestTenant.create(http, "member-name-limit");
+    String name = "é".repeat(512);
+
+    post(tenant, Map.of("url", URL, "event_types", List.of("*"), name, 1))
+        .expectStatus()
+        .isCreated();
+    post(tenant, Map.of("url", URL, "event_types", List.of("*"), "k" + name, 1))
+        .expectStatus()
+        .isBadRequest()
+        .expectHeader()
+        .contentType(MediaType.APPLICATION_PROBLEM_JSON);
 
     assertThat(endpointRowsOf(tenant)).isEqualTo(1);
   }

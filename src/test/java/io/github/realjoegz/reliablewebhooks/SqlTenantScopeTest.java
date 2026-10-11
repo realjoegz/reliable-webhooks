@@ -45,7 +45,10 @@ class SqlTenantScopeTest {
 
     assertThat(tenantTables).contains("endpoint", "endpoint_circuit", "delivery");
     assertThat(statements)
-        .containsKeys("EndpointRepository.FIND", "TenantRepository.INSERT_BUCKET");
+        .containsKeys(
+            "EndpointRepository.FIND",
+            "EventRepository.INSERT_DELIVERIES",
+            "TenantRepository.INSERT_BUCKET");
     assertThat(statements)
         .allSatisfy(
             (name, sql) -> assertThat(unscopedTenantTables(sql, tenantTables)).as(name).isEmpty());

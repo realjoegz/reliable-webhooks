@@ -8,7 +8,6 @@ import io.github.realjoegz.reliablewebhooks.harness.StubDns;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -52,12 +51,9 @@ class EndpointLimitIT {
     List<HttpStatusCode> answers = new ArrayList<>();
     try (ExecutorService callers = Executors.newVirtualThreadPerTaskExecutor()) {
       List<Future<HttpStatusCode>> creates = new ArrayList<>();
-      try (Connection blocker =
-              DriverManager.getConnection(
-                  TestDatabase.jdbcUrl(), TestDatabase.username(), TestDatabase.password());
+      try (Connection blocker = TestDatabase.connection();
           PreparedStatement lock =
               blocker.prepareStatement("SELECT 1 FROM tenant WHERE id = ? FOR NO KEY UPDATE")) {
-        blocker.setAutoCommit(false);
         lock.setObject(1, tenant.id());
         lock.execute();
 

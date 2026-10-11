@@ -1,5 +1,8 @@
 package io.github.realjoegz.reliablewebhooks.harness;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -40,5 +43,17 @@ public final class TestDatabase {
   /** The test's own access, outside the pools of the service under test. */
   public static JdbcClient jdbc() {
     return JDBC;
+  }
+
+  /**
+   * A connection with autocommit off, for a transaction that the test holds open while the service
+   * under test runs into its locks.
+   */
+  public static Connection connection() throws SQLException {
+    Connection connection =
+        DriverManager.getConnection(
+            POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+    connection.setAutoCommit(false);
+    return connection;
   }
 }

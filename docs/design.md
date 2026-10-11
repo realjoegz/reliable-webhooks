@@ -35,7 +35,7 @@ Packages:
 | Package | Contents |
 |---|---|
 | (root) | `ReliableWebhooksApplication`, `WebhooksProperties` (every `webhooks.*` setting), `DatabasePools` |
-| `api/` | Controllers, `Problems`, `ApiKeyFilter`, `TenantConcurrencyFilter`, `UntrustedTraceContextFilter` |
+| `api/` | Controllers, `Problems`, `ApiKeyFilter`, `TenantConcurrencyFilter`, `UntrustedTraceContextFilter`, `IngestMeter` |
 | `tenant/` | `TenantRepository` |
 | `endpoint/` | `EndpointService`, `EndpointRepository`, `UrlPolicy`, `SecretCipher` |
 | `ingest/` | `IngestService`, `EventRepository`, `TokenBucket` |
@@ -107,6 +107,8 @@ CREATE TABLE endpoint (                                 -- configuration; writte
   created_at  timestamptz NOT NULL DEFAULT now(),
   deleted_at  timestamptz
 );
+CREATE INDEX endpoint_active ON endpoint (tenant_id) WHERE status = 'active';   -- ingest match, cap, list
+
 CREATE TABLE endpoint_circuit (                         -- health; inserted with the endpoint,
   endpoint_id uuid PRIMARY KEY REFERENCES endpoint ON DELETE CASCADE,   -- afterwards written only by workers
   state       text NOT NULL DEFAULT 'closed' CHECK (state IN ('closed','open')),
@@ -194,7 +196,7 @@ A named problem type such as `rate_limited` is sent as the `type` member, as a r
 | Route | Behaviour |
 |---|---|
 | `POST /v1/events` | Body `{"type": "...", "data": {...}}`, header `Idempotency-Key` (required, 1 to 255 printable ASCII). Returns `202 {"id"}`. |
-| `GET /v1/events/{id}` | Event with its deliveries (at most 50). |
+| `GET /v1/events/{id}` | Event with its deliveries (at most 50). Its `created_at` is the `now()` of the ingest transaction, the database time that its deliveries are due from. The `created_at` in the body that subscribers receive is the clock of a replica (section 6), so the two can differ. |
 | `POST /v1/endpoints` | `{url, event_types}`. Returns `201 {"id", "secret"}`. The signing secret is shown this once. At the endpoint cap it answers `409` (section 11.5). |
 | `GET /v1/endpoints`, `GET /v1/endpoints/{id}` | Includes derived circuit state. At most 50 rows by the endpoint cap. |
 | `PATCH /v1/endpoints/{id}` | `event_types` only. Returns `204`. A new URL is a new endpoint. |
@@ -240,11 +242,14 @@ The delivery rows are the outbox. They are written in the same transaction as th
 Order of work for `POST /v1/events`:
 
 1. **Authenticate**, then take a per-tenant request permit (section 12). A request rejected here has not acquired a database connection.
-2. **Validate** size, JSON, type and key. Render the body `{"id","type","created_at","data"}` once.
-3. **Idempotency lookup**: `SELECT id, request_hash FROM event WHERE tenant_id = :t AND idempotency_key = :k`.
+2. **Validate** size, JSON, type and key against the limits of section 11.5. Render the body `{"id","type","created_at","data"}` once.
+   - `data` must be a JSON object. Its numbers keep their exact value. None is read into a double.
+   - Of members with the same name in one object, the last one counts.
+   - `created_at` is the replica's wall clock at this step, in milliseconds and always with three fraction digits. It is information for the subscriber. Nothing is scheduled from it, and it is never compared with a database timestamp.
+3. **Idempotency lookup**: `SELECT id, request_hash FROM event WHERE tenant_id = :t AND idempotency_key = :k`. The request hash is the SHA-256 of the request body as received.
    - Same hash: return `202` with the original id and `Idempotent-Replay: true`, not charged.
    - Different hash: `422 idempotency_key_reused`.
-4. **Match**: `SELECT id FROM endpoint WHERE tenant_id = :t AND status = 'active' AND (event_types @> ARRAY['*'] OR event_types @> ARRAY[:type])`. Call the result `matched`.
+4. **Match**: `SELECT id FROM endpoint WHERE tenant_id = :t AND status = 'active' AND (event_types @> ARRAY['*'] OR event_types @> ARRAY[:type::text])`. Call the result `matched`. The cast is there because the driver sends a string parameter as `varchar`, and Postgres has no `text[] @> varchar[]`.
 5. **Charge** `max(1, |matched|) + floor(body_bytes / 4096)` units to the token bucket in one autocommit statement (section 12). No tokens means `429`.
 6. **One transaction** on the `api` pool:
 
@@ -529,6 +534,11 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 | `webhooks_dns_lookups_total` | `result` = ok, timeout, busy, failed, blocked |
 | `webhooks_ssrf_allowlist_entries` (gauge) | none; must be 0 in production |
 
+`webhooks_ingest_requests_total` counts a request that the ingest route answered with one of these results, once, when the request is over. `invalid` is a `400`, a `413` or a `422`, and `busy` is a `503`. Nothing else is counted:
+- a request that is refused before it reaches the route, by authentication or for its media type;
+- a request to any other route;
+- a request that the ingest route answered with any other status. A `500` is such an answer, so a failure that the service maps to none of the results does not appear in this counter.
+
 `QueueGauges` runs one aggregate query over the pending index every 15 s per replica. It uses the claim's eligibility predicates: `due` counts rows a claim could take, and `held` counts due rows behind an open circuit or a suspended tenant.
 
 **Traces.**
@@ -614,6 +624,9 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 | Request body | 256 KiB (413 above) |
 | Event type | 128 characters of `[a-z0-9_.-]` |
 | Idempotency key | 255 characters |
+| Number in an event body | 1,000 digits, those of its exponent included, and an exponent that fits a Java `BigDecimal`, which is about plus or minus 2.1 billion |
+| Member name in a request body | 1,024 bytes of UTF-8 |
+| Nesting of an event body | 500 levels, the body itself being the first |
 | Event-type filter | 1 to 20 entries, each `*` or an event type |
 | Endpoints per tenant | `max_endpoints`, default 20, at most 50 |
 | Response status line and each header line | 8 KiB |
@@ -621,6 +634,10 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 | Response body read | 64 KiB, then the connection is aborted |
 | List page | 100 rows |
 | Attempt log per read | One run (at most 13 rows) |
+
+The three limits on an event body are set in the code and not left to the defaults of the JSON library. A body beyond one of them answers `400`, like a body that is not JSON.
+
+The limit on a member name also holds on the other routes that read a body, where it is set for the JSON mapper of the API. It is far below the 50,000 bytes that the library allows, for this reason: the parser keeps the member names it has read in a table that all requests share, so a name stays in memory after its request has ended. The limit bounds what one name can add to that table.
 
 The endpoint cap is exact, and an endpoint is never created without its circuit row:
 
@@ -907,13 +924,13 @@ Harness:
 |---|---|
 | `FaultReceiver` | In-process HTTP server. Per-path scripts: status with optional response headers, delay, hold until released, drip, close without response, redirect, `endlessHeader`, `endlessBody`. Records every request with its headers, counts accepted connections and peak concurrency per path, and for the endless scripts the bytes written and whether the peer closed first. |
 | `ReplicaProcess` | Starts the packaged jar as a child JVM against the Testcontainers database, with the replica id as `application_name`. Captures stdout. `kill()` is SIGKILL, `terminate()` is SIGTERM, `exitCode()` waits for the process to end by itself. |
-| `PgWait` | `untilBlocked(sqlFragment, replica)` polls `pg_stat_activity` for a backend of that replica waiting on a lock in a statement containing the fragment. `untilGone(replica)` waits until its backends have left. |
+| `PgWait` | `untilBlocked(sqlFragment, replica)` polls `pg_stat_activity` for a backend of that replica waiting on a lock in a statement containing the fragment. The lock timeout of the replica's pool ends that wait, so the test has that long to act. `untilGone(replica)` waits until its backends have left. |
 | `StubDns` | The resolver behind `DnsLookups` in a replica inside the test JVM, in place of the system resolver: scripted answers per call, or block until released. A name that no test scripted does not resolve. |
 | `TcpProxy` | In-process TCP forwarder between one replica and Postgres. `blackhole()` keeps every existing connection open and relays nothing more on it, ever; new connections are accepted and ignored. `heal()` lets new connections relay again. |
-| `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use. Hands its JDBC URL and credentials to replicas and gives a test its own `JdbcClient` outside the pools of the service. |
-| `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection, an admin token and a secret-encryption key. |
+| `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. |
+| `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection with the replica id as `application_name`, an admin token and a secret-encryption key. |
 | `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings. All such classes share one application context, and so one pair of pools. |
-| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. |
+| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint and sends an event as that tenant, and counts the tenant's event and delivery rows. |
 
 How each proof is forced.
 

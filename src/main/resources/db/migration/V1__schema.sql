@@ -25,6 +25,8 @@ CREATE TABLE endpoint (                                 -- configuration; writte
   created_at  timestamptz NOT NULL DEFAULT now(),
   deleted_at  timestamptz
 );
+CREATE INDEX endpoint_active ON endpoint (tenant_id) WHERE status = 'active';   -- ingest match, cap, list
+
 CREATE TABLE endpoint_circuit (                         -- health; inserted with the endpoint,
   endpoint_id uuid PRIMARY KEY REFERENCES endpoint ON DELETE CASCADE,   -- afterwards written only by workers
   state       text NOT NULL DEFAULT 'closed' CHECK (state IN ('closed','open')),

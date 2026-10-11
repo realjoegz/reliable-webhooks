@@ -64,6 +64,16 @@ public class Problems extends ResponseEntityExceptionHandler {
     return rejection;
   }
 
+  public static ErrorResponseException idempotencyKeyReused() {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.UNPROCESSABLE_CONTENT,
+            "idempotency_key_reused",
+            "Idempotency key reused",
+            "The Idempotency-Key belongs to an event that was sent with a different body.");
+    return new ErrorResponseException(HttpStatus.UNPROCESSABLE_CONTENT, problem, null);
+  }
+
   @ExceptionHandler(Exception.class)
   ResponseEntity<ProblemDetail> unhandled(Exception failure) {
     if (databaseBusy(failure)) {

@@ -114,6 +114,15 @@ class ProblemsTest {
     assertThat(rejection.getBody().getStatus()).isEqualTo(429);
   }
 
+  @Test
+  void reusedIdempotencyKeyIsUnprocessableWithItsOwnType() {
+    ErrorResponseException rejection = Problems.idempotencyKeyReused();
+
+    assertThat(rejection.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_CONTENT);
+    assertThat(rejection.getBody().getType()).isEqualTo(URI.create("idempotency_key_reused"));
+    assertThat(rejection.getBody().getStatus()).isEqualTo(422);
+  }
+
   private static void assertDatabaseBusy(ResponseEntity<ProblemDetail> response) {
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
     assertThat(response.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");

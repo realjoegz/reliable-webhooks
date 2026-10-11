@@ -5,10 +5,10 @@ import io.github.realjoegz.reliablewebhooks.endpoint.EndpointRepository;
 import io.github.realjoegz.reliablewebhooks.endpoint.EndpointService;
 import io.github.realjoegz.reliablewebhooks.endpoint.EndpointService.Refused;
 import io.github.realjoegz.reliablewebhooks.endpoint.EndpointService.Registered;
+import io.github.realjoegz.reliablewebhooks.ingest.EventType;
 import io.github.realjoegz.reliablewebhooks.tenant.Tenant;
 import java.util.List;
 import java.util.UUID;
-import java.util.regex.Pattern;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -27,7 +27,6 @@ import org.springframework.web.server.ResponseStatusException;
 public class EndpointController {
 
   private static final int MAX_EVENT_TYPES = 20;
-  private static final Pattern EVENT_TYPE = Pattern.compile("[a-z0-9_.-]{1,128}");
   private static final String ALL_EVENT_TYPES = "*";
 
   record CreateEndpoint(String url, List<String> eventTypes) {
@@ -113,7 +112,7 @@ public class EndpointController {
   }
 
   private static boolean isEventTypeOrWildcard(String entry) {
-    return entry != null && (entry.equals(ALL_EVENT_TYPES) || EVENT_TYPE.matcher(entry).matches());
+    return entry != null && (entry.equals(ALL_EVENT_TYPES) || EventType.isValid(entry));
   }
 
   // The same answer for an id that does not exist and for one that belongs to another tenant.
