@@ -104,6 +104,13 @@ public final class FaultReceiver implements AutoCloseable {
    */
   public static final class Endless extends Script {
 
+    /**
+     * More than the buffers between the receiver and a peer that has stopped reading can take. A
+     * response that its peer cut has written less than this. One that its peer read until a
+     * deadline of seconds has written many times as much.
+     */
+    public static final long MORE_THAN_BUFFERS_TAKE = 16L * 1024 * 1024;
+
     private static final byte[] FILL = "a".repeat(1024).getBytes(StandardCharsets.US_ASCII);
 
     private final byte[] start;

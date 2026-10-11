@@ -32,7 +32,42 @@ public final class Rows {
       Integer httpStatus,
       String error,
       String remoteAddr,
-      String replica) {}
+      String replica) {
+
+    /**
+     * An attempt of run 0 that the replica inside the test JVM recorded with the status of a
+     * response. Only the receiver answers that replica, so the address is the loopback address.
+     * Only a 2xx status is a success.
+     */
+    public static Attempt answered(int attemptNo, int status) {
+      String outcome = status >= 200 && status < 300 ? "success" : "failure";
+      return new Attempt(
+          0,
+          attemptNo,
+          false,
+          outcome,
+          status,
+          null,
+          "127.0.0.1",
+          ReplicaSettings.IN_PROCESS_REPLICA);
+    }
+
+    /**
+     * An attempt of run 0 that the replica inside the test JVM recorded as failed without a
+     * response. The address is null when the attempt ended before it had a connection.
+     */
+    public static Attempt unanswered(int attemptNo, String error, String remoteAddr) {
+      return new Attempt(
+          0,
+          attemptNo,
+          false,
+          "failure",
+          null,
+          error,
+          remoteAddr,
+          ReplicaSettings.IN_PROCESS_REPLICA);
+    }
+  }
 
   private Rows() {}
 

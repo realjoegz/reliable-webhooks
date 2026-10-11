@@ -45,7 +45,6 @@ class WebhookHttpClientIT {
   private static final int CONNECTIONS = 4;
   private static final int LOOKUP_SLOTS_OF_A_TENANT = 4;
   private static final int KIB = 1024;
-  private static final long MORE_THAN_BUFFERS_TAKE = 16 * KIB * KIB;
 
   // Every duration but the attempt deadline is the one that ships. The client that is built from
   // these settings, as the application builds its client, has to take the short one as its bound.
@@ -227,7 +226,7 @@ class WebhookHttpClientIT {
 
     await().until(endless::ended);
     assertThat(endless.peerClosedFirst()).isTrue();
-    assertThat(endless.bytesWritten()).isLessThan(MORE_THAN_BUFFERS_TAKE);
+    assertThat(endless.bytesWritten()).isLessThan(FaultReceiver.Endless.MORE_THAN_BUFFERS_TAKE);
   }
 
   // The status line decides, and the body is not drained: the client reads up to its limit and
@@ -242,7 +241,7 @@ class WebhookHttpClientIT {
 
     await().until(endless::ended);
     assertThat(endless.peerClosedFirst()).isTrue();
-    assertThat(endless.bytesWritten()).isLessThan(MORE_THAN_BUFFERS_TAKE);
+    assertThat(endless.bytesWritten()).isLessThan(FaultReceiver.Endless.MORE_THAN_BUFFERS_TAKE);
   }
 
   // A body of 64 KiB is read to its end, and its connection takes the next request. With one
