@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report.xsd" version="3.0.2" name="fixture.MethodNamesIT" time="0.08" tests="8" errors="0" skipped="0" failures="2" flakes="0">
+  <testcase name="plain" classname="fixture.MethodNamesIT" time="0.01"/>
+  <testcase name="plainWithSuffix" classname="fixture.MethodNamesIT" time="0.01">
+    <failure message="expected: 1 but was: 2" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: expected: 1 but was: 2]]></failure>
+  </testcase>
+  <testcase name="indexed[1]" classname="fixture.MethodNamesIT" time="0.01"/>
+  <testcase name="indexed[2]" classname="fixture.MethodNamesIT" time="0.01"/>
+  <testcase name="typed(String)[1]" classname="fixture.MethodNamesIT" time="0.01"/>
+  <testcase name="typed(String)[2]" classname="fixture.MethodNamesIT" time="0.01"/>
+  <testcase name="partlyFailing(int)[1]" classname="fixture.MethodNamesIT" time="0.01"/>
+  <testcase name="partlyFailing(int)[2]" classname="fixture.MethodNamesIT" time="0.01">
+    <failure message="expected: 1 but was: 2" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: expected: 1 but was: 2]]></failure>
+  </testcase>
+</testsuite>

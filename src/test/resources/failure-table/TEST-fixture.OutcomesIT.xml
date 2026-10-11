@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report.xsd" version="3.0.2" name="fixture.OutcomesIT" time="0.06" tests="6" errors="1" skipped="1" failures="2" flakes="1">
+  <testcase name="passed" classname="fixture.OutcomesIT" time="0.01">
+    <system-out><![CDATA[output of a passing test]]></system-out>
+  </testcase>
+  <testcase name="skipped" classname="fixture.OutcomesIT" time="0.0">
+    <skipped message="void fixture.OutcomesIT.skipped() is @Disabled"/>
+  </testcase>
+  <testcase name="failed" classname="fixture.OutcomesIT" time="0.01">
+    <failure message="expected: 1 but was: 2" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: expected: 1 but was: 2]]></failure>
+  </testcase>
+  <testcase name="errored" classname="fixture.OutcomesIT" time="0.01">
+    <error message="boom" type="java.lang.IllegalStateException"><![CDATA[java.lang.IllegalStateException: boom]]></error>
+  </testcase>
+  <testcase name="flaky" classname="fixture.OutcomesIT" time="0.01">
+    <flakyFailure message="expected: 1 but was: 2" type="org.opentest4j.AssertionFailedError">
+      <stackTrace><![CDATA[org.opentest4j.AssertionFailedError: expected: 1 but was: 2]]></stackTrace>
+    </flakyFailure>
+  </testcase>
+  <testcase name="rerun" classname="fixture.OutcomesIT" time="0.01">
+    <rerunFailure message="expected: 1 but was: 2" type="org.opentest4j.AssertionFailedError">
+      <stackTrace><![CDATA[org.opentest4j.AssertionFailedError: expected: 1 but was: 2]]></stackTrace>
+    </rerunFailure>
+  </testcase>
+</testsuite>

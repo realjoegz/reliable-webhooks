@@ -1,0 +1,72 @@
+spring:
+  application:
+    name: reliable-webhooks
+  threads:
+    virtual:
+      enabled: true
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+  web:
+    resources:
+      add-mappings: false
+  flyway:
+    # With a URL of its own, Flyway opens short-lived connections outside both pools. A
+    # migration is therefore not cut off by the statement and lock timeouts of the pools.
+    url: ${webhooks.database.url}
+    user: ${webhooks.database.username}
+    password: ${webhooks.database.password}
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  health:
+    db:
+      # The health endpoint takes no key. It must not borrow connections from the pools.
+      enabled: false
+
+# webhooks.database.url, .username and .password, webhooks.admin-token and
+# webhooks.secret-encryption-key have no default. They come from the environment.
+webhooks:
+  database:
+    api:
+      max-size: 16
+      borrow-timeout: 3s
+      connect-timeout: 2s
+      socket-timeout: 10s
+      tcp-keep-alive: true
+      lock-timeout: 2s
+      statement-timeout: 5s
+      idle-in-transaction-timeout: 10s
+    worker:
+      max-size: 16
+      borrow-timeout: 3s
+      connect-timeout: 2s
+      socket-timeout: 15s
+      tcp-keep-alive: true
+      lock-timeout: 5s
+      statement-timeout: 10s
+      idle-in-transaction-timeout: 10s
+  delivery:
+    attempt-deadline: 15s
+    lease: 60s
+    start-cutoff: 35s
+
+---
+spring:
+  config:
+    activate:
+      on-profile: "!local"
+
+logging:
+  structured:
+    format:
+      console: logstash
