@@ -668,7 +668,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 
 The three limits on an event body are set in the code and not left to the defaults of the JSON library. A body beyond one of them answers `400`, like a body that is not JSON.
 
-The limit on a member name also holds on the other routes that read a body, where it is set for the JSON mapper of the API. It is far below the 50,000 bytes that the library allows, for this reason: the parser keeps the member names it has read in a table that all requests share, so a name stays in memory after its request has ended. The limit bounds what one name can add to that table.
+The limit on a member name also holds on the other routes that read a body, where it is set for the JSON mapper of the API. It is far below the 50,000 bytes that the library allows, for this reason: the parser keeps the member names it has read in a table that all requests share, so a name stays in memory after its request has ended. The limit bounds what one name can add to that table. The library bounds the number of names in it: once the table holds more than 6,000, it is emptied. That number cannot be set, so `EventRequestTest#memberNameIsKeptAfterItsBodyAndDroppedOnceMoreThanSixThousandAreKept` holds the library to it for an event body in UTF-8. A name of 1,024 bytes is still in the table after its request, and it has left the table after 6,001 further bodies with one new name each.
 
 The endpoint cap is exact, and an endpoint is never created without its circuit row:
 
@@ -1094,6 +1094,7 @@ How each proof is forced.
 | Hand-written attempt span | Auto-instrumented HTTP client | Stock instrumentation records the full URL on the span and the host on a timer label. |
 | Redirects off | Follow and re-validate each hop | More code on the most attacked path, for a feature webhooks do not need. |
 | No stored response bodies | Store a snippet for debugging | It is the read primitive of an SSRF. |
+| Member names limited to 1,024 bytes | Turning off the table of names in the parser of an event body | The library then reads the body with its parser for characters, which counts a name by its characters. A name of 513 characters in 1,025 bytes is accepted, and so is a fraction of 1,001 digits. |
 | `JdbcClient` and explicit SQL | JPA | The locking clauses are the design; they must be visible. |
 | READ COMMITTED plus row locks | SERIALIZABLE | Retry loops everywhere, and `SKIP LOCKED` queues do not need it. |
 | SHA-256 for API keys | bcrypt | Slow hashes defend low-entropy secrets; these are 256-bit random. |

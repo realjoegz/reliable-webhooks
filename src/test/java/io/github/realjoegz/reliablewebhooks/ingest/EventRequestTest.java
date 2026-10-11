@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Named.named;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -14,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import tools.jackson.databind.JsonNode;
 
 class EventRequestTest {
 
@@ -117,6 +119,25 @@ class EventRequestTest {
 
     assertThat(rendered(parsed(withData(data))))
         .isEqualTo(RENDERED_UP_TO_DATA.formatted("a") + data + "}");
+  }
+
+  // The parser answers a name that is in its table with the String it made when it first read
+  // that name, so a name that comes back as another String has left the table. The library
+  // empties the table once it holds more than 6,000 names. That number cannot be set, so the
+  // test holds the library to it.
+  @Test
+  void memberNameIsKeptAfterItsBodyAndDroppedOnceMoreThanSixThousandAreKept()
+      throws ReflectiveOperationException {
+    String body = withData("{\"" + "k".repeat(1024) + "\":1}");
+    String kept = nameInTheDataOf(parsed(body));
+
+    assertThat(nameInTheDataOf(parsed(body))).isSameAs(kept);
+
+    for (int i = 0; i <= 6000; i++) {
+      parsed(withData("{\"n" + i + "\":1}"));
+    }
+
+    assertThat(nameInTheDataOf(parsed(body))).isNotSameAs(kept);
   }
 
   // The body is the first level and the data the second.
@@ -262,6 +283,13 @@ class EventRequestTest {
   /** A JSON object that holds an object that holds an object, down to the given level. */
   private static String nested(int levels) {
     return "{\"a\":".repeat(levels - 1) + "{}" + "}".repeat(levels - 1);
+  }
+
+  // The request has no accessor for its data, because nothing but its rendering reads it.
+  private static String nameInTheDataOf(EventRequest request) throws ReflectiveOperationException {
+    Field data = EventRequest.class.getDeclaredField("data");
+    data.setAccessible(true);
+    return ((JsonNode) data.get(request)).propertyNames().iterator().next();
   }
 
   private static String rendered(EventRequest request) {
