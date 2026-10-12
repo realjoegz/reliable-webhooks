@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
+import io.github.realjoegz.reliablewebhooks.DatabaseFailures;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
+import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker.Verdict;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Attempt;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Claimed;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.NextState;
@@ -17,6 +19,8 @@ import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import io.github.realjoegz.reliablewebhooks.harness.UnsafeLocalReplica;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.net.InetAddress;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
@@ -88,7 +92,9 @@ class LeaseFenceIT {
   }
 
   // The second finalize is what a retry does after a commit whose answer was lost. The others
-  // show that the token is spent for every result, not only for the one that was recorded.
+  // show that the token is spent for every result, not only for the one that was recorded. They
+  // bring failures, which would count toward opening the circuit, and the circuit row is among
+  // the rows that stay as they are.
   @Test
   void repeatedFinalizeIsNoOp() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start()) {
@@ -101,7 +107,9 @@ class LeaseFenceIT {
               "success", 200, null, InetAddress.getByName("127.0.0.1"), Duration.ofMillis(120));
       Attempt failure = new Attempt("failure", 500, null, null, Duration.ofMillis(80));
 
-      assertThat(deliveries.recordAttempt(claimed, NextState.succeeded(), success, "replica-1"))
+      assertThat(
+              deliveries.recordAttempt(
+                  claimed, NextState.succeeded(), success, Verdict.SUCCESS, "replica-1"))
           .isTrue();
 
       assertThat(Rows.delivery(delivery))
@@ -111,13 +119,21 @@ class LeaseFenceIT {
               new Rows.Attempt(0, 1, false, "success", 200, null, "127.0.0.1", "replica-1"));
       List<String> recorded = everyColumnOf(delivery);
 
-      assertThat(deliveries.recordAttempt(claimed, NextState.succeeded(), success, "replica-1"))
+      assertThat(
+              deliveries.recordAttempt(
+                  claimed, NextState.succeeded(), success, Verdict.SUCCESS, "replica-1"))
           .isFalse();
       assertThat(
               deliveries.recordAttempt(
-                  claimed, NextState.retryIn(Duration.ofSeconds(10)), failure, "replica-2"))
+                  claimed,
+                  NextState.retryIn(Duration.ofSeconds(10)),
+                  failure,
+                  Verdict.FAILURE,
+                  "replica-2"))
           .isFalse();
-      assertThat(deliveries.recordAttempt(claimed, NextState.exhausted(), failure, "replica-2"))
+      assertThat(
+              deliveries.recordAttempt(
+                  claimed, NextState.exhausted(), failure, Verdict.FAILURE, "replica-2"))
           .isFalse();
       assertThat(deliveries.deadLetterExhausted(claimed)).isFalse();
 
@@ -152,12 +168,58 @@ class LeaseFenceIT {
                       claimed,
                       NextState.succeeded(),
                       new Attempt("success", 200, null, null, Duration.ZERO),
+                      Verdict.SUCCESS,
                       "replica-1"))
           .isInstanceOf(DuplicateKeyException.class);
 
       assertThat(everyColumnOf(delivery)).isEqualTo(leased);
       assertThat(Rows.delivery(delivery))
           .isEqualTo(new Rows.Delivery("pending", 1, 0, true, null, false));
+    }
+  }
+
+  // The circuit statement is the last one of the finalize transaction. The test holds the circuit
+  // row, so the statement waits for it until the lock timeout of the worker pool ends the wait.
+  // By then the state change and the attempt row have been written, and both are undone: the
+  // delivery is still under its lease and has no attempt row. An attempt is recorded and counted
+  // together, or not at all.
+  //
+  // The failure is one that can pass, so a worker would try the finalize again. The test does,
+  // once it has let go of the row, and the failure is recorded and counted.
+  @Test
+  void finalizeWhoseCircuitStatementFailsChangesNothing() throws Exception {
+    try (FaultReceiver receiver = FaultReceiver.start()) {
+      TestTenant tenant = TestTenant.create(http, "blocked-circuit-row");
+      UUID endpoint = tenant.register(http, receiver.url("/hook"), "*");
+      UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
+      Claimed claimed = claimOnly(delivery);
+      Attempt failure = new Attempt("failure", 500, null, null, Duration.ofMillis(80));
+      NextState retry = NextState.retryIn(Duration.ofSeconds(10));
+      List<String> leased = everyColumnOf(delivery);
+
+      try (Connection blocker = TestDatabase.connection();
+          PreparedStatement lock =
+              blocker.prepareStatement(
+                  "SELECT 1 FROM endpoint_circuit WHERE endpoint_id = ? FOR UPDATE")) {
+        lock.setObject(1, endpoint);
+        lock.execute();
+
+        assertThatThrownBy(
+                () ->
+                    deliveries.recordAttempt(claimed, retry, failure, Verdict.FAILURE, "replica-1"))
+            .matches(DatabaseFailures::isTransient, "is a failure that can pass");
+
+        blocker.rollback();
+      }
+      assertThat(everyColumnOf(delivery)).isEqualTo(leased);
+      assertThat(Rows.delivery(delivery))
+          .isEqualTo(new Rows.Delivery("pending", 1, 0, true, null, false));
+
+      assertThat(deliveries.recordAttempt(claimed, retry, failure, Verdict.FAILURE, "replica-1"))
+          .isTrue();
+      assertThat(Rows.attempts(delivery))
+          .containsExactly(new Rows.Attempt(0, 1, false, "failure", 500, null, null, "replica-1"));
+      assertThat(Rows.circuit(endpoint)).isEqualTo(new Rows.Circuit("closed", 1, 0, false, false));
     }
   }
 
@@ -184,6 +246,7 @@ class LeaseFenceIT {
                   secondHolder,
                   NextState.succeeded(),
                   new Attempt("success", 204, null, null, Duration.ZERO),
+                  Verdict.SUCCESS,
                   "replica-2"))
           .isTrue();
     }
@@ -199,12 +262,18 @@ class LeaseFenceIT {
     return meters.get("webhooks.finalize.lost.lease").counter().count();
   }
 
-  /** The delivery row and its attempt rows, each as the text of all of its columns. */
+  /**
+   * The delivery row, the circuit row of its endpoint and its attempt rows, each as the text of all
+   * of its columns.
+   */
   private static List<String> everyColumnOf(UUID deliveryId) {
     return TestDatabase.jdbc()
         .sql(
             """
             SELECT d::text FROM delivery d WHERE d.id = :id
+            UNION ALL
+            SELECT c::text FROM endpoint_circuit c JOIN delivery d ON d.endpoint_id = c.endpoint_id
+            WHERE d.id = :id
             UNION ALL
             (SELECT a::text FROM delivery_attempt a WHERE a.delivery_id = :id ORDER BY a.id)
             """)

@@ -190,6 +190,9 @@ class SlowEndpointIsolationIT {
   // whose host resolves at once, finds no slot. It is given back, which the later due time
   // shows, and has used no attempt. The four attempts of the stuck endpoint fail meanwhile.
   //
+  // Those four failures count toward opening the circuit of the stuck endpoint. The circuit of
+  // the sibling has counted nothing: a delivery that is given back is no failure of its endpoint.
+  //
   // When the resolver answers again, the delivery for the sibling succeeds, and that attempt is
   // its first. An attempt that the wait had cost it would show as a second one here.
   @Test
@@ -200,8 +203,8 @@ class SlowEndpointIsolationIT {
       receiver.answer("/stuck", FaultReceiver.status(200));
       receiver.answer("/sibling", FaultReceiver.status(200));
       TestTenant tenant = TestTenant.create(http, "stuck-dns-with-sibling");
-      tenant.register(http, url(stuckHost, receiver, "/stuck"), "faulty.sent");
-      tenant.register(http, receiver.url("/sibling"), "sibling.sent");
+      UUID stuck = tenant.register(http, url(stuckHost, receiver, "/stuck"), "faulty.sent");
+      UUID sibling = tenant.register(http, receiver.url("/sibling"), "sibling.sent");
       List<UUID> forTheStuckEndpoint = new ArrayList<>();
       for (int i = 0; i < LOOKUP_SLOTS_OF_A_TENANT; i++) {
         forTheStuckEndpoint.add(Rows.deliveryOf(tenant.accept(http, FOR_THE_FAULTY_ENDPOINT)));
@@ -223,6 +226,9 @@ class SlowEndpointIsolationIT {
         }
 
         assertThat(Rows.attempts(forTheSibling)).isEmpty();
+        assertThat(Rows.circuit(stuck))
+            .isEqualTo(new Rows.Circuit("closed", LOOKUP_SLOTS_OF_A_TENANT, 0, false, false));
+        assertThat(Rows.circuit(sibling)).isEqualTo(Rows.Circuit.CLOSED);
         assertThat(receiver.requests()).isEmpty();
         assertThat(hold.waiting()).isEqualTo(LOOKUP_SLOTS_OF_A_TENANT);
       }
@@ -233,6 +239,7 @@ class SlowEndpointIsolationIT {
       assertThat(Rows.delivery(forTheSibling))
           .isEqualTo(new Rows.Delivery("succeeded", 1, 0, false, null, true));
       assertThat(Rows.attempts(forTheSibling)).containsExactly(Rows.Attempt.answered(1, 200));
+      assertThat(Rows.circuit(sibling)).isEqualTo(Rows.Circuit.CLOSED);
     }
   }
 

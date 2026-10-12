@@ -31,6 +31,7 @@ class FinalizeRetryTest {
           1,
           0,
           UUID.randomUUID(),
+          false,
           false);
 
   // System.nanoTime may be anywhere in the long range, so this clock starts a second before it

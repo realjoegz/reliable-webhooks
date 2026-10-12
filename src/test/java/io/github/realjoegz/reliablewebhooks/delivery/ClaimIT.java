@@ -68,6 +68,7 @@ class ClaimIT {
               assertThat(claimed.attempts()).isEqualTo(1);
               assertThat(claimed.replays()).isZero();
               assertThat(claimed.abandoned()).isFalse();
+              assertThat(claimed.circuitOpen()).isFalse();
               assertThat(claimed.leaseToken()).isNotNull();
             });
     assertThat(first).extracting(Claimed::leaseToken).doesNotHaveDuplicates();
@@ -131,10 +132,11 @@ class ClaimIT {
         .containsExactlyInAnyOrder(full, ofFullTenant);
   }
 
-  // Nothing in the service suspends a tenant or opens a circuit yet, so the test writes both
-  // states. The first claim takes the delivery of the third tenant only, and the held deliveries
-  // are as they were. Once the tenant is active again and the probe time of the circuit has
-  // passed, a claim takes both.
+  // Nothing in the service suspends a tenant yet, and a circuit opens only after five failed
+  // attempts, so the test writes both states. The first claim takes the delivery of the third
+  // tenant only, and the held deliveries are as they were. Once the tenant is active again and
+  // the probe time of the circuit has passed, a claim takes both, and it says of the one behind
+  // the open circuit that it was claimed for a probe.
   @Test
   void claimHoldsTheDeliveriesOfASuspendedTenantAndOfAnOpenCircuit() {
     TestTenant suspended = TestTenant.create(http, "held-suspended");
@@ -157,9 +159,15 @@ class ClaimIT {
     setStatus(suspended, "active");
     openCircuit(openEndpoint, "now() - interval '1 second'");
 
-    assertThat(claim(NONE, NONE, ROOM_FOR_ALL))
+    List<Claimed> noLongerHeld = claim(NONE, NONE, ROOM_FOR_ALL);
+
+    assertThat(noLongerHeld)
         .extracting(Claimed::id)
         .containsExactlyInAnyOrder(ofSuspended, ofOpenCircuit);
+    assertThat(noLongerHeld)
+        .filteredOn(Claimed::circuitOpen)
+        .extracting(Claimed::id)
+        .containsExactly(ofOpenCircuit);
   }
 
   @Test

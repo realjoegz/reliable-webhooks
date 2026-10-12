@@ -5,6 +5,7 @@ import io.github.realjoegz.reliablewebhooks.DatabasePools;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Delivery;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Pool;
+import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker;
 import io.github.realjoegz.reliablewebhooks.endpoint.SecretCipher;
 import java.lang.management.ManagementFactory;
 import java.time.Duration;
@@ -98,14 +99,21 @@ public class StartupInvariants implements InitializingBean {
     // A request that starts just before the start cutoff can take the whole attempt deadline.
     // Its result is recorded after that and before the finalize cutoff, which lies inside the
     // lease.
-    if (delivery.startCutoff().plus(delivery.attemptDeadline()).compareTo(delivery.finalizeCutoff())
-        > 0) {
+    Duration latestEndOfRequest = delivery.startCutoff().plus(delivery.attemptDeadline());
+    if (latestEndOfRequest.compareTo(delivery.finalizeCutoff()) > 0) {
       violations.add(
           "webhooks.delivery.start-cutoff plus the attempt deadline must not be above the finalize"
               + " cutoff");
     }
     if (delivery.finalizeCutoff().compareTo(delivery.lease()) >= 0) {
       violations.add("webhooks.delivery.finalize-cutoff must be below the lease");
+    }
+    // The request of a probe has to be over when its slot is free again, or the next claim would
+    // send a second probe beside it. The slot counts from the gate, which comes after the claim.
+    if (latestEndOfRequest.compareTo(CircuitBreaker.PROBE_SLOT) >= 0) {
+      violations.add(
+          "webhooks.delivery.start-cutoff plus the attempt deadline must be below the probe slot"
+              + " of %d s".formatted(CircuitBreaker.PROBE_SLOT.toSeconds()));
     }
     // With no attempt allowed, every delivery is dead-lettered by its first claim. With no room
     // for an attempt, the replica never claims.

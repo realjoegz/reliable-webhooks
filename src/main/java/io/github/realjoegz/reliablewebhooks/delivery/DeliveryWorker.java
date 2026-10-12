@@ -3,6 +3,7 @@ package io.github.realjoegz.reliablewebhooks.delivery;
 import io.github.realjoegz.reliablewebhooks.DatabaseFailures;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Delivery;
+import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker.Verdict;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Attempt;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Claimed;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Loaded;
@@ -28,8 +29,12 @@ import org.springframework.stereotype.Component;
 
 /**
  * Runs one attempt of a delivery that a claim has leased: load, sign and send, then record the
- * result and the next state in one transaction. Everything it writes carries the lease token, so an
- * attempt whose lease another replica has taken over records nothing.
+ * result, the next state and what the result says about the endpoint in one transaction. Everything
+ * it writes to the delivery carries the lease token, so an attempt whose lease another replica has
+ * taken over records nothing.
+ *
+ * <p>A delivery that was claimed behind an open circuit is sent only if it wins the gate, as the
+ * one probe of its endpoint. Otherwise it is given back at once and has used no attempt.
  *
  * <p>An attempt that ends without a record, because the replica stopped, the start cutoff passed or
  * the database failed, leaves the delivery leased. It becomes due again when the lease runs out,
@@ -46,6 +51,7 @@ class DeliveryWorker {
   private record Result(Attempt attempt, AttemptReason reason, String retryAfter) {}
 
   private final DeliveryRepository deliveries;
+  private final CircuitBreaker circuits;
   private final WebhookHttpClient http;
   private final SecretCipher secrets;
   private final DeliveryMeters meters;
@@ -59,12 +65,14 @@ class DeliveryWorker {
   @Autowired
   DeliveryWorker(
       DeliveryRepository deliveries,
+      CircuitBreaker circuits,
       WebhookHttpClient http,
       SecretCipher secrets,
       DeliveryMeters meters,
       WebhooksProperties properties) {
     this(
         deliveries,
+        circuits,
         http,
         secrets,
         meters,
@@ -76,6 +84,7 @@ class DeliveryWorker {
 
   DeliveryWorker(
       DeliveryRepository deliveries,
+      CircuitBreaker circuits,
       WebhookHttpClient http,
       SecretCipher secrets,
       DeliveryMeters meters,
@@ -84,6 +93,7 @@ class DeliveryWorker {
       LongSupplier nanoTime,
       FinalizeRetry.Pause pause) {
     this.deliveries = deliveries;
+    this.circuits = circuits;
     this.http = http;
     this.secrets = secrets;
     this.meters = meters;
@@ -105,12 +115,18 @@ class DeliveryWorker {
     try {
       if (delivery.attempts() > maxAttempts) {
         deadLetterWithoutSending(delivery, claimStartedNanos);
+      } else if (delivery.circuitOpen() && !circuits.admitProbe(delivery.endpointId())) {
+        // Another delivery has the probe slot, or the circuit has closed since the claim.
+        // Neither is a result of this delivery, which is due again at once: behind the circuit
+        // if that is still open, and as an ordinary delivery if it is not.
+        deliveries.release(delivery, Duration.ZERO);
+        meters.releasedForLostGate();
       } else {
         loadSendAndRecord(delivery, claimStartedNanos);
       }
     } catch (RuntimeException failure) {
-      // A database that restarts fails the load of every attempt in flight. That passes, and the
-      // lease brings each delivery back. Any other failure is a fault.
+      // A database that restarts fails the gate and the load of every attempt in flight. That
+      // passes, and the lease brings each delivery back. Any other failure is a fault.
       LoggingEventBuilder line =
           DatabaseFailures.isTransient(failure) ? log.atWarn() : log.atError();
       fields.about(delivery, line).setCause(failure).log("attempt_left_for_reclaim");
@@ -184,11 +200,12 @@ class DeliveryWorker {
 
   private void record(Claimed delivery, long claimStartedNanos, Result result) {
     NextState next = nextState(delivery, result);
+    Verdict verdict = verdict(delivery, result);
     boolean recorded =
         finalizeRetry.run(
             delivery,
             claimStartedNanos,
-            () -> deliveries.recordAttempt(delivery, next, result.attempt(), replica));
+            () -> deliveries.recordAttempt(delivery, next, result.attempt(), verdict, replica));
     if (recorded) {
       meters.attemptRecorded(result.reason());
       fields
@@ -210,5 +227,15 @@ class DeliveryWorker {
     Duration ownDelay =
         RetrySchedule.delay(delivery.attempts(), ThreadLocalRandom.current().nextDouble());
     return NextState.retryIn(RetrySchedule.honouring(result.retryAfter(), ownDelay));
+  }
+
+  // A delivery that was claimed behind an open circuit got this far by winning the gate, so its
+  // attempt was the probe. A probe that fails does not count toward opening the circuit, which is
+  // open. It moves the next probe further away.
+  private static Verdict verdict(Claimed delivery, Result result) {
+    if (result.reason() == AttemptReason.HTTP_2XX) {
+      return Verdict.SUCCESS;
+    }
+    return delivery.circuitOpen() ? Verdict.PROBE_FAILURE : Verdict.FAILURE;
   }
 }

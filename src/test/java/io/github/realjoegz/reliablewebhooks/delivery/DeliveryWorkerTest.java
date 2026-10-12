@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Delivery;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Ssrf;
+import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker.Verdict;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Attempt;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Claimed;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Loaded;
@@ -75,7 +76,8 @@ class DeliveryWorkerTest {
   private record Sent(UUID tenantId, URI url, Map<String, String> headers, byte[] body) {}
 
   /** What the worker asked the repository to record. */
-  private record Recorded(Claimed delivery, NextState next, Attempt attempt, String replica) {}
+  private record Recorded(
+      Claimed delivery, NextState next, Attempt attempt, Verdict verdict, String replica) {}
 
   private record Released(Claimed delivery, Duration delay) {}
 
@@ -87,10 +89,12 @@ class DeliveryWorkerTest {
   private final DnsLookups lookups =
       new DnsLookups(new StubDns(), new AddressPolicy(PROPERTIES, registry), registry);
   private final Deliveries deliveries = new Deliveries();
+  private final Circuits circuits = new Circuits();
   private final Client client = new Client();
   private final DeliveryWorker worker =
       new DeliveryWorker(
           deliveries,
+          circuits,
           client,
           cipher,
           new DeliveryMeters(registry),
@@ -113,7 +117,7 @@ class DeliveryWorkerTest {
     private final List<Released> released = new ArrayList<>();
 
     private Deliveries() {
-      super(null, null);
+      super(null, null, null);
     }
 
     @Override
@@ -132,8 +136,9 @@ class DeliveryWorkerTest {
     }
 
     @Override
-    boolean recordAttempt(Claimed delivery, NextState next, Attempt attempt, String replica) {
-      recorded.add(new Recorded(delivery, next, attempt, replica));
+    boolean recordAttempt(
+        Claimed delivery, NextState next, Attempt attempt, Verdict verdict, String replica) {
+      recorded.add(new Recorded(delivery, next, attempt, verdict, replica));
       return leaseHeld;
     }
 
@@ -141,6 +146,27 @@ class DeliveryWorkerTest {
     boolean deadLetterExhausted(Claimed delivery) {
       deadLettered.add(delivery);
       return leaseHeld;
+    }
+  }
+
+  /** The gate, which answers as scripted and keeps the endpoints that it was asked about. */
+  private static final class Circuits extends CircuitBreaker {
+
+    private boolean probeAdmitted = true;
+    private RuntimeException gateFailure;
+    private final List<UUID> askedToAdmit = new ArrayList<>();
+
+    private Circuits() {
+      super(null);
+    }
+
+    @Override
+    boolean admitProbe(UUID endpointId) {
+      askedToAdmit.add(endpointId);
+      if (gateFailure != null) {
+        throw gateFailure;
+      }
+      return probeAdmitted;
     }
   }
 
@@ -238,6 +264,7 @@ class DeliveryWorkerTest {
                 delivery,
                 NextState.succeeded(),
                 new Attempt("success", status, null, remote, Duration.ofMillis(120)),
+                Verdict.SUCCESS,
                 "replica-1"));
     assertThat(attemptsCounted("success", "http_2xx")).isEqualTo(1);
   }
@@ -270,6 +297,7 @@ class DeliveryWorkerTest {
     assertThat(recorded.next().deadReason()).isNull();
     assertThat(recorded.next().delay())
         .isBetween(RetrySchedule.delay(4, 0), RetrySchedule.delay(4, 1));
+    assertThat(recorded.verdict()).isEqualTo(Verdict.FAILURE);
     assertThat(attemptsCounted("failure", reason)).isEqualTo(1);
   }
 
@@ -299,6 +327,7 @@ class DeliveryWorkerTest {
     assertThat(recorded.next().state()).isEqualTo("pending");
     assertThat(recorded.next().delay())
         .isBetween(RetrySchedule.delay(1, 0), RetrySchedule.delay(1, 1));
+    assertThat(recorded.verdict()).isEqualTo(Verdict.FAILURE);
     assertThat(attemptsCounted("failure", counted)).isEqualTo(1);
   }
 
@@ -334,6 +363,7 @@ class DeliveryWorkerTest {
                 delivery,
                 NextState.exhausted(),
                 new Attempt("failure", 500, null, null, Duration.ZERO),
+                Verdict.FAILURE,
                 "replica-1"));
     assertThat(deliveries.deadLettered).isEmpty();
   }
@@ -357,6 +387,123 @@ class DeliveryWorkerTest {
     assertThat(deliveries.loads).isZero();
     assertThat(client.sent).isEmpty();
     assertThat(deliveries.recorded).isEmpty();
+  }
+
+  // The circuit was closed when the delivery was claimed, so there is no gate to pass.
+  @Test
+  void deliveryClaimedWithAClosedCircuitIsSentWithoutAskingTheGate() {
+    worker.attempt(claimed(1), claimStarted);
+
+    assertThat(circuits.askedToAdmit).isEmpty();
+    assertThat(client.sent).hasSize(1);
+  }
+
+  // The delivery was claimed behind an open circuit and wins the gate, so its request is the
+  // probe. The probe fails: the delivery waits as long as any delivery waits after its sixth
+  // attempt, and the circuit is told to move the next probe.
+  @Test
+  void deliveryThatWinsTheGateIsSentAndItsFailureIsTheFailureOfAProbe() {
+    client.outcome = new Response(503, null, null);
+    Claimed delivery = claimedBehindAnOpenCircuit(6);
+
+    worker.attempt(delivery, claimStarted);
+
+    assertThat(circuits.askedToAdmit).containsExactly(delivery.endpointId());
+    assertThat(client.sent).hasSize(1);
+    assertThat(deliveries.recorded).hasSize(1);
+    Recorded recorded = deliveries.recorded.getFirst();
+    assertThat(recorded.delivery()).isEqualTo(delivery);
+    assertThat(recorded.attempt())
+        .isEqualTo(new Attempt("failure", 503, null, null, Duration.ZERO));
+    assertThat(recorded.next().state()).isEqualTo("pending");
+    assertThat(recorded.next().delay())
+        .isBetween(RetrySchedule.delay(6, 0), RetrySchedule.delay(6, 1));
+    assertThat(recorded.verdict()).isEqualTo(Verdict.PROBE_FAILURE);
+    assertThat(deliveries.released).isEmpty();
+  }
+
+  @Test
+  void probeThatSucceedsIsRecordedAsASuccess() {
+    Claimed delivery = claimedBehindAnOpenCircuit(6);
+
+    worker.attempt(delivery, claimStarted);
+
+    assertThat(deliveries.recorded)
+        .containsExactly(
+            new Recorded(
+                delivery,
+                NextState.succeeded(),
+                new Attempt("success", 200, null, null, Duration.ZERO),
+                Verdict.SUCCESS,
+                "replica-1"));
+  }
+
+  // A probe uses an attempt like any other request, so the twelfth is the last.
+  @Test
+  void twelfthAttemptThatFailsAsAProbeDeadLettersTheDeliveryAsExhausted() {
+    client.outcome = new Response(500, null, null);
+    Claimed delivery = claimedBehindAnOpenCircuit(12);
+
+    worker.attempt(delivery, claimStarted);
+
+    assertThat(deliveries.recorded)
+        .containsExactly(
+            new Recorded(
+                delivery,
+                NextState.exhausted(),
+                new Attempt("failure", 500, null, null, Duration.ZERO),
+                Verdict.PROBE_FAILURE,
+                "replica-1"));
+  }
+
+  // Another delivery has the probe slot. That is no verdict on this one, so it is given back to
+  // be due at once, nothing is loaded or sent, and nothing is recorded.
+  @Test
+  void deliveryThatLosesTheGateIsGivenBackAtOnceAndNothingIsSent() {
+    circuits.probeAdmitted = false;
+    Claimed delivery = claimedBehindAnOpenCircuit(1);
+
+    worker.attempt(delivery, claimStarted);
+
+    assertThat(circuits.askedToAdmit).containsExactly(delivery.endpointId());
+    assertThat(deliveries.released).containsExactly(new Released(delivery, Duration.ZERO));
+    assertThat(deliveries.loads).isZero();
+    assertThat(client.sent).isEmpty();
+    assertThat(deliveries.recorded).isEmpty();
+    assertThat(
+            registry.get("webhooks.delivery.released").tag("reason", "gate_lost").counter().count())
+        .isEqualTo(1);
+  }
+
+  // The thirteenth claim is dead-lettered before the gate. A delivery that may not be sent any
+  // more must not take the probe slot from one that may.
+  @Test
+  void thirteenthClaimBehindAnOpenCircuitDeadLettersWithoutAskingTheGate() {
+    Claimed delivery = claimedBehindAnOpenCircuit(13);
+
+    worker.attempt(delivery, claimStarted);
+
+    assertThat(deliveries.deadLettered).containsExactly(delivery);
+    assertThat(circuits.askedToAdmit).isEmpty();
+    assertThat(client.sent).isEmpty();
+    assertThat(deliveries.recorded).isEmpty();
+  }
+
+  // Whether the gate was won is not known, so nothing is sent. The delivery is not given back
+  // either: it keeps its lease, as after a load that failed.
+  @Test
+  void attemptWhoseGateFailsSendsNothingAndLeavesTheRowLeased(CapturedOutput output) {
+    circuits.gateFailure =
+        new IllegalStateException(
+            "A statement failed", new SQLException("reported by the database", "08006"));
+
+    worker.attempt(claimedBehindAnOpenCircuit(1), claimStarted);
+
+    assertThat(deliveries.loads).isZero();
+    assertThat(client.sent).isEmpty();
+    assertThat(deliveries.recorded).isEmpty();
+    assertThat(deliveries.released).isEmpty();
+    assertThat(lineLogged(output, "attempt_left_for_reclaim")).contains("WARN");
   }
 
   // The replica had no room for the lookup. That is no verdict on the endpoint, so the row is
@@ -426,6 +573,14 @@ class DeliveryWorkerTest {
   }
 
   private static Claimed claimed(int attempts) {
+    return claimed(attempts, false);
+  }
+
+  private static Claimed claimedBehindAnOpenCircuit(int attempts) {
+    return claimed(attempts, true);
+  }
+
+  private static Claimed claimed(int attempts, boolean circuitOpen) {
     return new Claimed(
         UUID.randomUUID(),
         UUID.randomUUID(),
@@ -434,7 +589,8 @@ class DeliveryWorkerTest {
         attempts,
         0,
         UUID.randomUUID(),
-        false);
+        false,
+        circuitOpen);
   }
 
   private static String lineLogged(CapturedOutput output, String message) {

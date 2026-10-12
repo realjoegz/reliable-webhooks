@@ -69,7 +69,7 @@ class DeliveryPollerTest {
     private volatile RuntimeException failureOfTheNextClaim;
 
     private Deliveries() {
-      super(null, null);
+      super(null, null, null);
     }
 
     @Override
@@ -101,7 +101,7 @@ class DeliveryPollerTest {
     private final Map<Claimed, Long> claimStartedNanos = new ConcurrentHashMap<>();
 
     private Attempts() {
-      super(null, null, null, meters, SETTINGS, "replica-1", System::nanoTime, Thread::sleep);
+      super(null, null, null, null, meters, SETTINGS, "replica-1", System::nanoTime, Thread::sleep);
     }
 
     @Override
@@ -373,7 +373,8 @@ class DeliveryPollerTest {
             abandoned ? 2 : 1,
             0,
             UUID.randomUUID(),
-            abandoned);
+            abandoned,
+            false);
     deliveries.due.add(delivery);
     return delivery;
   }

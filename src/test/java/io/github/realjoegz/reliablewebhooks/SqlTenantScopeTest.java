@@ -2,6 +2,7 @@ package io.github.realjoegz.reliablewebhooks;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository;
 import io.github.realjoegz.reliablewebhooks.ops.ExpiryRepository;
 import java.io.IOException;
@@ -38,7 +39,7 @@ import org.springframework.stereotype.Repository;
 class SqlTenantScopeTest {
 
   private static final Set<Class<?>> WORKER_AND_JOB_REPOSITORIES =
-      Set.of(DeliveryRepository.class, ExpiryRepository.class);
+      Set.of(DeliveryRepository.class, CircuitBreaker.class, ExpiryRepository.class);
 
   private static final Path MIGRATIONS = Path.of("src/main/resources/db/migration");
   private static final Pattern CREATE_TABLE = Pattern.compile("CREATE TABLE (\\w+)");

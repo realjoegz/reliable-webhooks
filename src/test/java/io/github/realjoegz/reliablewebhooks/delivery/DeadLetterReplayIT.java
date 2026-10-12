@@ -28,8 +28,10 @@ class DeadLetterReplayIT {
       """
       {"type":"order.created","data":{"order":17}}""";
   private static final int MAX_ATTEMPTS = 12;
+  private static final int SUCCESSES_IN_BETWEEN = MAX_ATTEMPTS - 1;
   private static final Duration SPREAD_OF_A_REPLAY = Duration.ofSeconds(60);
   private static final Duration BUDGET = Duration.ofHours(72);
+  private static final Duration AN_HOUR = Duration.ofHours(1);
 
   /** When a delivery is due next and when it expires. */
   private record Times(Instant nextAttemptAt, Instant expiresAt) {}
@@ -37,18 +39,26 @@ class DeadLetterReplayIT {
   @Autowired RestTestClient http;
   @Autowired ReplicaWorker worker;
 
-  // The endpoint answers 500 to every request. After each of the first eleven attempts the test
-  // reads the wait that the finalize wrote, which has to lie in the window of that attempt, and
-  // only then ages the delivery by the longest wait of the window to make it due. The schedule
-  // itself is never shortened: the worker runs with the retry settings that ship.
+  // The endpoint is healthy and rejects one event: it answers 500 to every request of that
+  // delivery, and 200 to another event that is sent to it after each of those attempts. The
+  // circuit breaker runs as it ships. Each success starts its count of failures over, so the
+  // circuit is closed with one failure counted after every attempt, and none of the twelve is a
+  // probe. Without the successes in between it would open at the fifth.
+  //
+  // After each of the first eleven attempts the test reads the wait that the finalize wrote,
+  // which has to lie in the window of that attempt. Only then does it move the delivery: an hour
+  // ahead while the other event is delivered, and then back by that hour and by the longest wait
+  // of the window, which makes it due. The schedule itself is never shortened: the worker runs
+  // with the retry settings that ship.
   @Test
   void exhaustedAfterTwelveAttempts() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start()) {
-      receiver.answer("/hook", FaultReceiver.status(500));
+      receiver.answer("/hook", FaultReceiver.status(200));
       TestTenant tenant = TestTenant.create(http, "always-rejected");
-      tenant.register(http, receiver.url("/hook"), "*");
+      UUID endpoint = tenant.register(http, receiver.url("/hook"), "*");
       worker.start();
 
+      receiver.answerOnce("/hook", FaultReceiver.status(500));
       UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
       for (int attempt = 1; attempt < MAX_ATTEMPTS; attempt++) {
         int recorded = attempt;
@@ -59,7 +69,11 @@ class DeadLetterReplayIT {
         assertThat(Rows.waitAfter(delivery, attempt))
             .as("wait after attempt %d", attempt)
             .isBetween(RetrySchedule.delay(attempt, 0), RetrySchedule.delay(attempt, 1));
-        Rows.ageDelivery(delivery, RetrySchedule.delay(attempt, 1));
+        assertThat(Rows.circuit(endpoint))
+            .isEqualTo(new Rows.Circuit("closed", 1, 0, false, false));
+        deliverAnotherEventMeanwhile(tenant, delivery);
+        assertThat(Rows.circuit(endpoint)).isEqualTo(Rows.Circuit.CLOSED);
+        rejectTheNextAttempt(receiver, delivery, attempt);
       }
       await().untilAsserted(() -> assertThat(Rows.delivery(delivery).state()).isEqualTo("dead"));
 
@@ -67,28 +81,19 @@ class DeadLetterReplayIT {
           .isEqualTo(new Rows.Delivery("dead", MAX_ATTEMPTS, 0, false, "exhausted", true));
       List<Rows.Attempt> twelveFailures = new ArrayList<>();
       for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        twelveFailures.add(
-            new Rows.Attempt(
-                0,
-                attempt,
-                false,
-                "failure",
-                500,
-                null,
-                "127.0.0.1",
-                ReplicaSettings.IN_PROCESS_REPLICA));
+        twelveFailures.add(Rows.Attempt.answered(attempt, 500));
       }
       assertThat(Rows.attempts(delivery)).isEqualTo(twelveFailures);
-      assertThat(receiver.requests())
-          .hasSize(MAX_ATTEMPTS)
-          .allSatisfy(
-              request -> assertThat(request.header("webhook-id")).isEqualTo(delivery.toString()));
+      assertThat(Rows.circuit(endpoint)).isEqualTo(new Rows.Circuit("closed", 1, 0, false, false));
+      assertThat(requestsFor(delivery, receiver)).isEqualTo(MAX_ATTEMPTS);
+      assertThat(receiver.requests()).hasSize(MAX_ATTEMPTS + SUCCESSES_IN_BETWEEN);
     }
   }
 
-  // The endpoint answers 500 until the delivery is dead, and 200 from then on. The replay makes
-  // the delivery pending in a new run: no attempt counted, due within sixty seconds and with
-  // seventy-two hours of its own. The twelve rows of the first run stay.
+  // The endpoint rejects the delivery until it is dead, as in the test above, and answers 200 to
+  // every request from then on. The replay makes the delivery pending in a new run: no attempt
+  // counted, due within sixty seconds and with seventy-two hours of its own. The twelve rows of
+  // the first run stay.
   //
   // The worker is stopped while the delivery is replayed, so that the row which the test reads
   // is the row that the replay wrote. Once the delivery is aged past the sixty seconds, the
@@ -101,21 +106,22 @@ class DeadLetterReplayIT {
   @Test
   void replayedDeliveryIsDeliveredOnce() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start()) {
-      receiver.answer("/hook", FaultReceiver.status(500));
+      receiver.answer("/hook", FaultReceiver.status(200));
       TestTenant tenant = TestTenant.create(http, "replayed");
       tenant.register(http, receiver.url("/hook"), "*");
       worker.start();
+      receiver.answerOnce("/hook", FaultReceiver.status(500));
       UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
       for (int attempt = 1; attempt < MAX_ATTEMPTS; attempt++) {
         int recorded = attempt;
         await().untilAsserted(() -> assertThat(Rows.attempts(delivery)).hasSize(recorded));
-        Rows.ageDelivery(delivery, RetrySchedule.delay(attempt, 1));
+        deliverAnotherEventMeanwhile(tenant, delivery);
+        rejectTheNextAttempt(receiver, delivery, attempt);
       }
       await().untilAsserted(() -> assertThat(Rows.delivery(delivery).state()).isEqualTo("dead"));
       worker.stop();
       List<Rows.Attempt> firstRun = Rows.attempts(delivery);
       assertThat(firstRun).hasSize(MAX_ATTEMPTS);
-      receiver.answer("/hook", FaultReceiver.status(200));
 
       // The replay reads the database clock between these two readings of it.
       Instant before = databaseClock();
@@ -145,19 +151,41 @@ class DeadLetterReplayIT {
       assertThat(Rows.delivery(delivery)).isEqualTo(delivered);
       assertThat(Rows.attempts(delivery)).isEqualTo(bothRuns);
 
-      UUID witness = Rows.deliveryOf(tenant.accept(http, EVENT));
-      await()
-          .untilAsserted(() -> assertThat(Rows.delivery(witness).state()).isEqualTo("succeeded"));
-      assertThat(receiver.requests())
-          .extracting(request -> request.header("webhook-id"))
-          .filteredOn(id -> id.equals(delivery.toString()))
-          .hasSize(MAX_ATTEMPTS + 1);
-      assertThat(receiver.requests()).hasSize(MAX_ATTEMPTS + 2);
+      deliverAnotherEvent(tenant);
+      assertThat(requestsFor(delivery, receiver)).isEqualTo(MAX_ATTEMPTS + 1);
+      assertThat(receiver.requests()).hasSize(MAX_ATTEMPTS + SUCCESSES_IN_BETWEEN + 2);
 
       tenant.replay(http, delivery).expectStatus().isEqualTo(HttpStatus.CONFLICT);
       assertThat(Rows.delivery(delivery)).isEqualTo(delivered);
       assertThat(Rows.attempts(delivery)).isEqualTo(bothRuns);
     }
+  }
+
+  // What makes the endpoint a healthy one between two attempts of the delivery that it rejects:
+  // another event for it is delivered. The rejected delivery is moved an hour ahead first, so
+  // that it cannot come due meanwhile and take the 200, however long the other event takes.
+  private void deliverAnotherEventMeanwhile(TestTenant tenant, UUID rejected) {
+    Rows.postponeDelivery(rejected, AN_HOUR);
+    deliverAnotherEvent(tenant);
+  }
+
+  private void deliverAnotherEvent(TestTenant tenant) {
+    UUID other = Rows.deliveryOf(tenant.accept(http, EVENT));
+    await().untilAsserted(() -> assertThat(Rows.delivery(other).state()).isEqualTo("succeeded"));
+  }
+
+  // The next request to the endpoint is answered with a 500. The rejected delivery is the only
+  // one of the endpoint that is pending, and it is made due: aged by the hour that it was moved
+  // ahead and by the longest wait after the attempt that it has just made.
+  private static void rejectTheNextAttempt(FaultReceiver receiver, UUID rejected, int attempt) {
+    receiver.answerOnce("/hook", FaultReceiver.status(500));
+    Rows.ageDelivery(rejected, AN_HOUR.plus(RetrySchedule.delay(attempt, 1)));
+  }
+
+  private static long requestsFor(UUID delivery, FaultReceiver receiver) {
+    return receiver.requests().stream()
+        .filter(request -> request.header("webhook-id").equals(delivery.toString()))
+        .count();
   }
 
   private static Instant databaseClock() {

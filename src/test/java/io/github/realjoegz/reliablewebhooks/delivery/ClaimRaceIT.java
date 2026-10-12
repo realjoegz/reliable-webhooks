@@ -4,13 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
-import io.github.realjoegz.reliablewebhooks.endpoint.SecretCipher;
 import io.github.realjoegz.reliablewebhooks.harness.FaultReceiver;
 import io.github.realjoegz.reliablewebhooks.harness.Rows;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import io.github.realjoegz.reliablewebhooks.harness.UnsafeLocalReplica;
-import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Duration;
@@ -30,20 +28,13 @@ class ClaimRaceIT {
   private static final String EVENT =
       """
       {"type":"order.created","data":{"order":17}}""";
-  private static final int REPLICAS = 4;
   private static final int TENANTS = 5;
   private static final int ENDPOINTS_OF_A_TENANT = 10;
   private static final int EVENTS_OF_A_TENANT = 40;
   private static final int DELIVERIES = TENANTS * ENDPOINTS_OF_A_TENANT * EVENTS_OF_A_TENANT;
 
-  /** A poller with a worker of its own, which records its attempts under its own replica id. */
-  private record Replica(DeliveryPoller poller, Thread thread) {}
-
   @Autowired RestTestClient http;
-  @Autowired DeliveryRepository deliveries;
-  @Autowired WebhookHttpClient client;
-  @Autowired SecretCipher secrets;
-  @Autowired DeliveryMeters meters;
+  @Autowired PollerFleet fleet;
   @Autowired WebhooksProperties properties;
 
   // The claim runs on two connections that the test holds, with no worker running. The first
@@ -105,18 +96,11 @@ class ClaimRaceIT {
       List<UUID> queued = deliveriesOf(tenants);
       assertThat(queued).hasSize(DELIVERIES);
 
-      List<Replica> replicas = new ArrayList<>();
-      try {
-        for (int i = 1; i <= REPLICAS; i++) {
-          replicas.add(start("replica-" + i));
-        }
+      try (PollerFleet.Running replicas =
+          fleet.start("replica-1", "replica-2", "replica-3", "replica-4")) {
         await()
             .atMost(Duration.ofMinutes(2))
             .untilAsserted(() -> assertThat(succeeded(tenants)).isEqualTo(DELIVERIES));
-      } finally {
-        for (Replica replica : replicas) {
-          stop(replica);
-        }
       }
 
       assertThat(receiver.requests()).hasSize(DELIVERIES);
@@ -141,30 +125,6 @@ class ClaimRaceIT {
         .param("lease", new PGInterval(0, 0, 0, 0, 0, lease.toSeconds()))
         .query((row, n) -> row.getObject("id", UUID.class))
         .list();
-  }
-
-  private Replica start(String replicaId) {
-    DeliveryWorker worker =
-        new DeliveryWorker(
-            deliveries,
-            client,
-            secrets,
-            meters,
-            properties.delivery(),
-            replicaId,
-            System::nanoTime,
-            Thread::sleep);
-    DeliveryPoller poller =
-        new DeliveryPoller(
-            deliveries, worker, meters, new PollerHeartbeat(System::nanoTime), properties);
-    return new Replica(
-        poller, Thread.ofPlatform().name("poller-of-" + replicaId).start(poller::run));
-  }
-
-  private static void stop(Replica replica) throws InterruptedException {
-    replica.poller().stop();
-    replica.thread().join();
-    assertThat(replica.poller().awaitIdle(Duration.ofSeconds(20))).isTrue();
   }
 
   private static List<UUID> deliveriesOf(List<UUID> tenants) {

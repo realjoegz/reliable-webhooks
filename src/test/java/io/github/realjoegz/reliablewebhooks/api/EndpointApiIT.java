@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.realjoegz.reliablewebhooks.endpoint.SecretCipher;
 import io.github.realjoegz.reliablewebhooks.harness.InProcessReplica;
+import io.github.realjoegz.reliablewebhooks.harness.Rows;
 import io.github.realjoegz.reliablewebhooks.harness.StubDns;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
@@ -37,13 +38,6 @@ class EndpointApiIT {
   private static final String URL = "https://" + HOST + "/hooks/1";
   private static final String SECRET_FORMAT = "whsec_[A-Za-z0-9+/]{43}=";
   private static final String ISO_INSTANT = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z";
-
-  private record Circuit(
-      String state,
-      int consecutiveFailures,
-      int probeFailures,
-      boolean everOpened,
-      boolean probeScheduled) {}
 
   @Autowired RestTestClient http;
   @Autowired StubDns dns;
@@ -134,7 +128,7 @@ class EndpointApiIT {
 
     UUID id = create(tenant, URL, List.of("*"));
 
-    assertThat(circuitOf(id)).isEqualTo(new Circuit("closed", 0, 0, false, false));
+    assertThat(Rows.circuit(id)).isEqualTo(Rows.Circuit.CLOSED);
   }
 
   // The test holds a table lock that the circuit insert needs. The endpoint insert has run by
@@ -500,26 +494,5 @@ class EndpointApiIT {
                 + " WHERE endpoint_id = :id")
         .param("id", endpointId)
         .update();
-  }
-
-  private static Circuit circuitOf(UUID endpointId) {
-    return TestDatabase.jdbc()
-        .sql(
-            """
-            SELECT state, consecutive_failures, probe_failures,
-                   opened_at IS NOT NULL AS ever_opened,
-                   next_probe_at IS NOT NULL AS probe_scheduled
-            FROM endpoint_circuit WHERE endpoint_id = :id
-            """)
-        .param("id", endpointId)
-        .query(
-            (row, n) ->
-                new Circuit(
-                    row.getString("state"),
-                    row.getInt("consecutive_failures"),
-                    row.getInt("probe_failures"),
-                    row.getBoolean("ever_opened"),
-                    row.getBoolean("probe_scheduled")))
-        .single();
   }
 }

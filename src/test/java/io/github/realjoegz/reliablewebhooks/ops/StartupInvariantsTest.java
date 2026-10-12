@@ -111,6 +111,23 @@ class StartupInvariantsTest {
         .containsExactly("webhooks.delivery.finalize-cutoff must be below the lease");
   }
 
+  // The lease of these two is long enough for either cutoff, so only the probe slot of 60 s
+  // decides: a request that starts just before 44 s is over by 59 s.
+  @Test
+  void requestThatStartsAtTheStartCutoffMayEndOneSecondBeforeTheProbeSlot() {
+    assertThat(violations(delivery(90, 44, 59))).isEmpty();
+  }
+
+  // A request that starts just before 45 s can run until 60 s. A probe that did would still be
+  // open when its slot is free again and the next claim sends another.
+  @Test
+  void startCutoffPlusAttemptDeadlineMustBeBelowTheProbeSlot() {
+    assertThat(violations(delivery(90, 45, 60)))
+        .containsExactly(
+            "webhooks.delivery.start-cutoff plus the attempt deadline must be below the probe slot"
+                + " of 60 s");
+  }
+
   @Test
   void atLeastOneAttemptMustBeAllowed() {
     Delivery noAttempt = new Delivery(DEADLINE, LEASE, START_CUTOFF, FINALIZE_CUTOFF, 0, 64);

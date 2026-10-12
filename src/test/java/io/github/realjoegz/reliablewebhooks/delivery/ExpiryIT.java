@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
+import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker.Verdict;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Attempt;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Claimed;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.NextState;
@@ -103,9 +104,14 @@ class ExpiryIT {
 
     UUID waitingForRetry = Rows.deliveryOf(tenant.accept(http, EVENT));
     deliveries.recordAttempt(
-        claimOnly(waitingForRetry), NextState.retryIn(Duration.ofHours(1)), failure, "replica-1");
+        claimOnly(waitingForRetry),
+        NextState.retryIn(Duration.ofHours(1)),
+        failure,
+        Verdict.FAILURE,
+        "replica-1");
     UUID succeeded = Rows.deliveryOf(tenant.accept(http, EVENT));
-    deliveries.recordAttempt(claimOnly(succeeded), NextState.succeeded(), success, "replica-1");
+    deliveries.recordAttempt(
+        claimOnly(succeeded), NextState.succeeded(), success, Verdict.SUCCESS, "replica-1");
     UUID abandoned = Rows.deliveryOf(tenant.accept(http, EVENT));
     claimOnly(abandoned);
     UUID leased = Rows.deliveryOf(tenant.accept(http, EVENT));
@@ -150,7 +156,9 @@ class ExpiryIT {
 
     assertThat(Rows.delivery(leased))
         .isEqualTo(new Rows.Delivery("dead", 1, 0, false, "expired", true));
-    assertThat(deliveries.recordAttempt(holderOfTheLease, NextState.succeeded(), success, "late"))
+    assertThat(
+            deliveries.recordAttempt(
+                holderOfTheLease, NextState.succeeded(), success, Verdict.SUCCESS, "late"))
         .isFalse();
     assertThat(Rows.delivery(leased).state()).isEqualTo("dead");
     assertThat(Rows.attempts(leased))

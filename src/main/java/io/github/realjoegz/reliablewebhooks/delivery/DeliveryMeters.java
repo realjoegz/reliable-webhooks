@@ -14,6 +14,7 @@ import org.springframework.stereotype.Component;
 public class DeliveryMeters {
 
   private final Map<AttemptReason, Counter> attempts = new EnumMap<>(AttemptReason.class);
+  private final Counter releasedForLostGate;
   private final Counter releasedForBusyLookup;
   private final Counter finalizeLostLease;
   private final Counter finalizeErrors;
@@ -30,6 +31,8 @@ public class DeliveryMeters {
               .tag("reason", reason.label())
               .register(meters));
     }
+    this.releasedForLostGate =
+        Counter.builder("webhooks.delivery.released").tag("reason", "gate_lost").register(meters);
     this.releasedForBusyLookup =
         Counter.builder("webhooks.delivery.released").tag("reason", "dns_busy").register(meters);
     this.finalizeLostLease = meters.counter("webhooks.finalize.lost.lease");
@@ -48,6 +51,10 @@ public class DeliveryMeters {
    */
   public void abandonedAttemptsRecorded(int rows) {
     attempts.get(AttemptReason.LEASE_EXPIRED).increment(rows);
+  }
+
+  void releasedForLostGate() {
+    releasedForLostGate.increment();
   }
 
   void releasedForBusyLookup() {

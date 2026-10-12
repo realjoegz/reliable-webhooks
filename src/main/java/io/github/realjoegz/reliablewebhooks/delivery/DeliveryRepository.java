@@ -1,5 +1,6 @@
 package io.github.realjoegz.reliablewebhooks.delivery;
 
+import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker.Verdict;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.time.Duration;
@@ -97,19 +98,22 @@ public class DeliveryRepository {
       """;
 
   // The attempt began as long before this transaction as the replica measured it to take, so
-  // started_at plus duration_ms is the time at which the attempt was recorded. No probe exists
-  // yet, so no attempt is one.
+  // started_at plus duration_ms is the time at which the attempt was recorded.
   static final String INSERT_ATTEMPT =
       """
       INSERT INTO delivery_attempt (delivery_id, run, attempt_no, probe, outcome, http_status, error,
                                     remote_addr, started_at, duration_ms, replica)
-      VALUES (:id, :run, :attempt_no, false, :outcome, :http_status, :error, :remote_addr::inet,
+      VALUES (:id, :run, :attempt_no, :probe, :outcome, :http_status, :error, :remote_addr::inet,
               now() - :duration_ms * interval '1 millisecond', :duration_ms, :replica)
       """;
 
   /**
    * A delivery that a claim has leased. The attempts include the one that the claim began. An
    * abandoned delivery had been leased before, and its holder recorded nothing.
+   *
+   * <p>A claim takes a delivery whose endpoint has an open circuit only when a probe of that
+   * endpoint is due. Such a delivery may be sent only by the worker that wins the gate, and its
+   * attempt is then the probe.
    */
   record Claimed(
       UUID id,
@@ -119,7 +123,8 @@ public class DeliveryRepository {
       int attempts,
       int replays,
       UUID leaseToken,
-      boolean abandoned) {}
+      boolean abandoned,
+      boolean circuitOpen) {}
 
   /** What the request of an attempt is made of. The timestamp is the database clock in seconds. */
   record Loaded(String url, byte[] secret, byte[] body, long signedAt) {
@@ -153,12 +158,15 @@ public class DeliveryRepository {
 
   private final JdbcClient jdbc;
   private final TransactionTemplate transactions;
+  private final CircuitBreaker circuits;
 
   DeliveryRepository(
       @Qualifier("workerJdbc") JdbcClient jdbc,
-      @Qualifier("workerTransactions") TransactionTemplate transactions) {
+      @Qualifier("workerTransactions") TransactionTemplate transactions,
+      CircuitBreaker circuits) {
     this.jdbc = jdbc;
     this.transactions = transactions;
+    this.circuits = circuits;
   }
 
   /**
@@ -186,7 +194,8 @@ public class DeliveryRepository {
                               row.getInt("attempts"),
                               row.getInt("replays"),
                               row.getObject("lease_token", UUID.class),
-                              row.getBoolean("abandoned")))
+                              row.getBoolean("abandoned"),
+                              "open".equals(row.getString("circuit"))))
                   .list();
           for (Claimed delivery : claimed) {
             if (delivery.abandoned()) {
@@ -231,11 +240,13 @@ public class DeliveryRepository {
   }
 
   /**
-   * Records the attempt and moves the delivery to its next state, in one transaction. Returns
-   * false, with nothing changed, when the token is no longer the lease of the delivery: another
-   * replica has reclaimed it, or this result has been recorded before.
+   * Records the attempt, moves the delivery to its next state and tells the circuit of its endpoint
+   * what the attempt says about it, in one transaction. Returns false, with nothing changed, when
+   * the token is no longer the lease of the delivery: another replica has reclaimed it, or this
+   * result has been recorded before.
    */
-  boolean recordAttempt(Claimed delivery, NextState next, Attempt attempt, String replica) {
+  boolean recordAttempt(
+      Claimed delivery, NextState next, Attempt attempt, Verdict verdict, String replica) {
     return transactions.execute(
         transaction -> {
           if (!fenceAndChangeState(delivery, next)) {
@@ -246,6 +257,7 @@ public class DeliveryRepository {
               .param("id", delivery.id())
               .param("run", delivery.replays())
               .param("attempt_no", delivery.attempts())
+              .param("probe", delivery.circuitOpen())
               .param("outcome", attempt.outcome())
               .param("http_status", attempt.httpStatus())
               .param("error", attempt.error())
@@ -253,6 +265,7 @@ public class DeliveryRepository {
               .param("duration_ms", attempt.took().toMillis())
               .param("replica", replica)
               .update();
+          circuits.record(delivery.endpointId(), verdict);
           return true;
         });
   }

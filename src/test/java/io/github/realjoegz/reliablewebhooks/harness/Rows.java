@@ -6,9 +6,9 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Reads the rows that a delivery leaves behind, and ages them. Ageing is how a test lets time pass:
- * it moves the time columns of a row into the past, and the service and the database clock run
- * unchanged.
+ * Reads the rows that a delivery leaves behind and the circuit row of an endpoint, and ages them.
+ * Ageing is how a test lets time pass: it moves the time columns of a row into the past, and the
+ * service and the database clock run unchanged.
  */
 public final class Rows {
 
@@ -67,6 +67,18 @@ public final class Rows {
           remoteAddr,
           ReplicaSettings.IN_PROCESS_REPLICA);
     }
+  }
+
+  /** A circuit row. Whether it has a probe time says nothing about whether that time has passed. */
+  public record Circuit(
+      String state,
+      int consecutiveFailures,
+      int probeFailures,
+      boolean hasOpenedAt,
+      boolean hasProbeTime) {
+
+    /** The circuit of an endpoint that is created, and of one whose last attempt succeeded. */
+    public static final Circuit CLOSED = new Circuit("closed", 0, 0, false, false);
   }
 
   private Rows() {}
@@ -146,6 +158,65 @@ public final class Rows {
                 """
                 SELECT extract(epoch FROM d.next_attempt_at - recorded.at)
                 FROM delivery d
+                JOIN delivery_attempt a ON a.delivery_id = d.id
+                CROSS JOIN LATERAL
+                  (SELECT a.started_at + a.duration_ms * interval '1 millisecond' AS at) recorded
+                WHERE d.id = :id AND a.run = d.replays AND a.attempt_no = :attempt_no
+                """)
+            .param("id", deliveryId)
+            .param("attempt_no", attemptNo)
+            .query(BigDecimal.class)
+            .single();
+    return Duration.ofNanos(seconds.movePointRight(9).longValueExact());
+  }
+
+  public static Circuit circuit(UUID endpointId) {
+    return TestDatabase.jdbc()
+        .sql(
+            """
+            SELECT state, consecutive_failures, probe_failures,
+                   opened_at IS NOT NULL AS has_opened_at,
+                   next_probe_at IS NOT NULL AS has_probe_time
+            FROM endpoint_circuit WHERE endpoint_id = :id
+            """)
+        .param("id", endpointId)
+        .query(
+            (row, n) ->
+                new Circuit(
+                    row.getString("state"),
+                    row.getInt("consecutive_failures"),
+                    row.getInt("probe_failures"),
+                    row.getBoolean("has_opened_at"),
+                    row.getBoolean("has_probe_time")))
+        .single();
+  }
+
+  /** Moves the time of the next probe of an endpoint into the past. */
+  public static void ageCircuit(UUID endpointId, Duration by) {
+    TestDatabase.jdbc()
+        .sql(
+            """
+            UPDATE endpoint_circuit SET next_probe_at = next_probe_at - make_interval(secs => :seconds)
+            WHERE endpoint_id = :id
+            """)
+        .param("seconds", by.toNanos() / 1e9)
+        .param("id", endpointId)
+        .update();
+  }
+
+  /**
+   * How far the finalize of an attempt put the next probe of its endpoint ahead: from the time at
+   * which the attempt was recorded to the probe time of the circuit. It is the wait that this
+   * finalize wrote only as long as nothing has moved the probe time since.
+   */
+  public static Duration probeWaitAfter(UUID deliveryId, int attemptNo) {
+    BigDecimal seconds =
+        TestDatabase.jdbc()
+            .sql(
+                """
+                SELECT extract(epoch FROM c.next_probe_at - recorded.at)
+                FROM delivery d
+                JOIN endpoint_circuit c ON c.endpoint_id = d.endpoint_id
                 JOIN delivery_attempt a ON a.delivery_id = d.id
                 CROSS JOIN LATERAL
                   (SELECT a.started_at + a.duration_ms * interval '1 millisecond' AS at) recorded

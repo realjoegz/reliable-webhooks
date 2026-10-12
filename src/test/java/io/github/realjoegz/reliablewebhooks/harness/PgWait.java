@@ -37,6 +37,17 @@ public final class PgWait {
   }
 
   /**
+   * Returns once that many backends of the replica are waiting for a lock in such a statement at
+   * the same time. The lock timeout ends the wait of the first of them first, so the others have
+   * that long to arrive.
+   */
+  public static void untilBlocked(String sqlFragment, String replica, int backends) {
+    await("%d backends of %s blocked in: %s".formatted(backends, replica, sqlFragment))
+        .pollInterval(Duration.ofMillis(10))
+        .until(() -> backendsBlockedIn(sqlFragment, replica) == backends);
+  }
+
+  /**
    * Ends the backends that {@link #untilBlocked} waits for, which is what a database that shuts
    * down does to a session, and returns how many they were. The statement of such a backend fails,
    * and its connection is closed.
