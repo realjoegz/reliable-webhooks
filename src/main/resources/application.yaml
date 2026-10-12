@@ -18,6 +18,19 @@ spring:
           # share, and without this a name of up to 50,000 bytes stays in it. The limit counts
           # bytes because RequestBodyCharset has every body read as UTF-8.
           max-name-length: 1024
+  mvc:
+    formcontent:
+      filter:
+        # No route takes a form. This filter of Spring runs ahead of ApiKeyFilter. For a PUT,
+        # PATCH or DELETE that is sent as a form it reads the whole body into memory, on any
+        # path and before the request is authenticated.
+        enabled: false
+  servlet:
+    multipart:
+      # No route takes a multipart body. Left on, Spring parses such a body before it looks for
+      # a route, on any path and so also where no key is taken, up to the 10 MB that Spring Boot
+      # allows a request.
+      enabled: false
   web:
     resources:
       add-mappings: false

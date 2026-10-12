@@ -13,6 +13,8 @@ import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -42,7 +44,15 @@ class ApiTimeoutIT {
   // The test holds the endpoint row that the fan-out locks, and keeps it until the request has
   // been answered. The request is seen waiting in the fan-out, which its transaction runs after
   // the insert of the event, so the answer comes from a transaction that had an event to undo.
-  // An answer before the statement timeout shows that the lock timeout gave it.
+  //
+  // The database counts the lock timeout and the statement timeout on its own clock, so the time
+  // that the answer took is read from that clock as well: once before the request is sent and
+  // once after it has been answered. The wait for the row lies between the two readings. The lock
+  // timeout does not end that wait before its 2 s are over, so an answer that came sooner would
+  // have come from something else. The statement timeout does not end a statement before its 5 s
+  // are over, so an answer inside them shows that the lock timeout gave it. The clock of this JVM
+  // does not run at exactly the rate of that clock, and a wait of 2 s there can measure a few
+  // milliseconds less here.
   @Test
   void blockedStatementAnswers503() throws Exception {
     TestTenant tenant = TestTenant.create(http, "blocked-statement");
@@ -58,11 +68,11 @@ class ApiTimeoutIT {
       lock.setObject(1, endpoint);
       lock.execute();
 
-      long start = System.nanoTime();
+      Instant before = databaseClock();
       Future<ExchangeResult> call = caller.submit(() -> post(tenant, key));
       PgWait.untilBlocked("INSERT INTO delivery", ReplicaSettings.IN_PROCESS_REPLICA);
       ExchangeResult answer = call.get();
-      Duration took = Duration.ofNanos(System.nanoTime() - start);
+      Instant after = databaseClock();
 
       assertThat(answer.getStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
       assertThat(answer.getResponseHeaders().getContentType())
@@ -70,7 +80,8 @@ class ApiTimeoutIT {
       assertThat(answer.getResponseHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");
       assertThat(json.readTree(answer.getResponseBodyContent()).get("type").asString())
           .isEqualTo("database_busy");
-      assertThat(took).isBetween(api.lockTimeout(), api.statementTimeout());
+      assertThat(Duration.between(before, after))
+          .isBetween(api.lockTimeout(), api.statementTimeout());
 
       blocker.rollback();
     }
@@ -85,5 +96,9 @@ class ApiTimeoutIT {
 
   private ExchangeResult post(TestTenant tenant, String key) {
     return tenant.send(http, key, BODY).returnResult();
+  }
+
+  private static Instant databaseClock() {
+    return TestDatabase.jdbc().sql("SELECT now()").query(OffsetDateTime.class).single().toInstant();
   }
 }
