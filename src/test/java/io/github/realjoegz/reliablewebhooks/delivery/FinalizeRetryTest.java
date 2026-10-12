@@ -33,9 +33,11 @@ class FinalizeRetryTest {
           UUID.randomUUID(),
           false);
 
-  // System.nanoTime may be anywhere in the long range, so this clock starts just before it wraps.
-  // The only thing that moves it is the pause of the retry.
-  private final AtomicLong nanoTime = new AtomicLong(Long.MAX_VALUE - 5);
+  // System.nanoTime may be anywhere in the long range, so this clock starts a second before it
+  // wraps. A claim that begins now has its first tries before the wrap and its cutoff after it.
+  // The only thing that moves the clock is the pause of the retry.
+  private final AtomicLong nanoTime =
+      new AtomicLong(Long.MAX_VALUE - Duration.ofSeconds(1).toNanos());
   private final long claimStarted = nanoTime.get();
   private final MeterRegistry registry = new SimpleMeterRegistry();
   private final FinalizeRetry retry =

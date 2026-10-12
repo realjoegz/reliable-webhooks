@@ -27,6 +27,7 @@ class OutboundRequestIT {
       """
       {"type":"order.created","data":{"order":17}}""";
   private static final Duration LONGEST_WAIT_AFTER_A_FIRST_FAILURE = Duration.ofSeconds(10);
+  private static final Duration LONGER_THAN_THE_ATTEMPT_DEADLINE = Duration.ofSeconds(30);
 
   @Autowired RestTestClient http;
   @Autowired ReplicaWorker worker;
@@ -42,12 +43,13 @@ class OutboundRequestIT {
         new Rows.Delivery("pending", 1, 0, false, null, false));
   }
 
-  // The status line decides, so the delivery has succeeded. The body is no part of that.
+  // The status line decides, so the delivery has succeeded. The body is no part of that. It is
+  // the endless body in chunks, the one that a client goes on reading unless it cuts it.
   @Test
   void endlessBodyIsNotDrained() throws Exception {
     assertResponseIsCutAtItsLimit(
         "endless-body",
-        FaultReceiver.endlessBody(),
+        FaultReceiver.endlessChunkedBody(),
         Rows.Attempt.answered(1, 200),
         new Rows.Delivery("succeeded", 1, 0, false, null, true));
   }
@@ -101,7 +103,9 @@ class OutboundRequestIT {
   // its delivery succeeds: cutting one response costs one connection and no other request.
   //
   // The receiver writes until its connection is gone. That the client closed it, and how little
-  // had been written by then, shows that the response was cut and not read to the deadline.
+  // had been written by then, shows that the response was cut and not read to the deadline. The
+  // wait for the attempt outlasts that deadline, so a response that was read to it fails on what
+  // the attempt and the receiver show, and not on a wait that ran out.
   private void assertResponseIsCutAtItsLimit(
       String name,
       FaultReceiver.Endless endless,
@@ -121,7 +125,9 @@ class OutboundRequestIT {
       await().until(() -> hold.waiting() == 1);
 
       UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
-      await().untilAsserted(() -> assertThat(Rows.attempts(delivery)).hasSize(1));
+      await()
+          .atMost(LONGER_THAN_THE_ATTEMPT_DEADLINE)
+          .untilAsserted(() -> assertThat(Rows.attempts(delivery)).hasSize(1));
 
       assertThat(Rows.attempts(delivery)).containsExactly(expectedAttempt);
       assertThat(Rows.delivery(delivery)).isEqualTo(expectedDelivery);

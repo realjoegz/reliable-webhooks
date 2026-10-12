@@ -50,7 +50,8 @@ class SlowEndpointIsolationIT {
   // flight, which is all that an endpoint may have. Two events are accepted then, one for another
   // endpoint of the tenant and one of another tenant, and both are delivered while the four are
   // still held. They are the witness that the replica went on claiming: the two deliveries that
-  // are left for the slow endpoint were due in those claims, and were passed over.
+  // are left for the slow endpoint were due in those claims, and were passed over. Their due time
+  // is still the one that ingest gave them, so no claim took one of them and gave it back.
   //
   // A held request is cut at the deadline of an attempt, 15 s after it began. A run that took
   // that long to get here would fail: the receiver would count the requests of the two that are
@@ -72,7 +73,8 @@ class SlowEndpointIsolationIT {
         forTheSlowEndpoint.add(Rows.deliveryOf(tenant.accept(http, FOR_THE_FAULTY_ENDPOINT)));
       }
       worker.start();
-      await().until(() -> hold.waiting() == MAX_IN_FLIGHT_FOR_AN_ENDPOINT);
+      await()
+          .untilAsserted(() -> assertThat(hold.waiting()).isEqualTo(MAX_IN_FLIGHT_FOR_AN_ENDPOINT));
 
       UUID forTheSibling = Rows.deliveryOf(tenant.accept(http, FOR_THE_SIBLING));
       UUID ofTheOtherTenant = Rows.deliveryOf(other.accept(http, EVENT));
@@ -95,6 +97,7 @@ class SlowEndpointIsolationIT {
           forTheSlowEndpoint.subList(MAX_IN_FLIGHT_FOR_AN_ENDPOINT, forTheSlowEndpoint.size())) {
         assertThat(Rows.delivery(passedOver))
             .isEqualTo(new Rows.Delivery("pending", 0, 0, false, null, false));
+        assertThat(wasGivenBack(passedOver)).isFalse();
       }
     }
   }
@@ -153,7 +156,7 @@ class SlowEndpointIsolationIT {
 
       try (StubDns.Hold hold = dns.hold(stuckHost)) {
         worker.start();
-        await().until(() -> hold.waiting() == LOOKUP_SLOTS_OF_A_TENANT);
+        await().untilAsserted(() -> assertThat(hold.waiting()).isEqualTo(LOOKUP_SLOTS_OF_A_TENANT));
 
         UUID ofTheOtherTenant = Rows.deliveryOf(other.accept(http, EVENT));
         await()
@@ -207,7 +210,7 @@ class SlowEndpointIsolationIT {
       UUID forTheSibling;
       try (StubDns.Hold hold = dns.hold(stuckHost)) {
         worker.start();
-        await().until(() -> hold.waiting() == LOOKUP_SLOTS_OF_A_TENANT);
+        await().untilAsserted(() -> assertThat(hold.waiting()).isEqualTo(LOOKUP_SLOTS_OF_A_TENANT));
 
         forTheSibling = Rows.deliveryOf(tenant.accept(http, FOR_THE_SIBLING));
         await().until(() -> wasGivenBack(forTheSibling));

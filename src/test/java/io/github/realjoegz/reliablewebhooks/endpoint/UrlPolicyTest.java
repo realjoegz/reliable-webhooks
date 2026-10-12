@@ -64,10 +64,16 @@ class UrlPolicyTest {
     assertThat(policy.check(TENANT, url)).isEqualTo(Verdict.ALLOWED);
   }
 
+  // An http URL without a port means port 80, so its port would refuse it as well. The three
+  // that name a port are the ones that a policy which takes http allows. Here the scheme is all
+  // that refuses them.
   @ParameterizedTest
   @ValueSource(
       strings = {
         "http://hooks.example.com/hook",
+        "http://hooks.example.com:8080/hook",
+        "HTTP://hooks.example.com:1024/hook",
+        "http://hooks.example.com:443/hook",
         "ftp://hooks.example.com/hook",
         "//hooks.example.com/hook",
         "hooks.example.com/hook",

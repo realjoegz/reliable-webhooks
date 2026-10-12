@@ -26,8 +26,11 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.web.servlet.client.RestTestClient;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * The expiry job against deliveries in the states that a claim and a finalize leave them in. The
@@ -58,6 +61,14 @@ class ExpiryIT {
   @Autowired WebhooksProperties properties;
   @Autowired ExpiryJob expiry;
   @Autowired MeterRegistry meters;
+
+  @Autowired
+  @Qualifier("workerJdbc")
+  JdbcClient workerJdbc;
+
+  @Autowired
+  @Qualifier("workerTransactions")
+  TransactionTemplate workerTransactions;
 
   @BeforeEach
   void hostResolvesToAPublicAddress() {
@@ -184,24 +195,51 @@ class ExpiryIT {
         .containsExactly(new Rows.Attempt(0, 1, false, "failure", 500, null, null, "replica-1"));
   }
 
-  // One more delivery than a run takes is past its budget. They expired a second apart and were
-  // written in the reverse of that order, so the one that expired last was written first. The run
-  // takes the thousand that expired first and leaves that one, which a run that took the rows as
-  // they lie in the table would not. The next run takes it.
+  // Twice as many deliveries as a run takes are past their budget. In the order in which they
+  // were written, every other one expired an hour before the ones beside it. The run takes the
+  // thousand that expired first, and the next run takes the rest.
+  //
+  // That order has to come from the statement. The index on the time of expiry hands the rows
+  // over in that order whatever the statement asks for, and the planner reads them through it
+  // here. The first run is therefore made inside a transaction of the test, on the pool of the
+  // worker, that has the index scans turned off. Its rows come as they lie in the table, where
+  // the two halves alternate, so a run that took them as they came would take some of each.
+  //
+  // A session keeps the plan of a statement that it has run often, and goes on using it under
+  // other settings. The plans are therefore discarded before the run, and after it, so that the
+  // plan of this run is not kept either.
+  //
+  // If the run were outside the transaction, or still read through the index, the test would
+  // pass whatever the statement asked for, so it shows that neither is the case. What the run
+  // did is hidden from every other session until the transaction ends: the run was a part of
+  // it. And the statement reads the table twice, once to pick its deliveries and once to change
+  // them. The session counts two sequential scans of the table over the run, so neither read
+  // went through an index.
   @Test
   void runTakesTheThousandDeliveriesThatExpiredFirst() {
     TestTenant tenant = TestTenant.create(http, "expiry-batch");
     UUID endpoint = tenant.register(http, HOOK, "*");
-    insertDeliveriesPastTheirBudget(tenant, endpoint, BATCH + 1);
+    insertDeliveriesPastTheirBudget(tenant, endpoint, 2 * BATCH);
 
-    expiry.run();
+    workerTransactions.executeWithoutResult(
+        transaction -> {
+          workerJdbc.sql("SET LOCAL enable_indexscan = off").update();
+          workerJdbc.sql("SET LOCAL enable_bitmapscan = off").update();
+          workerJdbc.sql("DISCARD PLANS").update();
+          long scansBeforeTheRun = sequentialScansOfTheDeliveryTable();
+          expiry.run();
+          long scansOfTheRun = sequentialScansOfTheDeliveryTable() - scansBeforeTheRun;
+          workerJdbc.sql("DISCARD PLANS").update();
+          assertThat(scansOfTheRun).as("sequential scans of the table by the run").isEqualTo(2);
+          assertThat(deliveriesIn("dead", tenant)).isZero();
+        });
 
     assertThat(deliveriesIn("dead", tenant)).isEqualTo(BATCH);
-    assertThat(pendingDeliveriesOf(tenant)).containsExactly(lastToExpire(tenant));
+    assertThat(latestExpiryIn("dead", tenant)).isBefore(earliestExpiryIn("pending", tenant));
 
     expiry.run();
 
-    assertThat(deliveriesIn("dead", tenant)).isEqualTo(BATCH + 1);
+    assertThat(deliveriesIn("dead", tenant)).isEqualTo(2 * BATCH);
   }
 
   // The test holds the row of one expired delivery in a transaction of its own. A run that waited
@@ -294,8 +332,8 @@ class ExpiryIT {
   }
 
   // Events with one delivery each, as ingest leaves them for one matching endpoint, but created
-  // more than seventy-two hours ago and a second apart, the newest first. They are written here
-  // and not accepted through the API: no request can be that old.
+  // more than seventy-two hours ago: a second apart, and every other one an hour before that.
+  // They are written here and not accepted through the API: no request can be that old.
   private static void insertDeliveriesPastTheirBudget(
       TestTenant tenant, UUID endpointId, int count) {
     TestDatabase.jdbc()
@@ -306,6 +344,7 @@ class ExpiryIT {
                                  created_at)
               SELECT gen_random_uuid(), :t, 'order.created', :body, 'expired-' || n, sha256(:body),
                      now() - interval '72 hours' - n * interval '1 second'
+                       - (n % 2) * interval '1 hour'
               FROM generate_series(1, :count) AS n
               RETURNING id, created_at
             )
@@ -319,6 +358,15 @@ class ExpiryIT {
         .param("body", EVENT.getBytes(StandardCharsets.UTF_8))
         .param("count", count)
         .update();
+  }
+
+  // What the session of the calling transaction has counted and not yet reported. That can
+  // include scans from just before the transaction began, so the caller compares two counts.
+  private long sequentialScansOfTheDeliveryTable() {
+    return workerJdbc
+        .sql("SELECT seq_scan FROM pg_stat_xact_user_tables WHERE relname = 'delivery'")
+        .query(Long.class)
+        .single();
   }
 
   private static Instant completedAtOf(UUID deliveryId) {
@@ -339,19 +387,23 @@ class ExpiryIT {
         .single();
   }
 
-  private static List<UUID> pendingDeliveriesOf(TestTenant tenant) {
+  private static Instant latestExpiryIn(String state, TestTenant tenant) {
     return TestDatabase.jdbc()
-        .sql("SELECT id FROM delivery WHERE tenant_id = :t AND state = 'pending'")
+        .sql("SELECT max(expires_at) FROM delivery WHERE tenant_id = :t AND state = :state")
         .param("t", tenant.id())
-        .query(UUID.class)
-        .list();
+        .param("state", state)
+        .query(OffsetDateTime.class)
+        .single()
+        .toInstant();
   }
 
-  private static UUID lastToExpire(TestTenant tenant) {
+  private static Instant earliestExpiryIn(String state, TestTenant tenant) {
     return TestDatabase.jdbc()
-        .sql("SELECT id FROM delivery WHERE tenant_id = :t ORDER BY expires_at DESC LIMIT 1")
+        .sql("SELECT min(expires_at) FROM delivery WHERE tenant_id = :t AND state = :state")
         .param("t", tenant.id())
-        .query(UUID.class)
-        .single();
+        .param("state", state)
+        .query(OffsetDateTime.class)
+        .single()
+        .toInstant();
   }
 }

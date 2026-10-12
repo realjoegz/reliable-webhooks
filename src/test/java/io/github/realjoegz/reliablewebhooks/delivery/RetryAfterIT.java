@@ -21,19 +21,22 @@ class RetryAfterIT {
   @Autowired RestTestClient http;
   @Autowired ReplicaWorker worker;
 
-  // Three endpoints answer 503 and ask for a wait of nothing, of two minutes and of a billion
-  // seconds. The wait of two minutes is the control: it is taken as it is, so the header is
-  // read. The other two are clamped, to the delay that the schedule gives by itself and to one
-  // hour.
+  // Four endpoints answer 503 and ask for a wait of nothing, of two minutes, of an hour and a
+  // second, and of a billion seconds. The wait of two minutes is the control: it is taken as it
+  // is, so the header is read. The others are clamped: the wait of nothing to the delay that the
+  // schedule gives by itself, and the two above an hour to one hour. An hour and a second is the
+  // shortest wait that is cut, so it shows where the limit lies.
   @Test
   void clampedAtBothEnds() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start()) {
       receiver.answer("/zero", FaultReceiver.status(503, "Retry-After", "0"));
       receiver.answer("/two-minutes", FaultReceiver.status(503, "Retry-After", "120"));
+      receiver.answer("/hour-and-a-second", FaultReceiver.status(503, "Retry-After", "3601"));
       receiver.answer("/absurd", FaultReceiver.status(503, "Retry-After", "1000000000"));
       TestTenant tenant = TestTenant.create(http, "retry-after");
       tenant.register(http, receiver.url("/zero"), "wait.zero");
       tenant.register(http, receiver.url("/two-minutes"), "wait.two-minutes");
+      tenant.register(http, receiver.url("/hour-and-a-second"), "wait.hour-and-a-second");
       tenant.register(http, receiver.url("/absurd"), "wait.absurd");
       worker.start();
 
@@ -41,6 +44,8 @@ class RetryAfterIT {
           .isBetween(RetrySchedule.delay(1, 0), RetrySchedule.delay(1, 1));
       assertThat(waitAfterFirstFailure(tenant, "wait.two-minutes"))
           .isEqualTo(Duration.ofMinutes(2));
+      assertThat(waitAfterFirstFailure(tenant, "wait.hour-and-a-second"))
+          .isEqualTo(Duration.ofHours(1));
       assertThat(waitAfterFirstFailure(tenant, "wait.absurd")).isEqualTo(Duration.ofHours(1));
     }
   }

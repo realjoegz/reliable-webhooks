@@ -111,14 +111,16 @@ public final class FaultReceiver implements AutoCloseable {
      */
     public static final long MORE_THAN_BUFFERS_TAKE = 16L * 1024 * 1024;
 
-    private static final byte[] FILL = "a".repeat(1024).getBytes(StandardCharsets.US_ASCII);
+    private static final String FILL = "a".repeat(1024);
 
     private final byte[] start;
+    private final byte[] repeated;
     private final AtomicLong bytesWritten = new AtomicLong();
     private volatile Boolean peerClosedFirst;
 
-    private Endless(String start) {
+    private Endless(String start, String repeated) {
       this.start = start.getBytes(StandardCharsets.US_ASCII);
+      this.repeated = repeated.getBytes(StandardCharsets.US_ASCII);
     }
 
     public long bytesWritten() {
@@ -144,8 +146,8 @@ public final class FaultReceiver implements AutoCloseable {
         out.write(start);
         bytesWritten.addAndGet(start.length);
         while (true) {
-          out.write(FILL);
-          bytesWritten.addAndGet(FILL.length);
+          out.write(repeated);
+          bytesWritten.addAndGet(repeated.length);
         }
       } catch (IOException connectionGone) {
         peerClosedFirst = !receiver.closing;
@@ -213,13 +215,30 @@ public final class FaultReceiver implements AutoCloseable {
 
   /** Answers with a status line and one header line that never ends. */
   public static Endless endlessHeader() {
-    return new Endless("HTTP/1.1 200 Scripted\r\nX-Endless: ");
+    return new Endless("HTTP/1.1 200 Scripted\r\nX-Endless: ", Endless.FILL);
   }
 
-  /** Answers 200 with a body that never ends. */
+  /**
+   * Answers 200 with a body that never ends. The head declares no length and no chunks, so the body
+   * is all that the connection carries until it closes.
+   */
   public static Endless endlessBody() {
     return new Endless(
-        "HTTP/1.1 200 Scripted\r\nContent-Type: application/octet-stream" + END_OF_HEAD);
+        "HTTP/1.1 200 Scripted\r\nContent-Type: application/octet-stream" + END_OF_HEAD,
+        Endless.FILL);
+  }
+
+  /**
+   * Answers 200 with a body in chunks that never ends. A body in chunks is one that a client can
+   * read to its end to use the connection again, and a client that did would read this one for as
+   * long as it is allowed to.
+   */
+  public static Endless endlessChunkedBody() {
+    return new Endless(
+        "HTTP/1.1 200 Scripted\r\nContent-Type: application/octet-stream\r\n"
+            + "Transfer-Encoding: chunked"
+            + END_OF_HEAD,
+        Integer.toHexString(Endless.FILL.length()) + "\r\n" + Endless.FILL + "\r\n");
   }
 
   // A response that is written in one piece. The connection can take another request after it.

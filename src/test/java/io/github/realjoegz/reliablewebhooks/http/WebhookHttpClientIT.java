@@ -2,6 +2,8 @@ package io.github.realjoegz.reliablewebhooks.http;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Named.named;
+import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Delivery;
@@ -26,9 +28,13 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * The client against a receiver on the loopback address, which its address policy lets through
@@ -229,11 +235,18 @@ class WebhookHttpClientIT {
     assertThat(endless.bytesWritten()).isLessThan(FaultReceiver.Endless.MORE_THAN_BUFFERS_TAKE);
   }
 
+  static Stream<Arguments> bodiesWithoutAnEnd() {
+    return Stream.of(
+        arguments(named("until the connection closes", FaultReceiver.endlessBody())),
+        arguments(named("in chunks", FaultReceiver.endlessChunkedBody())));
+  }
+
   // The status line decides, and the body is not drained: the client reads up to its limit and
   // closes the connection, as it does under a header line without an end.
-  @Test
-  void bodyWithoutAnEndIsCutAtTheLimitAndTheStatusStillCounts() throws Exception {
-    FaultReceiver.Endless endless = FaultReceiver.endlessBody();
+  @ParameterizedTest
+  @MethodSource("bodiesWithoutAnEnd")
+  void bodyWithoutAnEndIsCutAtTheLimitAndTheStatusStillCounts(FaultReceiver.Endless endless)
+      throws Exception {
     receiver.answer("/hook", endless);
 
     assertThat(client.send(TENANT, url("/hook"), Map.of(), BODY))

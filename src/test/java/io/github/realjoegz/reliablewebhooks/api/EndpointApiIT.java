@@ -383,11 +383,12 @@ class EndpointApiIT {
     assertThat(tenant.endpointRows()).isEqualTo(1);
   }
 
-  // The host of each URL is public, so the form of the URL is the only reason to refuse it.
+  // The host of each URL is public, so the form of the URL is the only reason to refuse it. The
+  // first names a port that is allowed, so its scheme alone refuses it.
   @ParameterizedTest
   @ValueSource(
       strings = {
-        "http://hooks.endpoint-api.example/hooks/1",
+        "http://hooks.endpoint-api.example:8443/hooks/1",
         "https://hooks.endpoint-api.example:80/hooks/1",
         "https://user:password@hooks.endpoint-api.example/hooks/1",
         "hooks.endpoint-api.example/hooks/1"
