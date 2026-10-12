@@ -34,8 +34,8 @@ Packages:
 
 | Package | Contents |
 |---|---|
-| (root) | `ReliableWebhooksApplication`, `WebhooksProperties` (every `webhooks.*` setting), `DatabasePools`, `DatabaseFailures` |
-| `api/` | Controllers, `Problems`, `ApiKeyFilter`, `TenantConcurrencyFilter`, `UntrustedTraceContextFilter`, `IngestMeter` |
+| (root) | `ReliableWebhooksApplication`, `WebhooksProperties` (every `webhooks.*` setting), `DatabasePools`, `DatabaseFailures`, `Traceparent` |
+| `api/` | Controllers, `Problems`, `ApiKeyFilter`, `TenantConcurrencyFilter`, `UntrustedTraceContextFilter`, `RequestLogFields`, `IngestMeter` |
 | `tenant/` | `TenantRepository` |
 | `endpoint/` | `EndpointService`, `EndpointRepository`, `UrlPolicy`, `SecretCipher` |
 | `ingest/` | `IngestService`, `EventRepository`, `TokenBucket` |
@@ -361,7 +361,8 @@ A release writes no attempt row and does not touch the circuit. It is for decisi
 SELECT e.url, e.secret,
        CASE WHEN e.prev_secret_expires_at > now() THEN e.prev_secret END AS prev_secret,
        ev.body, ev.trace_context,
-       extract(epoch FROM now())::bigint AS signed_at        -- the signature timestamp
+       extract(epoch FROM now())::bigint AS signed_at,       -- the signature timestamp
+       extract(epoch FROM now() - d.created_at) AS age       -- of the delivery, in seconds
 FROM delivery d
 JOIN endpoint e ON e.id = d.endpoint_id
 JOIN event ev   ON ev.id = d.event_id
@@ -369,6 +370,8 @@ WHERE d.id = :id AND d.lease_token = :token AND e.status = 'active';
 ```
 
 No row means the delivery was cancelled or reclaimed, or its endpoint was deleted. The worker stops. A row of a deleted endpoint stays leased until `CancelJob` cancels it.
+
+The trace context is the parent of the span of the attempt, and the age is what the end-to-end meter starts from (section 10). Neither is part of the request.
 
 **Step 4: sign and send** (sections 11.3 and 11.4), under the hard attempt deadline below. If `DnsLookups` answers `busy`, this replica could not admit the lookup. The worker releases the row with a 2 s delay and stops.
 
@@ -567,15 +570,15 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 
 ## 10. Observability
 
-**Metrics** (Micrometer, Prometheus). No metric carries a tenant, endpoint, delivery, host or URL label. Each meter ships with the code it counts.
+**Metrics** (Micrometer, Prometheus). A replica serves them at `/actuator/prometheus`, which takes no key, like the health endpoints. They are scraped and pushed nowhere. No meter of the service carries a tenant, endpoint, delivery, host or URL label. Each meter ships with the code it counts.
 
 | Metric | Labels |
 |---|---|
 | `webhooks_ingest_requests_total` | `result` = accepted, replayed, rate_limited, unsatisfiable, busy, invalid |
 | `webhooks_delivery_attempts_total` | `outcome`, `reason` = http_2xx, http_3xx, http_4xx, http_5xx, timeout, connect, tls, dns, blocked, deadline, response_too_large, lease_expired |
 | `webhooks_delivery_released_total` | `reason` = gate_lost, dns_busy |
-| `webhooks_delivery_attempt_seconds` (histogram) | `outcome` |
-| `webhooks_delivery_terminal_total` | `state`, `reason` |
+| `webhooks_delivery_attempt_seconds` (histogram) | `outcome` = success, failure |
+| `webhooks_delivery_terminal_total` | `state`, `reason` = succeeded and delivered, dead and exhausted, dead and expired, cancelled and endpoint_deleted |
 | `webhooks_delivery_end_to_end_seconds` (histogram) | none |
 | `webhooks_claim_seconds`, `webhooks_claim_rows`, `webhooks_claim_errors_total` | none |
 | `webhooks_finalize_lost_lease_total`, `webhooks_finalize_errors_total` | none |
@@ -587,24 +590,77 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 
 `webhooks_delivery_attempts_total` counts attempt rows: an attempt is counted when its finalize has committed, and an abandoned attempt (`unknown`, `lease_expired`) when the claim or the expiry run that found it has. An attempt whose finalize lost its lease is counted on `webhooks_finalize_lost_lease_total` only.
 
+`webhooks_delivery_attempt_seconds` holds how long the request of such an attempt took, on the monotonic clock of the replica. An abandoned attempt has no duration and is not in it. Its buckets end at 15 s, which is the attempt deadline that ships. They are not read from `webhooks.delivery.attempt-deadline`.
+
+`webhooks_delivery_terminal_total` counts a delivery when it reaches a final state. The worker counts `succeeded` and `dead` with `exhausted` once the finalize has committed, `ExpiryJob` counts `dead` with `expired`, and `CancelJob` counts `cancelled`. A delivery that is replayed is counted again when its new run ends.
+
+`webhooks_delivery_end_to_end_seconds` holds, for each delivery that succeeded, the time from its creation to the end of the request that was answered with a 2xx. That is the age of the delivery when the attempt was loaded, on the database clock (section 7), plus the time that the request took, on the monotonic clock of the replica. A replayed delivery counts from its creation and not from its replay. The buckets end at the 72 h of a delivery.
+
+One finalize that committed is counted as if it had not. When the answer to its commit is lost with the connection, the next try finds the lease gone (section 7), and a replica cannot tell that from a lease that another replica took over. The attempt row is written and the delivery may have reached its final state, but the replica counts a lost lease on `webhooks_finalize_lost_lease_total` and nothing on the four meters above.
+
+`webhooks_claim_seconds` holds how long a claim took that the database answered, and `webhooks_claim_rows` how many rows it returned. Both hold a count, a sum and the largest value, without buckets. A claim that failed is counted on `webhooks_claim_errors_total` only.
+
+`webhooks_poller_last_iteration_age_seconds` is the time since the heartbeat that liveness reads (section 15).
+
 `webhooks_ingest_requests_total` counts a request that the ingest route answered with one of these results, once, when the request is over. `invalid` is a `400`, a `413` or a `422`, and `busy` is a `503`. Nothing else is counted:
 - a request that is refused before it reaches the route, by authentication, by the request permits or for its media type;
 - a request to any other route;
 - a request that the ingest route answered with any other status. A `500` is such an answer, so a failure that the service maps to none of the results does not appear in this counter. The `415` for a charset other than UTF-8 (section 11.5) is another.
 
-`QueueGauges` runs one aggregate query over the pending index every 15 s per replica. It uses the claim's eligibility predicates: `due` counts rows a claim could take, and `held` counts due rows behind an open circuit or a suspended tenant.
+`QueueGauges` runs one aggregate query over the pending index on every replica, once when the replica starts and then 15 s after the end of each run. It uses the claim's eligibility predicates: `due` counts rows a claim could take, and `held` counts due rows behind an open circuit or a suspended tenant.
 
-**Traces.**
-- Ingest starts a new root span. A syntactically valid caller `traceparent` is attached as a span link (section 11.7).
-- The ingest span's own context is stored in `event.trace_context`.
-- Each attempt is one span of kind CLIENT, a child of that stored context, written by hand in `WebhookHttpClient`.
-- Its attributes are delivery id, attempt number, probe, outcome, status code and the destination host. It never carries the URL, path or query.
+```sql
+WITH pending AS (
+  SELECT d.next_attempt_at,
+         d.next_attempt_at <= now() AS due,
+         d.lease_token IS NOT NULL  AS has_token,
+         t.status = 'active'                                        -- as the claim decides
+           AND (c.state = 'closed' OR c.next_probe_at <= now()) AS claimable
+  FROM delivery d
+  JOIN endpoint e         ON e.id = d.endpoint_id
+  JOIN tenant t           ON t.id = e.tenant_id
+  JOIN endpoint_circuit c ON c.endpoint_id = e.id
+  WHERE d.state = 'pending' AND e.status = 'active'
+)
+SELECT count(*) FILTER (WHERE due AND claimable)         AS due,
+       count(*) FILTER (WHERE due AND NOT claimable)     AS held,
+       count(*) FILTER (WHERE NOT due AND NOT has_token) AS scheduled,
+       count(*) FILTER (WHERE NOT due AND has_token)     AS leased,
+       coalesce(extract(epoch FROM now() - min(next_attempt_at) FILTER (WHERE due AND claimable)), 0)
+         AS oldest_due_age,
+       (SELECT count(*) FROM endpoint_circuit c JOIN endpoint e ON e.id = c.endpoint_id
+        WHERE c.state = 'open' AND e.status = 'active') AS circuits_open
+FROM pending;
+```
+
+- The statement runs by itself, outside a transaction, on the `worker` pool, whose statement timeout of 10 s bounds it (limitation 27). It writes nothing and locks no row, so a run that outlives its replica leaves nothing behind (section 3).
+- The four states are those of section 4. A delivery whose lease ran out with nothing recorded is `due`, because a claim could take it. A delivery that waits for the time of its next attempt is `scheduled`.
+- An open circuit whose probe is due makes its endpoint eligible, so the due deliveries of that endpoint count as `due` until the gate has moved the probe time, and as `held` again after that.
+- The bulkheads of a replica are not part of the predicates. They are the state of one replica, and the gauges count the queue of all of them.
+- The pending deliveries of a deleted endpoint are in none of the four states. `CancelJob` cancels them, and `webhooks_delivery_terminal_total` counts them then.
+- `webhooks_oldest_due_age_seconds` is how long the oldest `due` delivery has been due, and 0 when none is.
+- `webhooks_circuits_open` counts the open circuits of active endpoints.
+- A value is as old as the last run that the database answered. A run that fails is logged and leaves the gauges as they were (limitation 27). A replica that has read nothing yet shows no number.
+
+Spring Boot adds meters of its own to the scrape, for the JVM, the connection pools and the HTTP server. `http_server_requests_seconds` names a route by its pattern, such as `/v1/deliveries/{id}`, and never by the path of a request.
+
+**Traces** (OpenTelemetry, through the starter of Spring Boot).
+- Spans are exported over OTLP once `management.opentelemetry.tracing.export.otlp.endpoint` names a collector. Without it no span leaves the replica.
+- A replica samples the share of its traces that `management.tracing.sampling.probability` gives. The decision is made once, for the ingest span, and an attempt span is sampled when the stored context says that its ingest span was.
+- Spring Boot would also take such settings from the `OTEL_` variables of the environment. `management.opentelemetry.map-environment-variables` is false, so a replica does not read them: a variable that a platform sets for every process neither switches the export of spans or meters on nor changes what is sampled.
+- Ingest starts a new root span. It is the span that the tracing filter of Spring starts for the request, from which `UntrustedTraceContextFilter` has kept the trace context of the caller (section 11.7). `IngestService` attaches a syntactically valid caller `traceparent` to it as a span link.
+- The ingest span's own context is stored in `event.trace_context`, in the form of a `traceparent` value.
+- Each attempt is one span of kind CLIENT, a child of that stored context, written by hand in `WebhookHttpClient`. An event that was stored without a context gets a trace of its own for each attempt.
+- Its attributes are delivery id (`webhooks.delivery_id`), attempt number (`webhooks.attempt`), probe (`webhooks.probe`), outcome (`webhooks.outcome`), status code (`http.response.status_code`) and the destination host (`server.address`). It never carries the URL, path or query.
+- The outcome is `success` or `failure`, as in the attempt row. A request that was not sent, because the replica had no room for its lookup (section 7), is no attempt. Its span ends with the outcome `not_sent`.
 - The HTTP client is not auto-instrumented, so no span or meter is derived from the request URL.
-- Outbound requests carry the attempt span's `traceparent`.
+- Outbound requests carry the attempt span's `traceparent`, and no other trace header.
 
 **Logs.**
 - JSON through Spring Boot structured logging.
-- Fields: `trace_id`, `span_id`, `tenant_id`, `event_id`, `delivery_id`, `endpoint_id`, `attempt`, `outcome`, `reason`, `replica`.
+- Fields: `trace_id`, `span_id`, `tenant_id`, `event_id`, `delivery_id`, `endpoint_id`, `attempt`, `outcome`, `reason`, `state`, `host`, `replica`.
+- A line that is logged while a route handles a request carries the trace id and the span id of the request, the replica and, on a tenant route, the tenant.
+- A line about a delivery carries the ids of the tenant, the event, the delivery and the endpoint, the number of the attempt and the replica. A line about what came of a request to a subscriber also carries the trace id and the span id of the attempt span. The line that records an attempt adds its outcome, its reason, the state that it left the delivery in (`pending`, `succeeded` or `dead`) and the host that the request went to.
 - Never logged: `Authorization` values, API keys, signing secrets, signatures, payload bodies, and any part of a subscriber URL other than its host.
 
 ## 11. Security
@@ -729,9 +785,12 @@ Each of the two create transactions, this one and the one of a tenant (section 5
 - `TracingIT#attemptSpanCarriesHostOnly`
 - `MetricsIT#noMeterHasHostOrUrlLabel`, which scans the whole scrape for the marker, the receiver host and the ids.
 
+The first of them reads every line written by a replica that runs as a process of its own (section 16). It looks in those lines for the rest of the list as well: the API key, the admin token, the signing secret, the signatures of the requests and the payload of the event.
+
 **11.7 Untrusted trace context.**
-- `UntrustedTraceContextFilter` runs before the tracing filter on public routes. It strips `traceparent`, `tracestate` and `baggage`.
-- It keeps the `traceparent` only if it is version 00, 55 characters, lowercase hex with non-zero ids, and hands that to `IngestService` as a span link.
+- `UntrustedTraceContextFilter` runs before the tracing filter on public routes, which are all the routes of a replica. It strips the W3C headers `traceparent`, `tracestate` and `baggage`, and the B3 headers: `b3`, and `x-b3-traceid`, `x-b3-spanid`, `x-b3-parentspanid`, `x-b3-sampled` and `x-b3-flags`.
+- It keeps the `traceparent` only if it is version 00, 55 characters, lowercase hex with non-zero ids, and hands that to `IngestService` as a span link. A request with more than one `traceparent` has none that is kept.
+- Spring Boot reads the W3C headers and both forms of B3 unless `management.tracing.propagation.type` tells it to read fewer. The filter strips them all and does not go by that setting, so no value of it lets the context of a caller reach the tracing filter.
 - The caller therefore cannot set the trace id or the sampling decision.
 
 ## 12. Rate limiting, tenant isolation and database time bounds
@@ -891,6 +950,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 31. **The delivery list is narrow.** It needs an endpoint and a state. There is no tenant-wide listing, and the attempt log is read one run at a time.
 32. **A request on a connection that the subscriber has just closed fails.** The client keeps connections for reuse and repeats no request by itself, so such a request is a failed attempt and waits for its retry. A connection that was idle for more than 2 s is tested before it is used again, which leaves the short window after a request.
 33. **One old signing secret is kept.** A second rotation inside the 24 h of the first ends that overlap early, and so does the repeat of a rotation whose response was lost. A subscriber that still checks with the secret from before the first rotation rejects every request from then on. The deliveries that it rejects are retried on the schedule until it has a secret that is signed with.
+34. **The scrape is open to whoever reaches the port.** `/actuator/prometheus` takes no key and is served on the port of the API. It holds no tenant, endpoint or delivery, but it does show the state of the queue and the rate of failures. Keeping it from the public belongs to the ingress.
 
 ## 15. Operations
 
@@ -912,7 +972,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 - No JVM proxy properties.
 - SSRF allowlist empty and `http` disabled unless the `unsafe-local` profile is active.
 
-**Liveness.** The `poller` health indicator (`PollerHealth`) belongs to the liveness group, next to the liveness state of Spring Boot. It reports down when the poller loop has not finished an iteration for 60 s, which it reads from `PollerHeartbeat` on the monotonic clock of the replica. A failed claim also finishes an iteration, so a database outage does not restart pods. Only a poller that stopped looping does. A heartbeat that was never beaten counts from the start of the replica. `PollerHeartbeatTest` covers the rule with an injected time source, and `DeliveryPollerTest` that the loop beats after a claim that failed. `PollerHealthIT` asks the probes of a replica whose poller is seen waiting in its claim, behind a table lock of the test, after the test has moved the clock of its heartbeat by 60 s: the liveness probe answers down and the readiness probe up, and the liveness probe answers up again once the claim has ended.
+**Liveness.** The `poller` health indicator (`PollerHealth`) belongs to the liveness group, next to the liveness state of Spring Boot. It reports down when the poller loop has not finished an iteration for 60 s, which it reads from `PollerHeartbeat` on the monotonic clock of the replica. A failed claim also finishes an iteration, so a database outage does not restart pods. Only a poller that stopped looping does. A heartbeat that was never beaten counts from the start of the replica. `PollerHealth` also registers the gauge of section 10, on the heartbeat that it reads. `PollerHeartbeatTest` covers the rule and the gauge with an injected time source, and `DeliveryPollerTest` that the loop beats after a claim that failed. `PollerHealthIT` asks the probes of a replica whose poller is seen waiting in its claim, behind a table lock of the test, after the test has moved the clock of its heartbeat by 60 s: the liveness probe answers down and the readiness probe up, and the liveness probe answers up again once the claim has ended. A scrape of that replica shows the gauge at those 60 s while the probe answers down, and at 0 once it answers up again.
 
 The database health indicator is off. The health endpoint takes no key, so it must not borrow pooled connections.
 
@@ -924,7 +984,7 @@ The database health indicator is off. The health endpoint takes no key, so it mu
 
 The JVM then exits with code 143 (128 + SIGTERM), which is the documented exit code of a clean drain. The deployment must allow at least 30 s of termination grace. Nothing needs releasing, because nothing is claimed that has not started.
 
-`ExpiryJob`, `CancelJob` and `RetentionJob` are lifecycles of the same phase as the worker, so they stop before the pools close as well. Spring stops the lifecycles of a phase one after the other and then waits until each has reported its end, for at most the 30 s that Spring Boot gives a phase. The stop of a job starts no further run and returns at once, and a run in progress starts no further statement. The job reports its end when its loop is over, which is after the statement that is in progress. A slow run therefore neither delays the stop of the poller nor adds its time to the drain. It still ends before the pools close, because the time bounds of the `worker` pool (section 12) end a statement inside those 30 s.
+`ExpiryJob`, `CancelJob` and `RetentionJob` are lifecycles of the same phase as the worker, so they stop before the pools close as well. So is `QueueGauges` (section 10), which runs on the same kind of timer. Spring stops the lifecycles of a phase one after the other and then waits until each has reported its end, for at most the 30 s that Spring Boot gives a phase. The stop of a job starts no further run and returns at once, and a run in progress starts no further statement. The job reports its end when its loop is over, which is after the statement that is in progress. A slow run therefore neither delays the stop of the poller nor adds its time to the drain. It still ends before the pools close, because the time bounds of the `worker` pool (section 12) end a statement inside those 30 s.
 
 **Background jobs.** They run on every replica on a timer, with no leader election. Each is an idempotent batch statement that picks its rows in a CTE with `FOR UPDATE SKIP LOCKED`, so a job never waits on a row and concurrent runs are harmless. The CTE runs once, so its `LIMIT` bounds the statement whatever plan it gets (section 8).
 
@@ -948,12 +1008,14 @@ WITH picked AS (
   FROM picked
   WHERE d.id = picked.id
   RETURNING d.id, d.replays, d.attempts, picked.abandoned
+), logged AS (
+  INSERT INTO delivery_attempt (delivery_id, run, attempt_no, outcome, error)
+  SELECT id, replays, attempts, 'unknown', 'lease_expired' FROM expired WHERE abandoned
 )
-INSERT INTO delivery_attempt (delivery_id, run, attempt_no, outcome, error)
-SELECT id, replays, attempts, 'unknown', 'lease_expired' FROM expired WHERE abandoned;
+SELECT count(*) AS deliveries, count(*) FILTER (WHERE abandoned) AS abandoned FROM expired;
 ```
 
-  A run is this one statement.
+  A run is this one statement. It answers with the number of deliveries that it dead-lettered and the number of attempt rows that it wrote, which the job counts on the meters of section 10. Postgres runs the insert although nothing reads from it.
 
 - `CancelJob` (every 30 s) cancels the pending rows of deleted endpoints, 1,000 per statement, repeating while a batch is full:
 
@@ -1048,12 +1110,19 @@ Rules:
 - **Time is aged in the data, not in the clock.** `Rows` ages a row: it subtracts an interval from its time columns, which are `next_attempt_at`, `expires_at`, `completed_at`, `next_probe_at`, `refilled_at`, `prev_secret_expires_at` and the `created_at` of an event. Production code and `now()` run unchanged. This drives lease expiry, the twelve-step schedule, the probe interval, the 72 h budget, the 24 h of an old secret and retention. `Rows` also postpones a delivery: it moves the due time ahead, so that no claim takes the delivery until the test ages it by as much.
 - **A negative claim needs a witness.** "Nothing was claimed" or "no attempt was used" is asserted only after something observable proves the poller ran in the state under test. The witness is either a canary (a delivery to another endpoint or tenant, ingested after that state was reached, has succeeded) or a positive signal such as `poller_stopped`.
 - **Ordering assertions, not clocks.** Where a test is about who goes first, it reads the receiver's request log.
-- Integration tests run with production retry, breaker, lease and timeout settings. The test-profile differences are the `unsafe-local` allowance for the loopback receiver with its `http` scheme, in the classes that deliver to the receiver, and in `TracingIT` only, the sampler probability.
+- Integration tests run with production retry, breaker, lease and timeout settings. The test-profile differences are the `unsafe-local` allowance for the loopback receiver with its `http` scheme, in the classes that deliver to the receiver, and in `TracingIT` only, the sampler probability. The replicas that `TracingIT` starts to read spans also hand them to an exporter of the test, which keeps them in memory. One replica of that class names a collector instead, which is a receiver of the test.
 - Three tests of `WebhookHttpClientIT` wait for a time bound to end a request, and their clients have a short one: an attempt deadline of 500 ms in the two that are cut at the deadline, and a lookup wait of 20 ms in the one whose lookup does not answer. The client with the short deadline is built from settings, as the application builds its client, so the bound that cuts those requests is `attempt-deadline`. A replica under test always runs with the shipped values.
 - **A replica inside the test JVM does not start its worker by itself.** The replicas of a build share one database, so a worker that ran all the time would take the deliveries of tests that are about something else, and those of a test that has to claim them itself. A test that wants deliveries sent starts the worker of its replica, or builds the pollers it needs. The worker is stopped when the test ends. One test is the exception: `WorkerLifecycleIT#replicaStartsItsWorkerByItselfAndStopsItWhenItCloses` starts a second replica the way the application starts, with nothing taken from Spring, and closes it before it ends. The attempt is recorded under the id of that replica, which shows that Spring started its worker. Its pools hold 4 connections each, because the replicas that the build keeps have theirs open.
 - **Nor does it start its jobs.** A run that came by itself could take a delivery that a test has aged past its budget before the test is ready for it, cancel one that a test shows as pending, or delete a row that a test has aged past retention. A test that wants a run calls the run of the job. Three tests are the exception here, one for each job: `ExpiryIT#replicaRunsItsExpiryJobByItself`, `EndpointDeleteIT#replicaRunsItsCancelJobByItself` and `RetentionIT#replicaRunsItsRetentionJobByItself`. Each starts a second replica the way the application starts and waits for the first run of that replica's job. In the first of them the delivery belongs to a suspended tenant, so the worker of that replica does not claim it.
-- **Every test of such a replica begins with an empty queue.** The pending deliveries that earlier tests left are deleted first. A worker that a test starts therefore sends the deliveries of that test and no others.
-- **A replica that runs as a process of its own is not held back.** `ReplicaProcess` starts the packaged jar, and its worker and its jobs run as they do in production. Such a replica claims whatever is due. A test that starts one runs in a class with a replica inside the test JVM as well, which takes the requests that set the test up and whose worker does not run while the process does, so the test begins with an empty queue and the process finds the deliveries of that test only. The process is killed when the test ends. In the two kills of `EndpointOutageIT` that worker runs before the process and after it: it fails the delivery five times and is stopped before the process starts, and it is started again once the process is gone. In `probeSlotReopensAfterProberKilled` it is then the second replica, which sends the next probe, and in `expiredAfterHolderKilledReplaysCleanly` it delivers the replay.
+- **Nor does it read the queue for its gauges.** `QueueGauges` only reads, so a run that came by itself would harm no test. It is left to the tests all the same, so that the gauges show what the run that a test called has read. `MetricsIT#replicaReadsTheQueueForItsGaugesByItself` is the exception: a second replica starts the way the application starts, and its gauges show a held delivery without a run of the test.
+- **Every test of such a replica begins with an empty queue.** The pending deliveries that earlier tests left are deleted first. A worker that a test starts therefore sends the deliveries of that test and no others. The gauges of the queue count every tenant, so the numbers that `MetricsIT` reads from them are the deliveries of its own test for the same reason.
+- **A replica that runs as a process of its own is not held back.** `ReplicaProcess` starts the packaged jar, and its worker and its jobs run as they do in production. Such a replica claims whatever is due. A test that starts one runs in a class with a replica inside the test JVM as well, which takes the requests that set the test up and whose worker does not run while the process does, so the test begins with an empty queue and the process finds the deliveries of that test only. Three tests send the process every request, because they are about what the process itself writes or stores: the two tests of `LogFormatIT` that read its lines, and `TracingIT#replicaDoesNotReadTheOpenTelemetryVariablesOfItsEnvironment`. The process is killed when the test ends. In the two kills of `EndpointOutageIT` that worker runs before the process and after it: it fails the delivery five times and is stopped before the process starts, and it is started again once the process is gone. In `probeSlotReopensAfterProberKilled` it is then the second replica, which sends the next probe, and in `expiredAfterHolderKilledReplaysCleanly` it delivers the replay.
+- **Spans are read from a replica that the test started.** The share of its traces that a replica samples is read when it starts. Each test of `TracingIT` about spans therefore starts a `SelfStartedReplica` with the share that it is about: 1 where it reads spans, and 0 where it shows that none is exported. That replica takes the requests of the test and sends its deliveries.
+  - A replica hands its spans to an exporter in batches. The test asks the replica for the batch that is due once the request or the delivery whose spans it wants is over, and reads the exporter then. The span of a request has ended when the caller has read the answer to its end, and the span of an attempt before its row is written.
+  - In `callerCannotForceSampling` the witness is a span that the test starts in the replica as a child of the context that the caller sent. It is exported, by the sampler and through the exporter of that replica, and it is the only span there.
+  - `replicaExportsItsSpansNowhereUnlessACollectorIsNamed` reads no span. The replica of the class runs with the configuration that ships and has no exporter. A replica that the test starts with `management.opentelemetry.tracing.export.otlp.endpoint` naming a receiver of the test has one, and the span of a request to it arrives at the receiver as a `POST` of a protobuf message.
+  - `replicaDoesNotReadTheOpenTelemetryVariablesOfItsEnvironment` needs a replica with an environment of its own, which only a process has. The environment says two things about sampling: as the setting of Spring Boot (`MANAGEMENT_TRACING_SAMPLING_PROBABILITY`), that every trace is sampled, and as a variable of OpenTelemetry (`OTEL_TRACES_SAMPLER`), that none is. The event that the replica accepts is stored with the context of a sampled span. A replica that read the variable of OpenTelemetry would go by it and sample nothing.
+- **Log lines are read from a replica that runs as a process.** Its output is every line that a replica wrote and no line of anything else. The trace id and the span id reach a line through the logging context, which the tracing of Spring Boot fills from a hook in the context storage of OpenTelemetry. The hook has to be installed before that storage is first used. A process installs it when it starts. In the test JVM a test that uses the storage without an application, as `WebhookHttpClientIT` does, can come first, and the hook is then missing for every replica in that JVM. `LogFormatIT#subscriberUrlIsReducedToHost` and `#lineOfARequestNamesItsTraceItsTenantAndTheReplica` therefore read a process, and no test asserts those two ids on a line of a replica inside the test JVM. That process takes every request of its test, the creation of the tenant and the registration of the endpoint among them, so its output holds every line that the test looks through.
 - **A replica without a running worker is not live.** Its poller does not loop, so its `poller` indicator reports down once 60 s have passed since the replica started or since a test last stopped its worker. The two tests that ask a replica inside the test JVM for its health, `ApiKeyAuthIT#healthProbesNeedNoKey` and `DatabasePoolsIT#healthEndpointBorrowsNoPooledConnection`, start its worker first.
 
 Harness:
@@ -1061,16 +1130,16 @@ Harness:
 | Piece | What it does |
 |---|---|
 | `FaultReceiver` | In-process HTTP server. Per-path scripts: status with optional response headers, a body of a given length, delay, hold until released, drip, close without response, redirect, `endlessHeader`, `endlessBody`, `endlessChunkedBody`. Records every request with its headers, counts accepted connections and peak concurrency per path, and for the endless scripts the bytes written and whether the peer closed first. |
-| `ReplicaProcess` | Starts the packaged jar as a child JVM against the Testcontainers database, with the replica id as `application_name`, the JVM flag that `StartupInvariants` demands and the `unsafe-local` allowance, on a port that the operating system chose. It can start the replica behind a `TcpProxy`. Returns once the readiness probe of the replica answers. Captures stdout and passes it on to the output of the build. `kill()` is SIGKILL and returns once the process is gone, `terminate()` is SIGTERM, `exitCode()` waits for the process to end by itself. |
+| `ReplicaProcess` | Starts the packaged jar as a child JVM against the Testcontainers database, with the replica id as `application_name`, the JVM flag that `StartupInvariants` demands and the `unsafe-local` allowance, on a port that the operating system chose. It can start the replica behind a `TcpProxy`, or with further variables in its environment. Returns once the readiness probe of the replica answers. Captures stdout and passes it on to the output of the build. `kill()` is SIGKILL and returns once the process is gone, `terminate()` is SIGTERM, `exitCode()` waits for the process to end by itself. |
 | `PgWait` | `untilBlocked(sqlFragment, replica)` polls `pg_stat_activity` for a backend of that replica waiting on a lock in a statement containing the fragment, or for a given number of such backends. The lock timeout of the replica's pool ends that wait, so the test has that long to act. `endBlocked(sqlFragment, replica)` ends those backends, as a database that shuts down ends a session, and returns how many they were. `untilGone(replica)` waits until its backends have left, which is where a replica that was killed ends up. `untilNoTransaction(replica)` waits until none of its backends is in a transaction. It is for a replica whose connections went silent: nothing closes them, so its backends do not leave. |
 | `StubDns` | The resolver behind `DnsLookups` in a replica inside the test JVM, in place of the system resolver: scripted answers per call, or block until released. A name that no test scripted does not resolve. |
 | `TcpProxy` | In-process TCP forwarder between one replica and Postgres. `blackhole()` keeps every existing connection open and relays nothing more on it, ever; new connections are accepted and ignored. `heal()` lets new connections relay again. |
 | `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use, with room for 300 connections: a replica holds 32, and besides the replicas inside the test JVM a test runs up to two as processes. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. `stop()` and `start()` stop the container and start it again. The container is created with a host port that was free at that moment, because Docker gives a container that starts again another port unless its port was named. |
 | `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection with the replica id as `application_name`, an admin token and a secret-encryption key. |
-| `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker and the jobs of the replica are left to the tests, and the queue is emptied before each test. |
+| `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker, the jobs and the queue gauges of the replica are left to the tests, and the queue is emptied before each test. |
 | `UnsafeLocalReplica` | An `InProcessReplica` with the `unsafe-local` profile and its allowance: plain `http` and the loopback address, where `FaultReceiver` listens. The classes with this annotation share a second application context. |
 | `ReplicaWorker` | Starts and stops the delivery worker of a replica inside the test JVM. Each start gets a `WorkerLifecycle` and a poller of its own from the application context, wired as the application wires them, and runs the start and stop that Spring runs. |
-| `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker and its jobs, and closing it stops them. A test can give it the heartbeat of its poller, built on a clock that the test moves. |
+| `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker, its jobs and its queue gauges, and closing it stops them. A test can give it the heartbeat of its poller, built on a clock that the test moves. A test can also start it with the `unsafe-local` allowance, the share of traces that it samples and an exporter for its spans, or with a collector named that it exports its spans to. Hands out a client for the API of a replica that it started. |
 | `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, deletes one and rotates its secret, sends an event, and replays one delivery or the dead deliveries of an endpoint as that tenant. Has the tenant's limits and status set through the admin API, and counts the tenant's event, endpoint and delivery rows. |
 | `OpenRequests` | Counts, for each tenant, the requests that a route of a replica inside the test JVM has been given and has not finished. A request is counted once every filter has let it through and before the route reads its body, so a test that keeps requests unfinished can wait until they are behind the filters. |
 

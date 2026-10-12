@@ -100,7 +100,8 @@ class EventApiIT {
     assertThat(stored.idempotencyKey()).isEqualTo(key);
     assertThat(stored.requestHash())
         .isEqualTo(MessageDigest.getInstance("SHA-256").digest(request));
-    assertThat(stored.traceContext()).isNull();
+    // The context of the span of the request, as a traceparent. TracingIT shows which span.
+    assertThat(stored.traceContext()).matches("00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}");
     Matcher body =
         Pattern.compile(
                 "\\{\"id\":\"%s\",\"type\":\"order.created\",\"created_at\":\"(%s)\",\"data\":%s}"

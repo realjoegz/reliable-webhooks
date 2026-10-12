@@ -24,11 +24,10 @@ public class EventRepository {
         AND (event_types @> ARRAY['*'] OR event_types @> ARRAY[:type::text])
       """;
 
-  // trace_context is for the context of the ingest span, and ingest starts no span.
   static final String INSERT_EVENT =
       """
       INSERT INTO event (id, tenant_id, type, body, idempotency_key, request_hash, trace_context)
-      VALUES (:id, :t, :type, :body, :k, :hash, NULL)
+      VALUES (:id, :t, :type, :body, :k, :hash, :trace_context)
       ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING id
       """;
 
@@ -55,13 +54,18 @@ public class EventRepository {
   /** The event that holds an idempotency key, with the hash of the request that created it. */
   record KeyHolder(UUID eventId, byte[] requestHash) {}
 
+  /**
+   * The trace context is the context of the ingest span as a traceparent, and null on a replica
+   * that traces nothing.
+   */
   record NewEvent(
       UUID id,
       UUID tenantId,
       String type,
       byte[] body,
       String idempotencyKey,
-      byte[] requestHash) {}
+      byte[] requestHash,
+      String traceContext) {}
 
   private record Stored(String type, Instant createdAt) {}
 
@@ -114,6 +118,7 @@ public class EventRepository {
                   .param("body", event.body())
                   .param("k", event.idempotencyKey())
                   .param("hash", event.requestHash())
+                  .param("trace_context", event.traceContext())
                   .query(UUID.class)
                   .optional()
                   .isPresent();

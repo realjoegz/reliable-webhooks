@@ -2,6 +2,7 @@ package io.github.realjoegz.reliablewebhooks.delivery;
 
 import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker.Verdict;
 import java.net.InetAddress;
+import java.net.URI;
 import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.List;
@@ -81,7 +82,8 @@ public class DeliveryRepository {
       SELECT e.url, e.secret,
              CASE WHEN e.prev_secret_expires_at > now() THEN e.prev_secret END AS prev_secret,
              ev.body, ev.trace_context,
-             extract(epoch FROM now())::bigint AS signed_at        -- the signature timestamp
+             extract(epoch FROM now())::bigint AS signed_at,       -- the signature timestamp
+             extract(epoch FROM now() - d.created_at) AS age       -- of the delivery, in seconds
       FROM delivery d
       JOIN endpoint e ON e.id = d.endpoint_id
       JOIN event ev   ON ev.id = d.event_id
@@ -129,14 +131,21 @@ public class DeliveryRepository {
   /**
    * What the request of an attempt is made of. The secrets are as they are stored: the one of the
    * endpoint and, for 24 hours after a rotation, the one before it. The timestamp is the database
-   * clock in seconds.
+   * clock in seconds. The trace context is the one that the ingest stored with the event, and null
+   * where it stored none. The age is how long ago the delivery was created, on the database clock.
    */
-  record Loaded(String url, List<byte[]> secrets, byte[] body, long signedAt) {
+  record Loaded(
+      URI url,
+      List<byte[]> secrets,
+      byte[] body,
+      long signedAt,
+      String traceContext,
+      Duration age) {
 
     /** Leaves out the URL, the secrets and the body, none of which may reach a log. */
     @Override
     public String toString() {
-      return "Loaded[signedAt=%d]".formatted(signedAt);
+      return "Loaded[signedAt=%d, traceContext=%s, age=%s]".formatted(signedAt, traceContext, age);
     }
   }
 
@@ -240,10 +249,12 @@ public class DeliveryRepository {
               byte[] secret = row.getBytes("secret");
               byte[] previous = row.getBytes("prev_secret");
               return new Loaded(
-                  row.getString("url"),
+                  URI.create(row.getString("url")),
                   previous == null ? List.of(secret) : List.of(secret, previous),
                   row.getBytes("body"),
-                  row.getLong("signed_at"));
+                  row.getLong("signed_at"),
+                  row.getString("trace_context"),
+                  Duration.ofNanos(row.getBigDecimal("age").movePointRight(9).longValue()));
             })
         .optional();
   }

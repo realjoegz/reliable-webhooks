@@ -1,5 +1,6 @@
 package io.github.realjoegz.reliablewebhooks.ops;
 
+import io.github.realjoegz.reliablewebhooks.delivery.DeliveryMeters;
 import java.time.Duration;
 import java.util.function.BooleanSupplier;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -19,20 +20,29 @@ public class CancelJob extends PeriodicJob {
   private static final Duration INTERVAL = Duration.ofSeconds(30);
 
   private final CancelRepository deliveries;
+  private final DeliveryMeters meters;
 
   @Autowired
-  CancelJob(CancelRepository deliveries) {
+  CancelJob(CancelRepository deliveries, DeliveryMeters meters) {
     super(NAME, INTERVAL);
     this.deliveries = deliveries;
+    this.meters = meters;
   }
 
-  CancelJob(CancelRepository deliveries, Wait betweenRuns) {
+  CancelJob(CancelRepository deliveries, DeliveryMeters meters, Wait betweenRuns) {
     super(NAME, INTERVAL, betweenRuns);
     this.deliveries = deliveries;
+    this.meters = meters;
   }
 
   @Override
   void run(BooleanSupplier stopRequested) {
-    inBatches(deliveries::cancel, stopRequested);
+    inBatches(
+        () -> {
+          int cancelled = deliveries.cancel();
+          meters.cancelled(cancelled);
+          return cancelled;
+        },
+        stopRequested);
   }
 }

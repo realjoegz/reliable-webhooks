@@ -13,9 +13,11 @@ import io.github.realjoegz.reliablewebhooks.harness.Rows;
 import io.github.realjoegz.reliablewebhooks.harness.StubDns;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
+import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.AttemptSpan;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Response;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.opentelemetry.api.OpenTelemetry;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.URI;
@@ -232,16 +234,20 @@ class SsrfIT {
         DnsLookups lookups =
             new DnsLookups(
                 dns, new AddressPolicy(List.of("127.0.0.1/32")), new SimpleMeterRegistry());
-        WebhookHttpClient client = new WebhookHttpClient(lookups, properties)) {
+        WebhookHttpClient client =
+            new WebhookHttpClient(lookups, properties, OpenTelemetry.noop())) {
       receiver.answer("/moved", FaultReceiver.redirect(receiver.url("/target")));
       receiver.answer("/target", FaultReceiver.status(200));
 
       WebhookHttpClient.Outcome outcome =
-          client.send(
-              UUID.randomUUID(),
-              URI.create(receiver.url("/moved")),
-              Map.of(),
-              EVENT.getBytes(StandardCharsets.UTF_8));
+          client
+              .send(
+                  UUID.randomUUID(),
+                  new AttemptSpan(UUID.randomUUID(), 1, false, null),
+                  URI.create(receiver.url("/moved")),
+                  Map.of(),
+                  EVENT.getBytes(StandardCharsets.UTF_8))
+              .outcome();
 
       assertThat(outcome).isEqualTo(new Response(302, null, InetAddress.getByName("127.0.0.1")));
       assertThat(receiver.requests())

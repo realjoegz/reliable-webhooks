@@ -16,13 +16,18 @@ import io.github.realjoegz.reliablewebhooks.http.AddressPolicy;
 import io.github.realjoegz.reliablewebhooks.http.DnsLookups;
 import io.github.realjoegz.reliablewebhooks.http.ReferenceVerifier;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient;
+import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.AttemptSpan;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Failed;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.LookupBusy;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Outcome;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Reason;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Response;
+import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Traced;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.SpanContext;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
@@ -37,6 +42,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -66,7 +72,10 @@ class DeliveryWorkerTest {
           null,
           SETTINGS,
           new Ssrf(List.of(), false));
-  private static final String URL = "https://hooks.example.com/hook";
+  private static final URI URL = URI.create("https://hooks.example.com/hook");
+  private static final String TRACE_CONTEXT =
+      "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+  private static final Duration AGE_AT_THE_LOAD = Duration.ofSeconds(40);
   private static final byte[] KEY =
       "0123456789abcdef0123456789abcdef".getBytes(StandardCharsets.UTF_8);
   private static final byte[] KEY_BEFORE_THE_ROTATION =
@@ -75,7 +84,8 @@ class DeliveryWorkerTest {
   private static final long SIGNED_AT = 1_800_000_000;
 
   /** What the worker asked the client to send. */
-  private record Sent(UUID tenantId, URI url, Map<String, String> headers, byte[] body) {}
+  private record Sent(
+      UUID tenantId, AttemptSpan span, URI url, Map<String, String> headers, byte[] body) {}
 
   /** What the worker asked the repository to record. */
   private record Recorded(
@@ -109,7 +119,14 @@ class DeliveryWorkerTest {
   private final class Deliveries extends DeliveryRepository {
 
     private Optional<Loaded> loaded =
-        Optional.of(new Loaded(URL, List.of(cipher.encrypt(KEY)), BODY, SIGNED_AT));
+        Optional.of(
+            new Loaded(
+                URL,
+                List.of(cipher.encrypt(KEY)),
+                BODY,
+                SIGNED_AT,
+                TRACE_CONTEXT,
+                AGE_AT_THE_LOAD));
     private Duration loadTakes = Duration.ZERO;
     private RuntimeException loadFailure;
     private boolean leaseHeld = true;
@@ -180,14 +197,15 @@ class DeliveryWorkerTest {
     private final List<Sent> sent = new ArrayList<>();
 
     private Client() {
-      super(lookups, PROPERTIES);
+      super(lookups, PROPERTIES, OpenTelemetry.noop());
     }
 
     @Override
-    public Outcome send(UUID tenantId, URI url, Map<String, String> headers, byte[] body) {
-      sent.add(new Sent(tenantId, url, headers, body));
+    public Traced send(
+        UUID tenantId, AttemptSpan span, URI url, Map<String, String> headers, byte[] body) {
+      sent.add(new Sent(tenantId, span, url, headers, body));
       nanoTime.addAndGet(sendTakes.toNanos());
-      return outcome;
+      return new Traced(outcome, SpanContext.getInvalid());
     }
   }
 
@@ -233,7 +251,8 @@ class DeliveryWorkerTest {
     assertThat(client.sent).hasSize(1);
     Sent sent = client.sent.getFirst();
     assertThat(sent.tenantId()).isEqualTo(delivery.tenantId());
-    assertThat(sent.url()).isEqualTo(URI.create(URL));
+    assertThat(sent.span()).isEqualTo(new AttemptSpan(delivery.id(), 1, false, TRACE_CONTEXT));
+    assertThat(sent.url()).isEqualTo(URL);
     assertThat(sent.body()).isEqualTo(BODY);
     assertThat(sent.headers())
         .containsOnlyKeys("webhook-id", "webhook-timestamp", "webhook-signature")
@@ -255,7 +274,9 @@ class DeliveryWorkerTest {
                 URL,
                 List.of(cipher.encrypt(KEY), cipher.encrypt(KEY_BEFORE_THE_ROTATION)),
                 BODY,
-                SIGNED_AT));
+                SIGNED_AT,
+                TRACE_CONTEXT,
+                AGE_AT_THE_LOAD));
 
     worker.attempt(claimed(1), claimStarted);
 
@@ -288,6 +309,24 @@ class DeliveryWorkerTest {
                 Verdict.SUCCESS,
                 "replica-1"));
     assertThat(attemptsCounted("success", "http_2xx")).isEqualTo(1);
+    assertThat(attemptTime("success").count()).isEqualTo(1);
+    assertThat(attemptTime("success").totalTime(TimeUnit.MILLISECONDS)).isEqualTo(120);
+    assertThat(attemptTime("failure").count()).isZero();
+  }
+
+  // The delivery was 40 s old when its attempt was loaded, and the request took 120 ms. It is
+  // counted as delivered once, that long after its creation.
+  @Test
+  void deliveryThatSucceedsIsCountedWithTheTimeSinceItsCreation() {
+    client.sendTakes = Duration.ofMillis(120);
+
+    worker.attempt(claimed(3), claimStarted);
+
+    assertThat(terminal("succeeded", "delivered")).isEqualTo(1);
+    assertThat(terminal("dead", "exhausted")).isZero();
+    Timer endToEnd = registry.get("webhooks.delivery.end.to.end").timer();
+    assertThat(endToEnd.count()).isEqualTo(1);
+    assertThat(endToEnd.totalTime(TimeUnit.MILLISECONDS)).isEqualTo(40_120);
   }
 
   // No status ends a delivery for good: not a redirect, which is not followed, and not a 4xx.
@@ -320,6 +359,10 @@ class DeliveryWorkerTest {
         .isBetween(RetrySchedule.delay(4, 0), RetrySchedule.delay(4, 1));
     assertThat(recorded.verdict()).isEqualTo(Verdict.FAILURE);
     assertThat(attemptsCounted("failure", reason)).isEqualTo(1);
+    assertThat(attemptTime("failure").count()).isEqualTo(1);
+    assertThat(terminal("succeeded", "delivered")).isZero();
+    assertThat(terminal("dead", "exhausted")).isZero();
+    assertThat(registry.get("webhooks.delivery.end.to.end").timer().count()).isZero();
   }
 
   // A host that does not resolve and a host with a denied address read the same in the attempt
@@ -387,6 +430,8 @@ class DeliveryWorkerTest {
                 Verdict.FAILURE,
                 "replica-1"));
     assertThat(deliveries.deadLettered).isEmpty();
+    assertThat(terminal("dead", "exhausted")).isEqualTo(1);
+    assertThat(terminal("succeeded", "delivered")).isZero();
   }
 
   @Test
@@ -408,6 +453,7 @@ class DeliveryWorkerTest {
     assertThat(deliveries.loads).isZero();
     assertThat(client.sent).isEmpty();
     assertThat(deliveries.recorded).isEmpty();
+    assertThat(terminal("dead", "exhausted")).isEqualTo(1);
   }
 
   // The circuit was closed when the delivery was claimed, so there is no gate to pass.
@@ -431,6 +477,8 @@ class DeliveryWorkerTest {
 
     assertThat(circuits.askedToAdmit).containsExactly(delivery.endpointId());
     assertThat(client.sent).hasSize(1);
+    assertThat(client.sent.getFirst().span())
+        .isEqualTo(new AttemptSpan(delivery.id(), 6, true, TRACE_CONTEXT));
     assertThat(deliveries.recorded).hasSize(1);
     Recorded recorded = deliveries.recorded.getFirst();
     assertThat(recorded.delivery()).isEqualTo(delivery);
@@ -590,7 +638,19 @@ class DeliveryWorkerTest {
 
     assertThat(client.sent).hasSize(1);
     assertThat(attemptsCounted("success", "http_2xx")).isZero();
+    assertThat(attemptTime("success").count()).isZero();
+    assertThat(terminal("succeeded", "delivered")).isZero();
     assertThat(registry.get("webhooks.finalize.lost.lease").counter().count()).isEqualTo(1);
+  }
+
+  // The thirteenth claim of a delivery whose lease another replica holds by now.
+  @Test
+  void deadLetterThatLostItsLeaseIsNotCounted() {
+    deliveries.leaseHeld = false;
+
+    worker.attempt(claimed(13), claimStarted);
+
+    assertThat(terminal("dead", "exhausted")).isZero();
   }
 
   private static Claimed claimed(int attempts) {
@@ -631,6 +691,19 @@ class DeliveryWorkerTest {
 
   private static String lineLogged(CapturedOutput output, String message) {
     return output.getOut().lines().filter(line -> line.contains(message)).findFirst().orElseThrow();
+  }
+
+  private Timer attemptTime(String outcome) {
+    return registry.get("webhooks.delivery.attempt").tag("outcome", outcome).timer();
+  }
+
+  private double terminal(String state, String reason) {
+    return registry
+        .get("webhooks.delivery.terminal")
+        .tag("state", state)
+        .tag("reason", reason)
+        .counter()
+        .count();
   }
 
   private double attemptsCounted(String outcome, String reason) {

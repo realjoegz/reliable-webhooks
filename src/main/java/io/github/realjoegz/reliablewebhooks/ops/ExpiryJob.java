@@ -1,6 +1,7 @@
 package io.github.realjoegz.reliablewebhooks.ops;
 
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryMeters;
+import io.github.realjoegz.reliablewebhooks.ops.ExpiryRepository.Expired;
 import java.time.Duration;
 import java.util.function.BooleanSupplier;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -35,6 +36,8 @@ public class ExpiryJob extends PeriodicJob {
 
   @Override
   void run(BooleanSupplier stopRequested) {
-    meters.abandonedAttemptsRecorded(deliveries.expire());
+    Expired run = deliveries.expire();
+    meters.expired(run.deliveries());
+    meters.abandonedAttemptsRecorded(run.abandonedAttempts());
   }
 }

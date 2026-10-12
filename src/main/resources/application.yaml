@@ -35,7 +35,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,prometheus
   endpoint:
     health:
       probes:
@@ -48,6 +48,19 @@ management:
     db:
       # The health endpoint takes no key. It must not borrow connections from the pools.
       enabled: false
+  otlp:
+    metrics:
+      export:
+        # The meters are scraped from the prometheus endpoint. The OpenTelemetry starter brings a
+        # registry that would also push them to a collector on this host.
+        enabled: false
+  opentelemetry:
+    # Spring Boot would map the OTEL_ variables of the environment onto its settings. A variable
+    # that a platform sets for every process would then switch an export on or change what is
+    # sampled.
+    map-environment-variables: false
+  # Spans are exported once management.opentelemetry.tracing.export.otlp.endpoint names a
+  # collector. Without it they are exported nowhere.
 
 # webhooks.database.url, .username and .password, webhooks.admin-token and
 # webhooks.secret-encryption-key have no default. They come from the environment.
@@ -97,3 +110,8 @@ logging:
   structured:
     format:
       console: logstash
+    json:
+      # The names that tracing gives the ids of the current span, as the other fields are named.
+      rename:
+        traceId: trace_id
+        spanId: span_id

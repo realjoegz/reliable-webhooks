@@ -1,7 +1,10 @@
 package io.github.realjoegz.reliablewebhooks.ops;
 
 import io.github.realjoegz.reliablewebhooks.delivery.PollerHeartbeat;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.TimeGauge;
 import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 import org.springframework.boot.health.contributor.Health;
 import org.springframework.boot.health.contributor.HealthIndicator;
 import org.springframework.stereotype.Component;
@@ -9,7 +12,8 @@ import org.springframework.stereotype.Component;
 /**
  * Reports the replica as not live when the loop of its poller has stopped looping: it is down once
  * 60 seconds have passed without an iteration. The configuration puts it into the liveness group,
- * so the answer of the liveness probe is what restarts such a replica.
+ * so the answer of the liveness probe is what restarts such a replica. A gauge shows the time that
+ * the check goes by, read from the same heartbeat.
  *
  * <p>A database that is down does not make it report down, because a claim that fails ends its
  * iteration like any other. No call of the loop can take 60 seconds either: the time bounds of the
@@ -23,8 +27,15 @@ public class PollerHealth implements HealthIndicator {
 
   private final PollerHeartbeat heartbeat;
 
-  PollerHealth(PollerHeartbeat heartbeat) {
+  PollerHealth(PollerHeartbeat heartbeat, MeterRegistry meters) {
     this.heartbeat = heartbeat;
+    // The Prometheus registry renders this name as webhooks_poller_last_iteration_age_seconds.
+    TimeGauge.builder(
+            "webhooks.poller.last.iteration.age",
+            heartbeat,
+            TimeUnit.NANOSECONDS,
+            beaten -> beaten.sinceLastIteration().toNanos())
+        .register(meters);
   }
 
   @Override

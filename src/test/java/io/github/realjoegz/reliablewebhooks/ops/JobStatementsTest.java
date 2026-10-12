@@ -12,9 +12,9 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 /**
- * The statements of the expiry, cancel and retention jobs are the statements that the design writes
- * out. Each is looked for in the design as it is in the code, with its comment, apart from how its
- * lines are laid out.
+ * The statements of the expiry, cancel and retention jobs and of the queue gauges are the
+ * statements that the design writes out. Each is looked for in the design as it is in the code,
+ * with its comment, apart from how its lines are laid out.
  */
 class JobStatementsTest {
 
@@ -36,7 +36,10 @@ class JobStatementsTest {
 
   static Stream<Arguments> statements() {
     return Stream.concat(
-        Stream.of(arguments("expiry", ExpiryRepository.EXPIRE)), statementsThatAreRepeated());
+        Stream.of(
+            arguments("expiry", ExpiryRepository.EXPIRE),
+            arguments("queue gauges", QueueRepository.COUNT)),
+        statementsThatAreRepeated());
   }
 
   static Stream<Arguments> statementsThatAreRepeated() {

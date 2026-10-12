@@ -8,7 +8,7 @@ import org.springframework.stereotype.Component;
 /**
  * When the loop of the poller last finished an iteration, on the monotonic clock of the replica.
  * The loop beats after every claim, also after one that failed, so the time since the last beat
- * grows only while the loop does not loop. The liveness check reads it.
+ * grows only while the loop does not loop. The liveness check reads it and shows it on a gauge.
  *
  * <p>A heartbeat that has not been beaten yet counts from its creation.
  */

@@ -82,7 +82,7 @@ class ExpiryIT {
   // Three are pending past their seventy-two hours and not leased: one that was never claimed,
   // one that waits for its retry after a failed attempt, and one whose holder recorded nothing
   // before its lease ran out. The run dead-letters all three, and writes the attempt row that the
-  // third is missing.
+  // third is missing. It counts three deliveries as expired and one attempt of unknown outcome.
   //
   // Three are left as they are: one that is past its budget but leased, one that has a minute of
   // its budget left, and one that succeeded. The run that leaves them is the run that took the
@@ -128,9 +128,11 @@ class ExpiryIT {
     Rows.ageDelivery(withBudgetLeft, BUDGET.minusMinutes(1));
     List<String> leftAlone = Rows.everyColumnOf(List.of(leased, withBudgetLeft, succeeded));
     double countedBefore = attemptsOfUnknownOutcome();
+    double expiredBefore = deliveriesExpired();
 
     expiry.run();
 
+    assertThat(deliveriesExpired() - expiredBefore).isEqualTo(3);
     assertThat(Rows.delivery(neverClaimed))
         .isEqualTo(new Rows.Delivery("dead", 0, 0, false, "expired", true));
     assertThat(Rows.attempts(neverClaimed)).isEmpty();
@@ -308,6 +310,15 @@ class ExpiryIT {
     List<Claimed> claimed = deliveries.claim(NONE, NONE, 1, properties.delivery().lease());
     assertThat(claimed).extracting(Claimed::id).containsExactly(delivery);
     return claimed.getFirst();
+  }
+
+  private double deliveriesExpired() {
+    return meters
+        .get("webhooks.delivery.terminal")
+        .tag("state", "dead")
+        .tag("reason", "expired")
+        .counter()
+        .count();
   }
 
   private double attemptsOfUnknownOutcome() {

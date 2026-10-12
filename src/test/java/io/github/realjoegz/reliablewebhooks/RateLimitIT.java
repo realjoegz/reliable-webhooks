@@ -39,13 +39,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.test.http.server.LocalTestWebServer;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
-import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.test.web.servlet.client.ExchangeResult;
 import org.springframework.test.web.servlet.client.RestTestClient;
 import tools.jackson.databind.JsonNode;
@@ -653,13 +651,9 @@ class RateLimitIT {
   private record Replica(String id, RestTestClient http) {}
 
   private static Replica replicaOf(ConfigurableApplicationContext started) {
-    return new Replica(started.getBean(WebhooksProperties.class).replicaId(), clientOf(started));
-  }
-
-  private static RestTestClient clientOf(ConfigurableApplicationContext replica) {
-    return RestTestClient.bindToServer(new JdkClientHttpRequestFactory())
-        .uriBuilderFactory(LocalTestWebServer.obtain(replica).uriBuilderFactory())
-        .build();
+    return new Replica(
+        started.getBean(WebhooksProperties.class).replicaId(),
+        SelfStartedReplica.clientOf(started));
   }
 
   private static int storedBytesOf(UUID eventId) {

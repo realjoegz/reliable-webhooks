@@ -5,6 +5,7 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryMeters;
+import io.github.realjoegz.reliablewebhooks.ops.ExpiryRepository.Expired;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
@@ -25,13 +26,13 @@ class ExpiryJobTest {
   private final ExpiryJob job = new ExpiryJob(runs, new DeliveryMeters(registry), waits);
 
   /**
-   * Counts the runs, and answers each with the attempt rows or the failure that a test set. A run
-   * that a test gave an end stays in progress until that end gets a permit.
+   * Counts the runs, and answers each with the deliveries and attempt rows or the failure that a
+   * test set. A run that a test gave an end stays in progress until that end gets a permit.
    */
   private static final class Runs extends ExpiryRepository {
 
     private final AtomicInteger count = new AtomicInteger();
-    private volatile int attemptRowsOfARun;
+    private volatile Expired resultOfARun = new Expired(0, 0);
     private volatile RuntimeException failureOfTheNextRun;
     private volatile Semaphore endOfTheNextRun;
 
@@ -40,7 +41,7 @@ class ExpiryJobTest {
     }
 
     @Override
-    int expire() {
+    Expired expire() {
       count.incrementAndGet();
       Semaphore end = endOfTheNextRun;
       if (end != null) {
@@ -52,7 +53,7 @@ class ExpiryJobTest {
         failureOfTheNextRun = null;
         throw failure;
       }
-      return attemptRowsOfARun;
+      return resultOfARun;
     }
   }
 
@@ -164,13 +165,23 @@ class ExpiryJobTest {
     assertThat(runs.count).hasValue(2);
   }
 
+  // Of the five deliveries that a run dead-letters, three were abandoned by their holders and
+  // got their attempt rows from it.
   @Test
-  void runCountsTheAttemptRowsThatItWrote() {
-    runs.attemptRowsOfARun = 3;
+  void runCountsTheDeliveriesThatItExpiredAndTheAttemptRowsThatItWrote() {
+    runs.resultOfARun = new Expired(5, 3);
 
     job.run();
     job.run();
 
+    assertThat(
+            registry
+                .get("webhooks.delivery.terminal")
+                .tag("state", "dead")
+                .tag("reason", "expired")
+                .counter()
+                .count())
+        .isEqualTo(10);
     assertThat(
             registry
                 .get("webhooks.delivery.attempts")

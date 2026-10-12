@@ -315,6 +315,34 @@ class DeliveryPollerTest {
     assertThat(heartbeat.sinceLastIteration()).isZero();
   }
 
+  // The first claim is answered with three rows, so the next one follows at once. It is answered
+  // with none, and the loop waits. Both are timed, and their rows are counted.
+  @Test
+  void claimThatWasAnsweredIsTimedAndItsRowsAreCounted() {
+    makeDue(3);
+    loop.start();
+
+    await().until(() -> waits.asked.size() == 1);
+
+    assertThat(deliveries.claims).hasSize(2);
+    assertThat(registry.get("webhooks.claim").timer().count()).isEqualTo(2);
+    assertThat(registry.get("webhooks.claim.rows").summary().count()).isEqualTo(2);
+    assertThat(registry.get("webhooks.claim.rows").summary().totalAmount()).isEqualTo(3);
+  }
+
+  // A claim that failed has an error counted and nothing else.
+  @Test
+  void claimThatFailedIsNotTimed() {
+    deliveries.failureOfTheNextClaim = new IllegalStateException("the database did not answer");
+    loop.start();
+
+    await().until(() -> waits.asked.size() == 1);
+
+    assertThat(registry.get("webhooks.claim.errors").counter().count()).isEqualTo(1);
+    assertThat(registry.get("webhooks.claim").timer().count()).isZero();
+    assertThat(registry.get("webhooks.claim.rows").summary().count()).isZero();
+  }
+
   // The claim wrote the attempt row for the holder that recorded nothing. The poller counts it.
   @Test
   void abandonedDeliveryIsCountedAsAnAttemptOfUnknownOutcome() {

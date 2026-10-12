@@ -11,11 +11,13 @@ import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.NextStat
 import io.github.realjoegz.reliablewebhooks.endpoint.SecretCipher;
 import io.github.realjoegz.reliablewebhooks.http.Signer;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient;
+import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.AttemptSpan;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Failed;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.LookupBusy;
-import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Outcome;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Response;
-import java.net.URI;
+import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Traced;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Scope;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -139,6 +141,7 @@ class DeliveryWorker {
   private void deadLetterWithoutSending(Claimed delivery, long claimStartedNanos) {
     if (finalizeRetry.run(
         delivery, claimStartedNanos, () -> deliveries.deadLetterExhausted(delivery))) {
+      meters.exhausted();
       fields.about(delivery, log.atInfo()).log("dead_lettered_without_attempt");
     }
   }
@@ -156,25 +159,34 @@ class DeliveryWorker {
     }
 
     long sendStarted = nanoTime.getAsLong();
-    Outcome outcome = send(delivery, loaded.get());
+    Traced sent = send(delivery, loaded.get());
     Duration took = Duration.ofNanos(nanoTime.getAsLong() - sendStarted);
 
-    switch (outcome) {
-      case LookupBusy busy -> {
-        // This replica had no room for the lookup, which says nothing about the endpoint.
-        deliveries.release(delivery, BUSY_LOOKUP_DELAY);
-        meters.releasedForBusyLookup();
+    // The span of the request has ended. Its context is current from here on, so the lines
+    // about what came of the request carry its trace id and its span id.
+    try (Scope ofTheAttempt = Span.wrap(sent.span()).makeCurrent()) {
+      switch (sent.outcome()) {
+        case LookupBusy busy -> {
+          // This replica had no room for the lookup, which says nothing about the endpoint.
+          deliveries.release(delivery, BUSY_LOOKUP_DELAY);
+          meters.releasedForBusyLookup();
+        }
+        case Response response ->
+            record(delivery, loaded.get(), claimStartedNanos, answered(response, took));
+        case Failed failed ->
+            record(delivery, loaded.get(), claimStartedNanos, unanswered(failed, took));
       }
-      case Response response -> record(delivery, claimStartedNanos, answered(response, took));
-      case Failed failed -> record(delivery, claimStartedNanos, unanswered(failed, took));
     }
   }
 
-  private Outcome send(Claimed delivery, Loaded loaded) {
+  private Traced send(Claimed delivery, Loaded loaded) {
     List<byte[]> keys = loaded.secrets().stream().map(cipher::decrypt).toList();
     Map<String, String> headers =
         Signer.headers(delivery.id(), loaded.signedAt(), loaded.body(), keys);
-    return http.send(delivery.tenantId(), URI.create(loaded.url()), headers, loaded.body());
+    AttemptSpan span =
+        new AttemptSpan(
+            delivery.id(), delivery.attempts(), delivery.circuitOpen(), loaded.traceContext());
+    return http.send(delivery.tenantId(), span, loaded.url(), headers, loaded.body());
   }
 
   // The status line decides. Only 2xx is a success: a redirect is not followed, and no status is
@@ -199,7 +211,7 @@ class DeliveryWorker {
     return new Result(attempt, reason, null);
   }
 
-  private void record(Claimed delivery, long claimStartedNanos, Result result) {
+  private void record(Claimed delivery, Loaded loaded, long claimStartedNanos, Result result) {
     NextState next = nextState(delivery, result);
     Verdict verdict = verdict(delivery, result);
     boolean recorded =
@@ -208,12 +220,22 @@ class DeliveryWorker {
             claimStartedNanos,
             () -> deliveries.recordAttempt(delivery, next, result.attempt(), verdict, replica));
     if (recorded) {
-      meters.attemptRecorded(result.reason());
+      Duration took = result.attempt().took();
+      meters.attemptRecorded(result.reason(), took);
+      if (next.equals(NextState.succeeded())) {
+        // From the creation of the delivery to the end of the request that was answered: its age
+        // at the load, on the database clock, and the time that the request took after it.
+        meters.succeeded(loaded.age().plus(took));
+      } else if (next.equals(NextState.exhausted())) {
+        meters.exhausted();
+      }
+      // Of the URL of the endpoint, a line names the host and nothing else.
       fields
           .about(delivery, log.atInfo())
           .addKeyValue("outcome", result.attempt().outcome())
           .addKeyValue("reason", result.reason().label())
           .addKeyValue("state", next.state())
+          .addKeyValue("host", loaded.url().getHost())
           .log("delivery_attempt");
     }
   }

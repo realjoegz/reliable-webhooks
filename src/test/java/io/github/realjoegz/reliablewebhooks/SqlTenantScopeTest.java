@@ -6,6 +6,7 @@ import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository;
 import io.github.realjoegz.reliablewebhooks.ops.CancelRepository;
 import io.github.realjoegz.reliablewebhooks.ops.ExpiryRepository;
+import io.github.realjoegz.reliablewebhooks.ops.QueueRepository;
 import io.github.realjoegz.reliablewebhooks.ops.RetentionRepository;
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -36,7 +37,9 @@ import org.springframework.stereotype.Repository;
  * neither read nor change a row of another tenant.
  *
  * <p>The repositories of the worker and of the jobs are left out by class. No tenant calls them:
- * they serve every tenant, and what the worker may write is decided by the lease token.
+ * they serve every tenant, and what the worker may write is decided by the lease token. The
+ * repository of the queue gauges is among them: its statement counts the deliveries of every tenant
+ * and returns numbers only.
  */
 class SqlTenantScopeTest {
 
@@ -46,7 +49,8 @@ class SqlTenantScopeTest {
           CircuitBreaker.class,
           ExpiryRepository.class,
           CancelRepository.class,
-          RetentionRepository.class);
+          RetentionRepository.class,
+          QueueRepository.class);
 
   private static final Path MIGRATIONS = Path.of("src/main/resources/db/migration");
   private static final Pattern CREATE_TABLE = Pattern.compile("CREATE TABLE (\\w+)");

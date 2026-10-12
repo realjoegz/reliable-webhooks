@@ -1,7 +1,10 @@
 package io.github.realjoegz.reliablewebhooks.ingest;
 
+import io.github.realjoegz.reliablewebhooks.Traceparent;
 import io.github.realjoegz.reliablewebhooks.ingest.EventRepository.KeyHolder;
 import io.github.realjoegz.reliablewebhooks.ingest.EventRepository.NewEvent;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
@@ -39,7 +42,18 @@ public class IngestService {
     this.bucket = bucket;
   }
 
-  public Result ingest(UUID tenantId, String idempotencyKey, EventRequest request) {
+  public Result ingest(
+      UUID tenantId,
+      String idempotencyKey,
+      EventRequest request,
+      Optional<SpanContext> callerContext) {
+    // The span of the request is the ingest span of the event. It is the root of a trace of its
+    // own, because the trace context that the caller sent was kept from the filter that started
+    // the span. What the caller sent becomes a link on it. Its own context is stored with the
+    // event, where every attempt to deliver the event finds its parent.
+    Span ingest = Span.current();
+    callerContext.ifPresent(ingest::addLink);
+
     UUID id = UUID.randomUUID();
     // The clock of this replica. The body is rendered before any statement runs, and nothing is
     // scheduled from this value or compared with a database timestamp.
@@ -60,7 +74,14 @@ public class IngestService {
       return new RateLimited(cost);
     }
     NewEvent event =
-        new NewEvent(id, tenantId, request.type(), body, idempotencyKey, request.hash());
+        new NewEvent(
+            id,
+            tenantId,
+            request.type(),
+            body,
+            idempotencyKey,
+            request.hash(),
+            Traceparent.of(ingest.getSpanContext()).orElse(null));
     if (events.create(event, matched)) {
       return new Accepted(id, false);
     }

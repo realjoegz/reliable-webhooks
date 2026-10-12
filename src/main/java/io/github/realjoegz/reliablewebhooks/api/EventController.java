@@ -8,6 +8,8 @@ import io.github.realjoegz.reliablewebhooks.ingest.IngestService.Accepted;
 import io.github.realjoegz.reliablewebhooks.ingest.IngestService.RateLimited;
 import io.github.realjoegz.reliablewebhooks.ingest.IngestService.Refused;
 import io.github.realjoegz.reliablewebhooks.tenant.Tenant;
+import io.opentelemetry.api.trace.SpanContext;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import org.springframework.http.HttpStatus;
@@ -48,6 +50,7 @@ public class EventController {
   @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
   ResponseEntity<AcceptedEvent> ingest(
       @RequestAttribute(ApiKeyFilter.TENANT) Tenant tenant,
+      @RequestAttribute(UntrustedTraceContextFilter.CALLER) Optional<SpanContext> callerContext,
       @RequestHeader(name = IDEMPOTENCY_KEY, required = false) String idempotencyKey,
       @RequestBody byte[] body) {
     if (idempotencyKey == null || !PRINTABLE_ASCII_KEY.matcher(idempotencyKey).matches()) {
@@ -65,7 +68,7 @@ public class EventController {
                             + " with a type of 1 to 128 characters of [a-z0-9_.-] and an object"
                             + " as data. It must keep to the limits on numbers, member names and"
                             + " nesting depth."));
-    return switch (service.ingest(tenant.id(), idempotencyKey, request)) {
+    return switch (service.ingest(tenant.id(), idempotencyKey, request, callerContext)) {
       case Accepted accepted -> {
         ResponseEntity.BodyBuilder response = ResponseEntity.accepted();
         if (accepted.replay()) {

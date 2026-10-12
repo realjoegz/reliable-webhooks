@@ -51,14 +51,20 @@ public final class ReplicaProcess implements AutoCloseable {
 
   /** Starts a replica with the given id and returns once its readiness probe answers. */
   public static ReplicaProcess start(String replicaId) {
-    return start(replicaId, ReplicaSettings.properties(replicaId));
+    return start(replicaId, ReplicaSettings.properties(replicaId), Map.of());
   }
 
   /** The same for a replica whose every connection to the database goes through the proxy. */
   public static ReplicaProcess startBehind(TcpProxy proxy, String replicaId) {
     return start(
         replicaId,
-        ReplicaSettings.properties(replicaId, TestDatabase.jdbcUrlThroughLocalPort(proxy.port())));
+        ReplicaSettings.properties(replicaId, TestDatabase.jdbcUrlThroughLocalPort(proxy.port())),
+        Map.of());
+  }
+
+  /** The same for a replica that finds the given variables in its environment. */
+  public static ReplicaProcess startWith(Map<String, String> environment, String replicaId) {
+    return start(replicaId, ReplicaSettings.properties(replicaId), environment);
   }
 
   /** A client for the API of this replica. */
@@ -114,7 +120,8 @@ public final class ReplicaProcess implements AutoCloseable {
     kill();
   }
 
-  private static ReplicaProcess start(String replicaId, Map<String, String> settings) {
+  private static ReplicaProcess start(
+      String replicaId, Map<String, String> settings, Map<String, String> environment) {
     List<String> command = new ArrayList<>();
     command.add(ProcessHandle.current().info().command().orElseThrow());
     // StartupInvariants refuses to start without it.
@@ -126,9 +133,11 @@ public final class ReplicaProcess implements AutoCloseable {
     command.add("--spring.config.additional-location=" + testResources());
     settings.forEach((name, value) -> command.add("--" + name + "=" + value));
 
+    ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
+    builder.environment().putAll(environment);
     Process process;
     try {
-      process = new ProcessBuilder(command).redirectErrorStream(true).start();
+      process = builder.start();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

@@ -27,10 +27,18 @@ public class ExpiryRepository {
         FROM picked
         WHERE d.id = picked.id
         RETURNING d.id, d.replays, d.attempts, picked.abandoned
+      ), logged AS (
+        INSERT INTO delivery_attempt (delivery_id, run, attempt_no, outcome, error)
+        SELECT id, replays, attempts, 'unknown', 'lease_expired' FROM expired WHERE abandoned
       )
-      INSERT INTO delivery_attempt (delivery_id, run, attempt_no, outcome, error)
-      SELECT id, replays, attempts, 'unknown', 'lease_expired' FROM expired WHERE abandoned
+      SELECT count(*) AS deliveries, count(*) FILTER (WHERE abandoned) AS abandoned FROM expired
       """;
+
+  /**
+   * What a run did: the deliveries that it dead-lettered, and how many of them got the attempt row
+   * that their last holder did not write.
+   */
+  record Expired(int deliveries, int abandonedAttempts) {}
 
   private final JdbcClient jdbc;
   private final TransactionTemplate transactions;
@@ -45,13 +53,16 @@ public class ExpiryRepository {
   /**
    * Dead-letters up to 1,000 deliveries that are pending past their expiry and not leased, the
    * oldest first, and skips a row that another transaction holds. A delivery whose lease ran out
-   * with nothing recorded gets the attempt row that its holder did not write. Returns the number of
-   * those attempt rows.
+   * with nothing recorded gets the attempt row that its holder did not write.
    *
    * <p>It is one statement and still a transaction, so a statement that outlives its replica cannot
    * commit by itself.
    */
-  int expire() {
-    return transactions.execute(transaction -> jdbc.sql(EXPIRE).update());
+  Expired expire() {
+    return transactions.execute(
+        transaction ->
+            jdbc.sql(EXPIRE)
+                .query((row, n) -> new Expired(row.getInt("deliveries"), row.getInt("abandoned")))
+                .single());
   }
 }

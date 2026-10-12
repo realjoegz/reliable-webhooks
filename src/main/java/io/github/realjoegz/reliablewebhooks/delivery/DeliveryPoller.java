@@ -136,9 +136,10 @@ public class DeliveryPoller {
       log.warn("claim_failed", failure);
       return false;
     }
+    meters.claimed(claimed.size(), Duration.ofNanos(System.nanoTime() - claimStartedNanos));
     for (Claimed delivery : claimed) {
       if (delivery.abandoned()) {
-        meters.attemptRecorded(AttemptReason.LEASE_EXPIRED);
+        meters.abandonedAttemptsRecorded(1);
       }
       room.acquireUninterruptibly();
       bulkhead.enter(delivery.tenantId(), delivery.endpointId());

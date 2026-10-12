@@ -4,6 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
+import io.github.realjoegz.reliablewebhooks.delivery.DeliveryMeters;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.util.List;
 import java.util.Queue;
@@ -20,9 +23,10 @@ class CancelJobTest {
   private static final Duration TIME_LIMIT = Duration.ofSeconds(10);
   private static final int FULL_BATCH = 1_000;
 
+  private final MeterRegistry registry = new SimpleMeterRegistry();
   private final Statements statements = new Statements();
   private final Waits waits = new Waits();
-  private final CancelJob job = new CancelJob(statements, waits);
+  private final CancelJob job = new CancelJob(statements, new DeliveryMeters(registry), waits);
 
   /**
    * Counts the statements, and answers each with the number of rows that a test set for it. A
@@ -77,6 +81,22 @@ class CancelJobTest {
     job.run();
 
     assertThat(statements.count).hasValue(3);
+  }
+
+  @Test
+  void runCountsTheDeliveriesOfEveryStatementAsCancelled() {
+    statements.rowsOfTheNextStatements.addAll(List.of(FULL_BATCH, 7));
+
+    job.run();
+
+    assertThat(
+            registry
+                .get("webhooks.delivery.terminal")
+                .tag("state", "cancelled")
+                .tag("reason", "endpoint_deleted")
+                .counter()
+                .count())
+        .isEqualTo(FULL_BATCH + 7);
   }
 
   @Test

@@ -28,6 +28,7 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -154,9 +155,11 @@ class EndpointDeleteIT {
       assertThat(stillDue)
           .allSatisfy(due -> assertThat(Rows.delivery(due)).isEqualTo(NEVER_CLAIMED));
       assertThat(receiver.requests("/deleted")).hasSize(MAX_IN_FLIGHT_FOR_AN_ENDPOINT);
+      double cancelledBefore = deliveriesCancelled();
 
       cancel.run();
 
+      assertThat(deliveriesCancelled() - cancelledBefore).isEqualTo(STILL_DUE);
       assertThat(stillDue).allSatisfy(due -> assertThat(Rows.delivery(due)).isEqualTo(CANCELLED));
       assertThat(inFlight)
           .allSatisfy(
@@ -315,7 +318,9 @@ class EndpointDeleteIT {
       Future<ExchangeResult> deleteBehindTheIngest =
           apiTransactions.execute(
               transaction -> {
-                assertThat(ingest.ingest(tenant.id(), TestTenant.newIdempotencyKey(), request))
+                assertThat(
+                        ingest.ingest(
+                            tenant.id(), TestTenant.newIdempotencyKey(), request, Optional.empty()))
                     .isInstanceOf(IngestService.Accepted.class);
                 Future<ExchangeResult> waiting =
                     callers.submit(() -> tenant.delete(http, deletedSecond).returnResult());
@@ -482,6 +487,15 @@ class EndpointDeleteIT {
 
   private UUID eventIdIn(ExchangeResult accepted) {
     return UUID.fromString(json.readTree(accepted.getResponseBodyContent()).get("id").asString());
+  }
+
+  private double deliveriesCancelled() {
+    return meters
+        .get("webhooks.delivery.terminal")
+        .tag("state", "cancelled")
+        .tag("reason", "endpoint_deleted")
+        .counter()
+        .count();
   }
 
   private double lostLeases() {

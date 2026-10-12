@@ -54,11 +54,17 @@ public final class ReplicaSettings
 
   // Spring starts a lifecycle bean only if it is a singleton. As prototypes, the worker lifecycle
   // and its poller are not started with the replica, and ReplicaWorker gets a new pair of them
-  // for every start. The expiry, cancel and retention jobs are not started either, and a test
-  // that wants a run of one calls the run.
+  // for every start. The expiry, cancel and retention jobs are not started either, and neither
+  // is the job that reads the queue for its gauges. A test that wants a run of one calls the run.
   private static void leaveTheWorkerAndTheJobsToTheTests(ConfigurableListableBeanFactory beans) {
     for (String lifecycle :
-        List.of("workerLifecycle", "deliveryPoller", "expiryJob", "cancelJob", "retentionJob")) {
+        List.of(
+            "workerLifecycle",
+            "deliveryPoller",
+            "expiryJob",
+            "cancelJob",
+            "retentionJob",
+            "queueGauges")) {
       beans.getBeanDefinition(lifecycle).setScope(BeanDefinition.SCOPE_PROTOTYPE);
     }
   }

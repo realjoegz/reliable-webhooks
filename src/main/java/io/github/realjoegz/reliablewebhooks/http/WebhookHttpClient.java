@@ -1,6 +1,14 @@
 package io.github.realjoegz.reliablewebhooks.http;
 
+import io.github.realjoegz.reliablewebhooks.Traceparent;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Context;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
@@ -47,6 +55,10 @@ import org.springframework.stereotype.Component;
  * <p>Every connection is made to an address that {@link DnsLookups} has checked. A request with all
  * of its response ends inside the attempt deadline, and no more of a response is read than the
  * limits below allow.
+ *
+ * <p>Every call writes one span, by hand. An instrumented client would put the URL of the request
+ * on its span, and the path and the query of a subscriber URL can hold a credential. This span
+ * names the host and nothing else of the URL.
  */
 @Component
 public class WebhookHttpClient implements AutoCloseable {
@@ -63,6 +75,27 @@ public class WebhookHttpClient implements AutoCloseable {
 
   // JSON is UTF-8 by definition and its media type has no charset parameter.
   private static final ContentType JSON = ContentType.create("application/json");
+
+  private static final String INSTRUMENTATION = "reliable-webhooks";
+  private static final String SPAN_NAME = "delivery attempt";
+  private static final AttributeKey<String> DELIVERY_ID =
+      AttributeKey.stringKey("webhooks.delivery_id");
+  private static final AttributeKey<Long> ATTEMPT = AttributeKey.longKey("webhooks.attempt");
+  private static final AttributeKey<Boolean> PROBE = AttributeKey.booleanKey("webhooks.probe");
+  private static final AttributeKey<String> OUTCOME = AttributeKey.stringKey("webhooks.outcome");
+  private static final AttributeKey<Long> STATUS_CODE =
+      AttributeKey.longKey("http.response.status_code");
+  private static final AttributeKey<String> HOST = AttributeKey.stringKey("server.address");
+
+  /**
+   * What the span of a request says about its attempt: the delivery, the number of the attempt and
+   * whether it is the probe of an open circuit. The parent is the trace context that the ingest
+   * stored with the event, and null where it stored none.
+   */
+  public record AttemptSpan(UUID deliveryId, int number, boolean probe, String parent) {}
+
+  /** What came of a request, and the context of the span that was written for it. */
+  public record Traced(Outcome outcome, SpanContext span) {}
 
   public sealed interface Outcome permits Response, Failed, LookupBusy {}
 
@@ -102,19 +135,27 @@ public class WebhookHttpClient implements AutoCloseable {
 
   private final SsrfGuardDnsResolver resolver;
   private final Duration deadline;
+  private final Tracer tracer;
   private final CloseableHttpClient client;
   private final ScheduledThreadPoolExecutor watchdog =
       new ScheduledThreadPoolExecutor(
           1, Thread.ofPlatform().daemon().name("attempt-deadline").factory());
 
   @Autowired
-  public WebhookHttpClient(DnsLookups lookups, WebhooksProperties properties) {
-    this(lookups, properties.delivery().attemptDeadline(), properties.delivery().maxInFlight());
+  public WebhookHttpClient(
+      DnsLookups lookups, WebhooksProperties properties, OpenTelemetry telemetry) {
+    this(
+        lookups,
+        properties.delivery().attemptDeadline(),
+        properties.delivery().maxInFlight(),
+        telemetry);
   }
 
-  WebhookHttpClient(DnsLookups lookups, Duration deadline, int maxConnections) {
+  WebhookHttpClient(
+      DnsLookups lookups, Duration deadline, int maxConnections, OpenTelemetry telemetry) {
     this.resolver = new SsrfGuardDnsResolver(lookups);
     this.deadline = deadline;
+    this.tracer = telemetry.getTracer(INSTRUMENTATION);
     this.watchdog.setRemoveOnCancelPolicy(true);
 
     // The watchdog is what ends a request at the deadline. These timeouts are the same bound
@@ -159,11 +200,65 @@ public class WebhookHttpClient implements AutoCloseable {
             .build();
   }
 
-  /** Sends the body as one JSON POST request with the given headers. */
-  public Outcome send(UUID tenantId, URI url, Map<String, String> headers, byte[] body) {
-    HttpPost request = new HttpPost(url);
-    headers.forEach(request::setHeader);
-    request.setEntity(new ByteArrayEntity(body, JSON));
+  /**
+   * Sends the body as one JSON POST request with the given headers, and with the traceparent of the
+   * span that it writes for the request.
+   */
+  public Traced send(
+      UUID tenantId, AttemptSpan attempt, URI url, Map<String, String> headers, byte[] body) {
+    Span span = start(attempt, url.getHost());
+    try {
+      HttpPost request = new HttpPost(url);
+      headers.forEach(request::setHeader);
+      Traceparent.of(span.getSpanContext())
+          .ifPresent(ofTheSpan -> request.setHeader(Traceparent.HEADER, ofTheSpan));
+      request.setEntity(new ByteArrayEntity(body, JSON));
+      Outcome outcome = sendWithinDeadline(tenantId, request);
+      describe(span, outcome);
+      return new Traced(outcome, span.getSpanContext());
+    } finally {
+      span.end();
+    }
+  }
+
+  @Override
+  public void close() {
+    client.close(CloseMode.GRACEFUL);
+    watchdog.shutdownNow();
+  }
+
+  // The parent is the context that the ingest stored, and never a span that happens to be current
+  // on this thread. An event without a stored context gets a trace of its own for each attempt.
+  private Span start(AttemptSpan attempt, String host) {
+    Context parent =
+        Traceparent.parse(attempt.parent())
+            .map(ingest -> Context.root().with(Span.wrap(ingest)))
+            .orElseGet(Context::root);
+    return tracer
+        .spanBuilder(SPAN_NAME)
+        .setParent(parent)
+        .setSpanKind(SpanKind.CLIENT)
+        .setAttribute(DELIVERY_ID, attempt.deliveryId().toString())
+        .setAttribute(ATTEMPT, attempt.number())
+        .setAttribute(PROBE, attempt.probe())
+        .setAttribute(HOST, host)
+        .startSpan();
+  }
+
+  // Only a 2xx status is a success, as in the attempt row. A request that was not sent is no
+  // attempt: its delivery is given back, and the span says so.
+  private static void describe(Span span, Outcome outcome) {
+    switch (outcome) {
+      case Response response -> {
+        span.setAttribute(STATUS_CODE, response.status());
+        span.setAttribute(OUTCOME, response.status() / 100 == 2 ? "success" : "failure");
+      }
+      case Failed failed -> span.setAttribute(OUTCOME, "failure");
+      case LookupBusy busy -> span.setAttribute(OUTCOME, "not_sent");
+    }
+  }
+
+  private Outcome sendWithinDeadline(UUID tenantId, HttpPost request) {
     HttpClientContext context = HttpClientContext.create();
 
     AtomicBoolean deadlinePassed = new AtomicBoolean();
@@ -194,12 +289,6 @@ public class WebhookHttpClient implements AutoCloseable {
       resolver.clear();
       cut.cancel(false);
     }
-  }
-
-  @Override
-  public void close() {
-    client.close(CloseMode.GRACEFUL);
-    watchdog.shutdownNow();
   }
 
   private Outcome exchange(HttpPost request, HttpClientContext context) throws IOException {
