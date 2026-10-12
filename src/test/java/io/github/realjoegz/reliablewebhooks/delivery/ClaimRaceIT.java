@@ -14,6 +14,7 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.postgresql.util.PGInterval;
@@ -77,12 +78,18 @@ class ClaimRaceIT {
 
   // Four pollers, each with its own worker and replica id, on the one database. Every delivery
   // is due before the first of them starts.
+  //
+  // An event of a tenant goes to its ten endpoints and costs ten units, so the forty events cost
+  // four times what a new tenant has. Each tenant is given a burst that pays for them, and its
+  // bucket is aged until it is full.
   @Test
   void fourReplicasDeliverEachEventOnce() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start()) {
       List<UUID> tenants = new ArrayList<>();
       for (int t = 0; t < TENANTS; t++) {
         TestTenant tenant = TestTenant.create(http, "four-replicas-" + t);
+        tenant.patch(http, Map.of("burst", ENDPOINTS_OF_A_TENANT * EVENTS_OF_A_TENANT));
+        Rows.ageBucket(tenant.id(), Duration.ofHours(1));
         tenants.add(tenant.id());
         for (int e = 0; e < ENDPOINTS_OF_A_TENANT; e++) {
           String path = "/tenant-%d/endpoint-%d".formatted(t, e);

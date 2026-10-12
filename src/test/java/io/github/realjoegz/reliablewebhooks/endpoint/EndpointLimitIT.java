@@ -141,13 +141,8 @@ class EndpointLimitIT {
         .exchange();
   }
 
-  // The admin route that sets the cap does not exist yet.
-  private static void setCap(TestTenant tenant, int maxEndpoints) {
-    TestDatabase.jdbc()
-        .sql("UPDATE tenant SET max_endpoints = :cap WHERE id = :id")
-        .param("cap", maxEndpoints)
-        .param("id", tenant.id())
-        .update();
+  private void setCap(TestTenant tenant, int maxEndpoints) {
+    tenant.patch(http, Map.of("max_endpoints", maxEndpoints));
   }
 
   private static int createsWaitingForATenantRow() {

@@ -138,8 +138,12 @@ class TenantIsolationIT {
 
   // One tenant owns an endpoint, an event and a dead delivery. Another tenant, with a key of its
   // own, sends every request that names one of them by its id. Each is answered with 404, and the
-  // endpoint, circuit and delivery rows of the owner are afterwards what they were, column for
-  // column.
+  // endpoint, circuit, delivery and bucket rows of the owner are afterwards what they were, column
+  // for column.
+  //
+  // A replay is charged before it looks for its delivery. The replay of the foreign delivery
+  // therefore costs a unit although it is refused, and the unit comes out of the bucket of the
+  // tenant that sent it. That tenant has a rate of 0, so its bucket holds what its charges left.
   //
   // The delivery is dead, which is the one state in which a replay changes it. The owner then
   // sends the same requests: each read finds its row, and the patch and the replay change theirs.
@@ -149,6 +153,8 @@ class TenantIsolationIT {
     try (FaultReceiver receiver = FaultReceiver.start()) {
       TestTenant owner = TestTenant.create(http, "owner-of-the-rows");
       TestTenant other = TestTenant.create(http, "holder-of-foreign-ids");
+      other.patch(http, Map.of("rate_per_sec", 0));
+      double unitsOfTheOther = Rows.bucketTokens(other.id());
       UUID endpoint = owner.register(http, receiver.url("/hook"), "*");
       UUID event = owner.accept(http, EVENT);
       UUID delivery = Rows.deliveryOf(event);
@@ -171,6 +177,7 @@ class TenantIsolationIT {
       }
 
       assertThat(rowsOf(owner)).isEqualTo(rows);
+      assertThat(Rows.bucketTokens(other.id())).isEqualTo(unitsOfTheOther - 1);
 
       for (String read : reads) {
         get(owner, read).expectStatus().isOk();
@@ -211,7 +218,8 @@ class TenantIsolationIT {
   }
 
   /**
-   * The endpoint, circuit and delivery rows of a tenant, each as the text of all of its columns.
+   * The endpoint, circuit, delivery and bucket rows of a tenant, each as the text of all of its
+   * columns.
    */
   private static List<String> rowsOf(TestTenant tenant) {
     return TestDatabase.jdbc()
@@ -225,6 +233,8 @@ class TenantIsolationIT {
               WHERE e.tenant_id = :t
               UNION ALL
               SELECT 'delivery ' || d::text FROM delivery d WHERE d.tenant_id = :t
+              UNION ALL
+              SELECT 'bucket ' || b::text FROM rate_bucket b WHERE b.tenant_id = :t
             ) lines
             ORDER BY line
             """)

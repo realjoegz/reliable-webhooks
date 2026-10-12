@@ -12,6 +12,7 @@ import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -132,8 +133,8 @@ class ClaimIT {
         .containsExactlyInAnyOrder(full, ofFullTenant);
   }
 
-  // Nothing in the service suspends a tenant yet, and a circuit opens only after five failed
-  // attempts, so the test writes both states. The first claim takes the delivery of the third
+  // The tenant is suspended through the admin route. A circuit opens only after five failed
+  // attempts, so the test writes that state. The first claim takes the delivery of the third
   // tenant only, and the held deliveries are as they were. Once the tenant is active again and
   // the probe time of the circuit has passed, a claim takes both, and it says of the one behind
   // the open circuit that it was claimed for a probe.
@@ -148,7 +149,7 @@ class ClaimIT {
     UUID ofSuspended = Rows.deliveryOf(suspended.accept(http, EVENT));
     UUID ofOpenCircuit = Rows.deliveryOf(behindOpenCircuit.accept(http, EVENT));
     UUID ofHealthy = Rows.deliveryOf(healthy.accept(http, EVENT));
-    setStatus(suspended, "suspended");
+    suspended.patch(http, Map.of("status", "suspended"));
     openCircuit(openEndpoint, "now() + interval '30 seconds'");
 
     assertThat(claim(NONE, NONE, ROOM_FOR_ALL)).extracting(Claimed::id).containsExactly(ofHealthy);
@@ -156,7 +157,7 @@ class ClaimIT {
     assertThat(Rows.delivery(ofSuspended)).isEqualTo(untouched);
     assertThat(Rows.delivery(ofOpenCircuit)).isEqualTo(untouched);
 
-    setStatus(suspended, "active");
+    suspended.patch(http, Map.of("status", "active"));
     openCircuit(openEndpoint, "now() - interval '1 second'");
 
     List<Claimed> noLongerHeld = claim(NONE, NONE, ROOM_FOR_ALL);
@@ -302,14 +303,6 @@ class ClaimIT {
         .param("id", deliveryId)
         .query(Boolean.class)
         .single();
-  }
-
-  private static void setStatus(TestTenant tenant, String status) {
-    TestDatabase.jdbc()
-        .sql("UPDATE tenant SET status = :status WHERE id = :id")
-        .param("status", status)
-        .param("id", tenant.id())
-        .update();
   }
 
   private static void openCircuit(UUID endpointId, String nextProbeAt) {

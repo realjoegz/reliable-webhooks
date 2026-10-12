@@ -42,7 +42,7 @@ Packages:
 | `delivery/` | `DeliveryPoller`, `PollerHeartbeat`, `DeliveryWorker`, `DeliveryRepository`, `TenantDeliveryRepository`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
 | `http/` | `WebhookHttpClient`, `SsrfGuardDnsResolver`, `AddressPolicy`, `DnsLookups`, `Signer` |
 | `ops/` | `WorkerLifecycle`, `StartupInvariants`, `ExpiryJob`, `CancelJob`, `RetentionJob`, `QueueGauges`, `PollerHealth` |
-| test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `UnsafeLocalReplica`, `ReplicaWorker`, `SelfStartedReplica`, `TestTenant` |
+| test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `UnsafeLocalReplica`, `ReplicaWorker`, `SelfStartedReplica`, `TestTenant`, `OpenRequests` |
 | test `tools/` | `FailureTableCheck` |
 
 The table names the classes that carry the design. The value types and helpers next to them are not listed.
@@ -230,7 +230,19 @@ INSERT INTO tenant (name, api_key_hash) VALUES (:name, :hash) RETURNING id, burs
 INSERT INTO rate_bucket (tenant_id, tokens) VALUES (:id, :burst);
 ```
 
-- `PATCH /admin/tenants/{id}` sets rate, burst, `max_endpoints` and `status` (`active` or `suspended`). It evicts the tenant from the local key cache; other replicas follow within 30 s.
+- `PATCH /admin/tenants/{id}` takes any of `rate_per_sec`, `burst`, `max_endpoints` and `status` (`active` or `suspended`) and returns `204`. A member that is absent stays as it is. A body that names none of them answers `400`, and so does a value outside the limits of the schema (section 4) and a number with a fraction where a whole number belongs. A rate is 0 or lies between 0.000001 and 1,000,000: the bucket statement multiplies it by the seconds since the last charge, and Postgres fails a product that a double cannot hold. The patch is one autocommit statement:
+
+```sql
+UPDATE tenant
+SET rate_per_sec  = coalesce(:rate_per_sec, rate_per_sec),
+    burst         = coalesce(:burst, burst),
+    max_endpoints = coalesce(:max_endpoints, max_endpoints),
+    status        = coalesce(:status, status)
+WHERE id = :id;
+-- 0 rows: 404
+```
+
+  The bucket statement (section 12), the claim (section 7) and the endpoint cap (section 11.5) read the tenant row, so they go by the new values from their next statement on, on every replica. The patch evicts the tenant from the local key cache; other replicas follow within 30 s.
 - `POST /admin/tenants/{id}/api-key/rotate` replaces the key immediately and returns the new one as `{"api_key"}`. Like the patch, it evicts the tenant from the local key cache; other replicas follow within 30 s.
 
 **Suspension** is the operator's kill switch. `status = 'suspended'` does two things: `ApiKeyFilter` rejects the tenant's key, and the claim stops taking the tenant's deliveries (section 7). The rows are not written to. They are held, expire as `dead (expired)` after 72 h like any held row, and deliver after `status = 'active'` is set again.
@@ -241,7 +253,7 @@ The delivery rows are the outbox. They are written in the same transaction as th
 
 Order of work for `POST /v1/events`:
 
-1. **Authenticate**, then take a per-tenant request permit (section 12). A request rejected here has not acquired a database connection.
+1. **Authenticate**, then take a per-tenant request permit (section 12). A request that is refused a permit runs no statement after that. Authentication comes first because it names the tenant, so the key lookup is the one statement that is not behind a permit. A replica caches that lookup for 30 s (section 11.1), and a request whose key is cached is refused without acquiring a database connection.
 2. **Validate** charset, size, JSON, type and key against the limits of section 11.5. Render the body `{"id","type","created_at","data"}` once.
    - The body is read as UTF-8 and as nothing else. A `Content-Type` that names another charset answers `415`, before the size of the body is looked at. A body in UTF-16 or UTF-32, or one that starts with a byte order mark, is not JSON here and answers `400`.
    - `data` must be a JSON object. Its numbers keep their exact value. None is read into a double.
@@ -251,7 +263,7 @@ Order of work for `POST /v1/events`:
    - Same hash: return `202` with the original id and `Idempotent-Replay: true`, not charged.
    - Different hash: `422 idempotency_key_reused`.
 4. **Match**: `SELECT id FROM endpoint WHERE tenant_id = :t AND status = 'active' AND (event_types @> ARRAY['*'] OR event_types @> ARRAY[:type::text])`. Call the result `matched`. The cast is there because the driver sends a string parameter as `varchar`, and Postgres has no `text[] @> varchar[]`.
-5. **Charge** `max(1, |matched|) + floor(body_bytes / 4096)` units to the token bucket in one autocommit statement (section 12). No tokens means `429`.
+5. **Charge** `max(1, |matched|) + floor(body_bytes / 4096)` units to the token bucket in one autocommit statement (section 12). `body_bytes` is the size of the body rendered in step 2, which is the body that is stored. No tokens means `429`.
 6. **One transaction** on the `api` pool:
 
 ```sql
@@ -465,6 +477,8 @@ SET state = 'pending', attempts = 0, replays = replays + 1, dead_reason = NULL, 
 WHERE id = :id AND tenant_id = :t AND state = 'dead';                           -- 0 rows: 409
 ```
 
+The unit is charged before the transaction and is not refunded, also when the replay then answers `404` or `409`.
+
 Bulk replay (`POST /v1/endpoints/{id}/replay`) is bounded and resumable:
 
 - `limit` is at most `min(500, burst)`.
@@ -568,7 +582,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 `webhooks_delivery_attempts_total` counts attempt rows: an attempt is counted when its finalize has committed, and an abandoned attempt (`unknown`, `lease_expired`) when the claim or the expiry run that found it has. An attempt whose finalize lost its lease is counted on `webhooks_finalize_lost_lease_total` only.
 
 `webhooks_ingest_requests_total` counts a request that the ingest route answered with one of these results, once, when the request is over. `invalid` is a `400`, a `413` or a `422`, and `busy` is a `503`. Nothing else is counted:
-- a request that is refused before it reaches the route, by authentication or for its media type;
+- a request that is refused before it reaches the route, by authentication, by the request permits or for its media type;
 - a request to any other route;
 - a request that the ingest route answered with any other status. A `500` is such an answer, so a failure that the service maps to none of the results does not appear in this counter. The `415` for a charset other than UTF-8 (section 11.5) is another.
 
@@ -600,11 +614,11 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 - `/admin/**` requires a static token from the environment, compared in constant time. `StartupInvariants` refuses to start without one of at least 32 characters.
 
 **11.2 Tenant scoping.**
-- Every statement behind a tenant route carries `tenant_id = :t`. A mutating route whose first statement matches no row answers 404 and runs nothing else.
+- Every statement behind a tenant route carries `tenant_id = :t`. A mutating route whose first statement matches no row answers 404 and runs nothing else. The charge of a replay comes before that statement and writes the bucket of the caller only.
 - `SqlTenantScopeTest` scans the repository SQL constants and fails on a tenant-table statement without it. The exemption list holds worker and job statements only, by class.
   - A tenant table is every table but `tenant`, whose rows are addressed by their own id.
   - An `INSERT` that only supplies values is not checked. It creates a row and can neither read nor change a row of another tenant.
-- `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` calls every mutating route (patch, delete, rotate, single and bulk replay) with a foreign id. It snapshots the foreign tenant's endpoint, delivery and circuit rows before the call and asserts they are identical after it, in addition to the 404. Read routes are checked for the 404.
+- `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` calls every mutating route (patch, delete, rotate, single and bulk replay) with a foreign id. It snapshots the foreign tenant's endpoint, delivery, circuit and bucket rows before the call and asserts they are identical after it, in addition to the 404. The replay with a foreign id is charged all the same, and its unit comes out of the bucket of the caller. Read routes are checked for the 404.
 
 **11.3 Signatures.** The format follows Standard Webhooks.
 
@@ -733,7 +747,7 @@ RETURNING b.tokens;
 
 | Layer | Value | Effect |
 |---|---|---|
-| Request permits (`TenantConcurrencyFilter`) | 8 per tenant per replica, all tenant routes | Beyond 8 concurrent requests a tenant gets `429` without acquiring a database connection. It can hold at most 8 of the 16 `api` connections. |
+| Request permits (`TenantConcurrencyFilter`) | 8 per tenant per replica, all tenant routes | Beyond 8 concurrent requests a tenant gets `429` without acquiring a database connection, unless its key had to be looked up first (section 6). The routes of a tenant can hold at most 8 of the 16 `api` connections. |
 | Token bucket | Per tenant, in Postgres | The exact limit above. It runs after the idempotency lookup, so a retry of an accepted event is neither charged nor rejected. |
 | Two pools | `api` 16, `worker` 16 | Ingest pressure cannot delay claim or finalize, so it cannot cause lease overruns. |
 | Bounded reads | Keyset pages of 100, required filters, `statement_timeout` | A tenant route cannot run an unbounded statement on the shared primary. |
@@ -784,7 +798,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 | 13 | Slow endpoint starving others | At most 4 concurrent requests per replica to it; other endpoints complete meanwhile; a drip-fed response is cut at the deadline | `SlowEndpointIsolationIT#slowEndpointDoesNotDelayOthers`, `#drippingResponseIsCutAtDeadline` | Receiver holds every request to the slow endpoint until the test ends |
 | 14 | Subscriber DNS that never answers | Attempt fails inside the DNS budget; at most 4 stuck lookups per tenant; other tenants complete; the tenant's healthy endpoints lose no attempt and keep a closed circuit | `SlowEndpointIsolationIT#slowDnsDoesNotStarveOthers`, `#stuckDnsOfOneEndpointDoesNotFailSiblingEndpoints`, `SsrfIT#registrationDnsLookupIsBounded` | `StubDns` delegate that blocks until the test releases it |
 | 15 | One tenant's backlog starving another tenant | Held case: tenant A never exceeds 16 in flight per replica and tenant B completes meanwhile. Fast case: with a deep backlog on A's instantly answering endpoint, B's request arrives before A's 200th of 2,000 | `TenantIsolationIT#backlogOfOneTenantDoesNotStarveAnother`, `#deepBacklogOnFastEndpointDoesNotStarveAnother` | Held case: A has 5 endpoints with 4 deliveries each. The receiver holds the 4 requests of each of four endpoints, and the deliveries for the fifth stay due and unclaimed, so the tenant cap binds where no endpoint cap does. Fast case: 2,000 aged due rows for A, one newer row for B; ordering read from the receiver's request log |
-| 16 | Tenant floods ingest | Admitted units equal the bucket exactly across replicas; large bodies cost more; the 9th concurrent request gets 429 without acquiring a database connection; an unsatisfiable request gets 429 without `Retry-After`; tenant B is served | `RateLimitIT#limitIsExactAcrossReplicas`, `#refillIsExact`, `#fanOutIsChargedPerDelivery`, `#largeBodiesAreChargedBySize`, `#costAboveBurstIsUnsatisfiable`, `#ninthConcurrentRequestTakesNoConnection`, `#floodingTenantDoesNotBlockOtherTenant` | Rate 0 and fixed burst; eight requests with unfinished bodies hold A's permits; A's bucket row locked by the test |
+| 16 | Tenant floods ingest | Admitted units equal the bucket exactly across replicas; large bodies cost more; the 9th concurrent request gets 429 without acquiring a database connection; an unsatisfiable request gets 429 without `Retry-After`; tenant B is served | `RateLimitIT#limitIsExactAcrossReplicas`, `#refillIsExact`, `#fanOutIsChargedPerDelivery`, `#largeBodiesAreChargedBySize`, `#costAboveBurstIsUnsatisfiable`, `#ninthConcurrentRequestTakesNoConnection`, `#floodingTenantDoesNotBlockOtherTenant` | Rate 0 and fixed burst; charges of four replicas seen waiting for a bucket row that the test holds; eight requests with unfinished bodies hold A's permits; A's bucket row locked by the test |
 | 17 | Tenant replays a huge dead-letter backlog | At most `limit` rows per call, charged per row, spread over 60 s; a kill after the charge re-arms nothing | `ReplayIT#bulkReplayIsBoundedAndCharged`, `#killedMidReplayRearmsNothing` | Dead rows inserted directly; test lock on the endpoint row blocks the replay's share lock |
 | 18 | Subscriber URL points at, or rebinds to, a private address | Rejected at registration; blocked at connect with zero accepted connections; redirects not followed | `SsrfIT#registrationRejectsPrivateTargets`, `#rebindingIsBlockedAtConnect`, `#redirectIsNotFollowed`, `AddressPolicyTest`, `DnsLookupsTest#systemResolverDoesNotLetADeniedAddressLiteralPast` | `StubDns` answers public first, loopback later; listener counts accepts; denied address literals given to the system resolver |
 | 19 | Absurd `Retry-After` | Clamped to between the own delay and one hour | `RetryAfterIT#clampedAtBothEnds` | Receiver sends 0, 3601 and 10^9 |
@@ -817,8 +831,8 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
    - One endpoint drains at one delivery per claim round trip per replica, at most 4 at a time.
    - A tenant can use 16 of a replica's 64 workers unless the cap is raised.
    - When more tenants have due work than a replica has free permits, the tenants with the oldest head rows go first. Fairness is per claim, not a quota over time.
-7. **The rate limiter is strict-side.** Failed ingests are not refunded. Retries are not charged. Each rejection past the request permits still costs one statement. The type and `Retry-After` of a 429 come from a tenant record cached up to 30 s.
-8. **Isolation covers a bounded number of misbehaving tenants.** Two tenants each holding 8 request permits can fill the `api` pool. Eight tenants with tarpit DNS can fill the DNS pool.
+7. **The rate limiter is strict-side.** Failed ingests are not refunded. Retries are not charged. A request that the bucket refuses has passed the request permits and has run its statements up to the charge: three for an event, one for a replay. The type and `Retry-After` of a 429 come from a tenant record cached up to 30 s.
+8. **Isolation covers a bounded number of misbehaving tenants.** Two tenants each holding 8 request permits can fill the `api` pool. Eight tenants with tarpit DNS can fill the DNS pool. The 8 permits are fixed and the size of the `api` pool is a setting: in a pool of 8 connections or fewer a single tenant can hold every connection, and no startup invariant refuses such a pool.
 9. **Unauthenticated floods** (invalid keys, slow request bodies) reach the service and, for the key lookup, the database. That belongs to the ingress.
 10. **Endpoint ownership is not verified.** A tenant can aim signed POSTs at any public host, up to its own rate. There is no per-destination limit across endpoints. The operator's lever is suspension.
 11. **The SSRF policy works at the IP layer.** It cannot see an internal service on public address space or a public proxy that forwards inward. HTTP proxies are unsupported.
@@ -838,7 +852,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 21. **Producer trace continuity is a link**, not a parent-child relation.
 22. **`FailureTableCheck` proves the linked tests ran and passed.** It cannot prove their assertions are strong.
 23. **A jump of the database clock shifts every schedule.** A forward jump can expire leases early, which produces fenced duplicates and no loss.
-24. **Rows removed by hand are not detected.** An endpoint whose circuit row or a tenant whose bucket row was deleted in SQL stops working silently. The service only guarantees it never creates that state.
+24. **Rows removed or changed by hand are not detected.** An endpoint whose circuit row or a tenant whose bucket row was deleted in SQL stops working silently. A rate written in SQL that the admin route would refuse can fail the bucket statement, and every event of that tenant then answers `500`. The service only guarantees it never creates that state.
 25. **A replica-local fault is recorded as endpoint failure.**
     - A replica that still reaches Postgres but has lost its egress fails every attempt quickly.
     - It consumes attempts and can open circuits for healthy endpoints fleet-wide. Nothing is lost (`dead` is replayable), but deliveries are delayed.
@@ -960,7 +974,7 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
 - The request holds the endpoint row for one statement however deep the backlog is.
 - An attempt already in flight is recorded as what it was, unless the cancel reaches its row first (limitation 15).
 
-**Tenant suspension** is `UPDATE tenant SET status = :status WHERE id = :id` (section 5). It writes no delivery rows.
+**Tenant suspension** is the patch statement of section 5 with `status` alone. It writes the tenant row and no delivery rows.
 
 ## 16. Test strategy and harness
 
@@ -993,7 +1007,8 @@ Harness:
 | `UnsafeLocalReplica` | An `InProcessReplica` with the `unsafe-local` profile and its allowance: plain `http` and the loopback address, where `FaultReceiver` listens. The classes with this annotation share a second application context. |
 | `ReplicaWorker` | Starts and stops the delivery worker of a replica inside the test JVM. Each start gets a `WorkerLifecycle` and a poller of its own from the application context, wired as the application wires them, and runs the start and stop that Spring runs. |
 | `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker and its expiry job, and closing it stops them. A test can give it the heartbeat of its poller, built on a clock that the test moves. |
-| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, sends an event and replays a delivery as that tenant, and counts the tenant's event, endpoint and delivery rows. |
+| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, sends an event and replays a delivery as that tenant, has the tenant's limits and status set through the admin API, and counts the tenant's event, endpoint and delivery rows. |
+| `OpenRequests` | Counts, for each tenant, the requests that a route of a replica inside the test JVM has been given and has not finished. A request is counted once every filter has let it through and before the route reads its body, so a test that keeps requests unfinished can wait until they are behind the filters. |
 
 How each proof is forced.
 
@@ -1033,9 +1048,13 @@ How each proof is forced.
 
   It asserts four `success` rows and four requests, the fifth delivery still at `attempts = 0` with no lease, and that the process ended by itself with exit code 143 inside the drain time. A poller that kept claiming would take the fifth as soon as a slot freed. A succeeded delivery keeps the end of its last lease as its due time. For each of the four that time still lies ahead on the database clock when the process has ended, so the exit came before a lease ran out.
 - **(f) Rate limit.**
-  - `limitIsExactAcrossReplicas` sets rate 0 and burst 20 and sends 200 requests to 4 replicas, 8 at a time per replica so the request permits never reject. It asserts exactly 20 accepted and that every other response is a well-formed `429 rate_limit_unsatisfiable` problem document without `Retry-After`.
-  - `refillIsExact` uses rate 0.01 per second and ages `refilled_at` by 500 s. Exactly 5 are accepted, and the next token is 100 s away.
-  - `ninthConcurrentRequestTakesNoConnection` opens eight requests whose bodies are never finished, so each holds a permit before any database work. The ninth gets `429 concurrency_limit`, and the `api` pool's acquire count is unchanged across it. Tenant B is served meanwhile.
+  - A test that counts units gives its tenant a rate of 0, so the bucket holds what the test put into it, and reads the bucket row after each charge.
+  - `limitIsExactAcrossReplicas` sets rate 0 and burst 20 and sends 200 requests to 4 replicas, 8 at a time per replica so the request permits never reject. It asserts exactly 20 accepted and that every other response is a well-formed `429 rate_limit_unsatisfiable` problem document without `Retry-After`. Three of the replicas are started inside the test JVM the way the application starts (`SelfStartedReplica`), each with its own pools, key cache and permits. The fourth is the replica of the class.
+    - The permits never reject because a caller sends its next request once it has read the answer to the one before to its end, and the end of an answer is sent after the permit of its request is back.
+    - The 200 requests leave it to chance whether two charges meet at the bucket row, so a second part forces it. A second tenant has rate 0 and burst 3, and the test holds its bucket row until two charges of each of the 4 replicas are seen waiting for it. Once the row is released, exactly 3 events are accepted and 5 are refused, because a charge that has waited decides on the row as the charge before it left it. The lock timeout of the `api` pool gives the test 2 s for this.
+  - `refillIsExact` empties the bucket, then uses rate 0.01 per second and ages `refilled_at` by 500 s. Exactly 5 are accepted, and the next token is 100 s away: the sixth is refused with `Retry-After: 100`, is still refused once the refill is 90 s older, and is accepted once it is 100 s older.
+  - `ninthConcurrentRequestTakesNoConnection` opens eight requests and sends half of each body, so each holds a permit and no connection while the route waits for the rest. Their authentication has put the key of the tenant into the cache of the replica. `OpenRequests` shows when all eight are with the route. The ninth gets `429 concurrency_limit`, and so does a request of the tenant to another route. The `api` pool's acquire count is unchanged across the two. Tenant B is served meanwhile, which moves that count. The eight are sent the rest of their bodies at the end and are accepted.
+  - `floodingTenantDoesNotBlockOtherTenant` holds the bucket row of tenant A. Eight requests of A are seen waiting in their charge, each with a connection. Further requests of A are refused by the permits without one, and tenant B is served. The lock timeout of the `api` pool gives the test 2 s for this.
 - **(g) Long durations.** The 72 h budget and the schedule are driven by `Rows`.
   - `RetryScheduleTest` asserts the eleven production windows as a pure function.
   - `exhaustedAfterTwelveAttempts` asserts that each `next_attempt_at` written by finalize lies inside the window for its attempt number, before ageing the row.

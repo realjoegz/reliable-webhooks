@@ -6,9 +6,9 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Reads the rows that a delivery leaves behind and the circuit row of an endpoint, and ages them.
- * Ageing is how a test lets time pass: it moves the time columns of a row into the past, and the
- * service and the database clock run unchanged.
+ * Reads the rows that a delivery leaves behind, the circuit row of an endpoint and the bucket row
+ * of a tenant, and ages them. Ageing is how a test lets time pass: it moves the time columns of a
+ * row into the past, and the service and the database clock run unchanged.
  */
 public final class Rows {
 
@@ -227,6 +227,34 @@ public final class Rows {
             .query(BigDecimal.class)
             .single();
     return Duration.ofNanos(seconds.movePointRight(9).longValueExact());
+  }
+
+  /**
+   * The tokens in the bucket row of a tenant. The row holds what its last charge left. What has
+   * refilled since then is worked out by the next charge and is not in the row.
+   */
+  public static double bucketTokens(UUID tenantId) {
+    return TestDatabase.jdbc()
+        .sql("SELECT tokens FROM rate_bucket WHERE tenant_id = :t")
+        .param("t", tenantId)
+        .query(Double.class)
+        .single();
+  }
+
+  /**
+   * Moves the last refill of the bucket of a tenant into the past, so that the next charge finds
+   * the bucket refilled for that much longer.
+   */
+  public static void ageBucket(UUID tenantId, Duration by) {
+    TestDatabase.jdbc()
+        .sql(
+            """
+            UPDATE rate_bucket SET refilled_at = refilled_at - make_interval(secs => :seconds)
+            WHERE tenant_id = :t
+            """)
+        .param("seconds", by.toNanos() / 1e9)
+        .param("t", tenantId)
+        .update();
   }
 
   /** The attempt log of a delivery, in the order of its runs and attempts. */

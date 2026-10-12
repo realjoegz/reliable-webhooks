@@ -6,6 +6,7 @@ import static org.awaitility.Awaitility.await;
 import io.github.realjoegz.reliablewebhooks.harness.InProcessReplica;
 import io.github.realjoegz.reliablewebhooks.harness.PgWait;
 import io.github.realjoegz.reliablewebhooks.harness.ReplicaSettings;
+import io.github.realjoegz.reliablewebhooks.harness.Rows;
 import io.github.realjoegz.reliablewebhooks.harness.StubDns;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
@@ -13,19 +14,22 @@ import io.micrometer.core.instrument.MeterRegistry;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.time.Duration;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.client.RestTestClient;
 
 /**
- * Every test compares all four counters with what they were before its requests, so it also shows
+ * Every test compares all six counters with what they were before its requests, so it also shows
  * that a request is counted once and under one result. The replica and its counters are shared with
  * the other test classes, which is why the tests compare and do not expect absolute numbers.
  */
@@ -47,22 +51,36 @@ class IngestMeterIT {
       """
       {"url":"http://hooks.ingest-meter.example/hook","event_types":["*"]}""";
 
-  private record Counts(double accepted, double replayed, double invalid, double busy) {
+  private record Counts(
+      double accepted,
+      double replayed,
+      double rateLimited,
+      double unsatisfiable,
+      double invalid,
+      double busy) {
 
     Counts plusAccepted(int requests) {
-      return new Counts(accepted + requests, replayed, invalid, busy);
+      return new Counts(accepted + requests, replayed, rateLimited, unsatisfiable, invalid, busy);
     }
 
     Counts plusReplayed(int requests) {
-      return new Counts(accepted, replayed + requests, invalid, busy);
+      return new Counts(accepted, replayed + requests, rateLimited, unsatisfiable, invalid, busy);
+    }
+
+    Counts plusRateLimited(int requests) {
+      return new Counts(accepted, replayed, rateLimited + requests, unsatisfiable, invalid, busy);
+    }
+
+    Counts plusUnsatisfiable(int requests) {
+      return new Counts(accepted, replayed, rateLimited, unsatisfiable + requests, invalid, busy);
     }
 
     Counts plusInvalid(int requests) {
-      return new Counts(accepted, replayed, invalid + requests, busy);
+      return new Counts(accepted, replayed, rateLimited, unsatisfiable, invalid + requests, busy);
     }
 
     Counts plusBusy(int requests) {
-      return new Counts(accepted, replayed, invalid, busy + requests);
+      return new Counts(accepted, replayed, rateLimited, unsatisfiable, invalid, busy + requests);
     }
   }
 
@@ -106,6 +124,37 @@ class IngestMeterIT {
 
     tenant.send(http, key, ORDER_18).expectStatus().isEqualTo(HttpStatus.UNPROCESSABLE_CONTENT);
     awaitCounts(withTheEvent.plusInvalid(4));
+  }
+
+  // The bucket of the tenant holds one unit, which the first event takes. While the bucket
+  // refills, however slowly, the next event is refused with a time to come back after, and is
+  // counted as rate limited. Once the tenant has a rate of 0, waiting cannot help, and the event
+  // after that is counted as unsatisfiable.
+  @Test
+  void requestThatTheBucketRefusedIsCountedAsRateLimitedOrAsUnsatisfiable() {
+    TestTenant tenant = TestTenant.create(http, "meter-rate-limited");
+    tenant.patch(http, Map.of("rate_per_sec", 0.01, "burst", 1));
+    Counts before = counts();
+    tenant.send(http, TestTenant.newIdempotencyKey(), ORDER_17).expectStatus().isAccepted();
+    Counts withTheEvent = before.plusAccepted(1);
+    awaitCounts(withTheEvent);
+
+    tenant
+        .send(http, TestTenant.newIdempotencyKey(), ORDER_17)
+        .expectStatus()
+        .isEqualTo(HttpStatus.TOO_MANY_REQUESTS)
+        .expectHeader()
+        .valueEquals(HttpHeaders.RETRY_AFTER, "100");
+    awaitCounts(withTheEvent.plusRateLimited(1));
+
+    tenant.patch(http, Map.of("rate_per_sec", 0));
+    tenant
+        .send(http, TestTenant.newIdempotencyKey(), ORDER_17)
+        .expectStatus()
+        .isEqualTo(HttpStatus.TOO_MANY_REQUESTS)
+        .expectHeader()
+        .doesNotExist(HttpHeaders.RETRY_AFTER);
+    awaitCounts(withTheEvent.plusRateLimited(1).plusUnsatisfiable(1));
   }
 
   // The test holds the endpoint row that the fan-out locks, until the lock timeout has ended the
@@ -175,25 +224,23 @@ class IngestMeterIT {
     assertThat(tenant.eventRows()).isZero();
   }
 
-  // The replica has the key of the tenant in its cache when the test deletes the row of the
-  // tenant. The next request with that key passes the authentication, and its event then names a
-  // tenant that does not exist. That is a fault and none of the results, so the answer is a 500.
-  // The accepted event of another tenant at the end is the witness: it is counted, so the
-  // counters were at work while the request before it was not counted.
+  // The tenant has a rate that the admin route would refuse, written by the test. The charge of
+  // its next event multiplies that rate by the hour since the last refill, and the database fails
+  // the statement on a number that no double holds. That is a fault and none of the results, so
+  // the answer is a 500. The accepted event of another tenant at the end is the witness: it is
+  // counted, so the counters were at work while the request before it was not counted.
   @Test
   void requestAnsweredWithAStatusThatHasNoResultIsNotCounted() {
-    TestTenant removed = TestTenant.create(http, "meter-no-result");
+    TestTenant faulty = TestTenant.create(http, "meter-no-result");
     TestTenant witness = TestTenant.create(http, "meter-witness");
-    http.get()
-        .uri("/v1/endpoints")
-        .headers(headers -> headers.setBearerAuth(removed.apiKey()))
-        .exchange()
-        .expectStatus()
-        .isOk();
-    deleteByHand(removed);
+    TestDatabase.jdbc()
+        .sql("UPDATE tenant SET rate_per_sec = 1e308 WHERE id = :id")
+        .param("id", faulty.id())
+        .update();
+    Rows.ageBucket(faulty.id(), Duration.ofHours(1));
     Counts before = counts();
 
-    removed
+    faulty
         .send(http, TestTenant.newIdempotencyKey(), ORDER_17)
         .expectStatus()
         .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
@@ -272,7 +319,13 @@ class IngestMeterIT {
   }
 
   private Counts counts() {
-    return new Counts(count("accepted"), count("replayed"), count("invalid"), count("busy"));
+    return new Counts(
+        count("accepted"),
+        count("replayed"),
+        count("rate_limited"),
+        count("unsatisfiable"),
+        count("invalid"),
+        count("busy"));
   }
 
   private double count(String result) {
@@ -286,14 +339,6 @@ class IngestMeterIT {
         .contentType(MediaType.APPLICATION_JSON)
         .body(body)
         .exchange();
-  }
-
-  private static void deleteByHand(TestTenant tenant) {
-    TestDatabase.jdbc()
-        .sql("DELETE FROM rate_bucket WHERE tenant_id = :t")
-        .param("t", tenant.id())
-        .update();
-    TestDatabase.jdbc().sql("DELETE FROM tenant WHERE id = :t").param("t", tenant.id()).update();
   }
 
   private static byte[] eventOf(int bytes) {

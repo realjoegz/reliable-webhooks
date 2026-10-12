@@ -6,6 +6,10 @@ spring:
       enabled: true
   jackson:
     property-naming-strategy: SNAKE_CASE
+    deserialization:
+      # A number with a fraction is refused where a whole number belongs. Left on, a burst of
+      # 1.9 would be set as 1.
+      accept-float-as-int: false
     factory:
       constraints:
         read:

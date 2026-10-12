@@ -12,7 +12,10 @@ import org.springframework.stereotype.Service;
 @Service
 public class IngestService {
 
-  public sealed interface Result permits Accepted, Refused {}
+  // One unit of the bucket pays for this much of a stored body.
+  private static final int BYTES_PER_UNIT = 4096;
+
+  public sealed interface Result permits Accepted, Refused, RateLimited {}
 
   /**
    * The event that holds the idempotency key. A replay answers a request whose event an earlier
@@ -25,10 +28,15 @@ public class IngestService {
     IDEMPOTENCY_KEY_REUSED
   }
 
-  private final EventRepository events;
+  /** The bucket of the tenant did not hold what the event costs, which is this many units. */
+  public record RateLimited(int cost) implements Result {}
 
-  IngestService(EventRepository events) {
+  private final EventRepository events;
+  private final TokenBucket bucket;
+
+  IngestService(EventRepository events, TokenBucket bucket) {
     this.events = events;
+    this.bucket = bucket;
   }
 
   public Result ingest(UUID tenantId, String idempotencyKey, EventRequest request) {
@@ -43,6 +51,14 @@ public class IngestService {
     }
 
     List<UUID> matched = events.matchEndpoints(tenantId, request.type());
+    // An event costs one unit for each endpoint that it goes to, and one where it goes to none,
+    // plus one for each full 4 KiB of the body that is stored. The charge comes after the lookup,
+    // so the repeat of an accepted event costs nothing. It comes before the transaction, which
+    // creates deliveries for these endpoints only, so no delivery is created that was not paid.
+    int cost = Math.max(1, matched.size()) + body.length / BYTES_PER_UNIT;
+    if (!bucket.charge(tenantId, cost)) {
+      return new RateLimited(cost);
+    }
     NewEvent event =
         new NewEvent(id, tenantId, request.type(), body, idempotencyKey, request.hash());
     if (events.create(event, matched)) {
@@ -50,7 +66,7 @@ public class IngestService {
     }
 
     // A concurrent request with the same key committed first. Its event was not visible to the
-    // lookup above and is visible to this one.
+    // lookup above and is visible to this one. Both requests have paid.
     KeyHolder winner =
         events
             .findByIdempotencyKey(tenantId, idempotencyKey)

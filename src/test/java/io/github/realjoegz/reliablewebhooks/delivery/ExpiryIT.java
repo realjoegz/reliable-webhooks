@@ -23,6 +23,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -284,17 +285,13 @@ class ExpiryIT {
   // Every other test calls the run itself. Here a second replica starts as the application does,
   // and Spring starts its expiry job, whose first run comes with the start. That replica runs
   // its worker too, so the delivery belongs to a suspended tenant: no claim takes it, and it is
-  // dead without an attempt. Nothing in the service suspends a tenant yet, so the test writes the
-  // status.
+  // dead without an attempt.
   @Test
   void replicaRunsItsExpiryJobByItself() {
     TestTenant tenant = TestTenant.create(http, "expired-by-a-replica");
     tenant.register(http, HOOK, "*");
     UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
-    TestDatabase.jdbc()
-        .sql("UPDATE tenant SET status = 'suspended' WHERE id = :id")
-        .param("id", tenant.id())
-        .update();
+    tenant.patch(http, Map.of("status", "suspended"));
     Rows.ageDelivery(delivery, BUDGET);
 
     try (ConfigurableApplicationContext replica = SelfStartedReplica.start(STARTED_BY_SPRING)) {

@@ -6,6 +6,7 @@ import io.github.realjoegz.reliablewebhooks.delivery.TenantDeliveryRepository;
 import io.github.realjoegz.reliablewebhooks.delivery.TenantDeliveryRepository.Attempt;
 import io.github.realjoegz.reliablewebhooks.delivery.TenantDeliveryRepository.Delivery;
 import io.github.realjoegz.reliablewebhooks.delivery.TenantDeliveryRepository.Page;
+import io.github.realjoegz.reliablewebhooks.ingest.TokenBucket;
 import io.github.realjoegz.reliablewebhooks.tenant.Tenant;
 import java.util.List;
 import java.util.Set;
@@ -26,6 +27,7 @@ import org.springframework.web.server.ResponseStatusException;
 public class DeliveryController {
 
   private static final int MAX_PAGE_SIZE = 100;
+  private static final int REPLAY_COST = 1;
   private static final Set<String> STATES = Set.of("pending", "succeeded", "dead", "cancelled");
 
   /** A page of a list. {@code next} is the cursor of the page that follows, or null at the end. */
@@ -35,9 +37,11 @@ public class DeliveryController {
       @JsonUnwrapped Delivery delivery, int run, List<Attempt> attemptLog) {}
 
   private final TenantDeliveryRepository deliveries;
+  private final TokenBucket bucket;
 
-  DeliveryController(TenantDeliveryRepository deliveries) {
+  DeliveryController(TenantDeliveryRepository deliveries, TokenBucket bucket) {
     this.deliveries = deliveries;
+    this.bucket = bucket;
   }
 
   // Both filters are required, so that every list is one range of one index. A request is checked
@@ -90,9 +94,14 @@ public class DeliveryController {
         delivery, shown, deliveries.attemptsOfRun(tenant.id(), id, shown));
   }
 
+  // A replay costs one unit, as the delivery that it sends again did at ingest. The charge comes
+  // first and is not given back, so a replay that is then refused has cost its unit as well.
   @PostMapping("/{id}/replay")
   ResponseEntity<Void> replay(
       @RequestAttribute(ApiKeyFilter.TENANT) Tenant tenant, @PathVariable UUID id) {
+    if (!bucket.charge(tenant.id(), REPLAY_COST)) {
+      throw Problems.rateLimited(tenant, REPLAY_COST);
+    }
     return switch (deliveries.replay(tenant.id(), id)) {
       case REPLAYED -> ResponseEntity.noContent().build();
       case NOT_FOUND ->

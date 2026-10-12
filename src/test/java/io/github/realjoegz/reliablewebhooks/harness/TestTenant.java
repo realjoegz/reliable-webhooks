@@ -11,7 +11,8 @@ import org.springframework.test.web.servlet.client.RestTestClient;
 /**
  * A tenant created through the admin API of a replica, with the API key it was shown. It makes the
  * requests that the tests of several classes send as a tenant: it registers an endpoint, sends an
- * event and replays a delivery. It also counts the event, endpoint and delivery rows of the tenant.
+ * event and replays a delivery. It also has the limits and the status of the tenant set through the
+ * admin API, and counts the event, endpoint and delivery rows of the tenant.
  */
 public record TestTenant(UUID id, String apiKey) {
 
@@ -29,6 +30,21 @@ public record TestTenant(UUID id, String apiKey) {
             .returnResult()
             .getResponseBody();
     return new TestTenant(UUID.fromString(created.get("id")), created.get("api_key"));
+  }
+
+  /**
+   * Sets the given ones of {@code rate_per_sec}, {@code burst}, {@code max_endpoints} and {@code
+   * status} through the admin API, and expects the replica to have set them.
+   */
+  public void patch(RestTestClient http, Map<String, Object> settings) {
+    http.patch()
+        .uri("/admin/tenants/{id}", id)
+        .headers(headers -> headers.setBearerAuth(ReplicaSettings.ADMIN_TOKEN))
+        .contentType(MediaType.APPLICATION_JSON)
+        .body(settings)
+        .exchange()
+        .expectStatus()
+        .isNoContent();
   }
 
   /** An idempotency key that no other request of the build carries. */

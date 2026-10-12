@@ -5,12 +5,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.realjoegz.reliablewebhooks.harness.InProcessReplica;
 import io.github.realjoegz.reliablewebhooks.harness.PgWait;
 import io.github.realjoegz.reliablewebhooks.harness.ReplicaSettings;
+import io.github.realjoegz.reliablewebhooks.harness.Rows;
 import io.github.realjoegz.reliablewebhooks.harness.StubDns;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -74,10 +76,14 @@ class IdempotencyIT {
   // request waits inside its transaction with its event inserted and not committed. The second
   // request is let go only when the first is seen waiting, and the row is released only when the
   // second is seen waiting on the insert of its own event.
+  //
+  // Both requests are charged, because neither found an event under the key when it looked: the
+  // tenant has two units and gets no more, and none is left.
   @Test
   void concurrentSameKeyCreatesOneEvent() throws Exception {
     TestTenant tenant = TestTenant.create(http, "concurrent-key");
     UUID endpoint = tenant.register(http, HOOK, "*");
+    tenant.patch(http, Map.of("rate_per_sec", 0, "burst", 2));
     String key = TestTenant.newIdempotencyKey();
 
     ExchangeResult first;
@@ -111,6 +117,7 @@ class IdempotencyIT {
     assertThat(eventIdIn(second)).isEqualTo(eventIdIn(first));
     assertThat(eventsOf(tenant)).containsExactly(eventIdIn(first));
     assertThat(tenant.deliveryRows()).isEqualTo(1);
+    assertThat(Rows.bucketTokens(tenant.id())).isZero();
   }
 
   @Test

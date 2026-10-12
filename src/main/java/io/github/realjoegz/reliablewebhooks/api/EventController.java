@@ -5,6 +5,7 @@ import io.github.realjoegz.reliablewebhooks.ingest.EventRepository;
 import io.github.realjoegz.reliablewebhooks.ingest.EventRequest;
 import io.github.realjoegz.reliablewebhooks.ingest.IngestService;
 import io.github.realjoegz.reliablewebhooks.ingest.IngestService.Accepted;
+import io.github.realjoegz.reliablewebhooks.ingest.IngestService.RateLimited;
 import io.github.realjoegz.reliablewebhooks.ingest.IngestService.Refused;
 import io.github.realjoegz.reliablewebhooks.tenant.Tenant;
 import java.util.UUID;
@@ -73,6 +74,7 @@ public class EventController {
         yield response.body(new AcceptedEvent(accepted.eventId()));
       }
       case Refused.IDEMPOTENCY_KEY_REUSED -> throw Problems.idempotencyKeyReused();
+      case RateLimited limited -> throw Problems.rateLimited(tenant, limited.cost());
     };
   }
 

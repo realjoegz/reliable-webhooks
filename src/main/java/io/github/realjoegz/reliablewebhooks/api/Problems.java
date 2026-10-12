@@ -1,6 +1,7 @@
 package io.github.realjoegz.reliablewebhooks.api;
 
 import io.github.realjoegz.reliablewebhooks.DatabaseFailures;
+import io.github.realjoegz.reliablewebhooks.tenant.Tenant;
 import java.net.URI;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -57,6 +58,50 @@ public class Problems extends ResponseEntityExceptionHandler {
     ErrorResponseException rejection =
         new ErrorResponseException(HttpStatus.TOO_MANY_REQUESTS, problem, null);
     rejection.getHeaders().set(HttpHeaders.RETRY_AFTER, "2");
+    return rejection;
+  }
+
+  /**
+   * The answer to a charge that the bucket of the tenant refused. The refusal was decided by the
+   * database. Whether waiting can help is worked out here, from the rate and the burst that
+   * authentication loaded with the tenant, which can be up to 30 seconds old.
+   *
+   * <p>A bucket that fills refills what the charge costs within the time that the answer names. A
+   * bucket that does not fill, or that never holds as much as the charge costs, gets no time.
+   */
+  public static ErrorResponseException rateLimited(Tenant tenant, int cost) {
+    if (tenant.ratePerSec() == 0 || cost > tenant.burst()) {
+      ProblemDetail problem =
+          problem(
+              HttpStatus.TOO_MANY_REQUESTS,
+              "rate_limit_unsatisfiable",
+              "Rate limit unsatisfiable",
+              "The request costs more than the rate limit of the tenant ever allows.");
+      return new ErrorResponseException(HttpStatus.TOO_MANY_REQUESTS, problem, null);
+    }
+    ProblemDetail problem =
+        problem(
+            HttpStatus.TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Rate limited",
+            "The rate limit of the tenant is used up.");
+    ErrorResponseException rejection =
+        new ErrorResponseException(HttpStatus.TOO_MANY_REQUESTS, problem, null);
+    long refillSeconds = (long) Math.ceil(cost / tenant.ratePerSec());
+    rejection.getHeaders().set(HttpHeaders.RETRY_AFTER, Long.toString(refillSeconds));
+    return rejection;
+  }
+
+  public static ErrorResponseException concurrencyLimit() {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.TOO_MANY_REQUESTS,
+            "concurrency_limit",
+            "Concurrency limit",
+            "The tenant has too many requests open on this replica.");
+    ErrorResponseException rejection =
+        new ErrorResponseException(HttpStatus.TOO_MANY_REQUESTS, problem, null);
+    rejection.getHeaders().set(HttpHeaders.RETRY_AFTER, "1");
     return rejection;
   }
 

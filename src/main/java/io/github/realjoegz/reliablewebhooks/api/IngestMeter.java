@@ -4,6 +4,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.HandlerInterceptor;
@@ -22,12 +23,16 @@ class IngestMeter implements HandlerInterceptor, WebMvcConfigurer {
 
   private final Counter accepted;
   private final Counter replayed;
+  private final Counter rateLimited;
+  private final Counter unsatisfiable;
   private final Counter invalid;
   private final Counter busy;
 
   IngestMeter(MeterRegistry meters) {
     this.accepted = counter(meters, "accepted");
     this.replayed = counter(meters, "replayed");
+    this.rateLimited = counter(meters, "rate_limited");
+    this.unsatisfiable = counter(meters, "unsatisfiable");
     this.invalid = counter(meters, "invalid");
     this.busy = counter(meters, "busy");
   }
@@ -43,6 +48,12 @@ class IngestMeter implements HandlerInterceptor, WebMvcConfigurer {
     switch (HttpStatus.resolve(response.getStatus())) {
       case ACCEPTED ->
           (response.containsHeader(EventController.IDEMPOTENT_REPLAY) ? replayed : accepted)
+              .increment();
+      // The route answers 429 for a charge that the bucket refused. The answer names a time to
+      // come back after only when waiting can help. A request that the permits refused got its
+      // 429 before it reached the route, and does not come by here.
+      case TOO_MANY_REQUESTS ->
+          (response.containsHeader(HttpHeaders.RETRY_AFTER) ? rateLimited : unsatisfiable)
               .increment();
       case BAD_REQUEST, CONTENT_TOO_LARGE, UNPROCESSABLE_CONTENT -> invalid.increment();
       case SERVICE_UNAVAILABLE -> busy.increment();

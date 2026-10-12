@@ -2,10 +2,14 @@ package io.github.realjoegz.reliablewebhooks.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.realjoegz.reliablewebhooks.tenant.Tenant;
 import java.net.URI;
 import java.sql.SQLException;
 import java.sql.SQLTransientConnectionException;
+import java.util.UUID;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DuplicateKeyException;
@@ -145,12 +149,70 @@ class ProblemsTest {
   }
 
   @Test
+  void refusedChargeNamesTheTimeInWhichTheBucketRefillsItsCost() {
+    ErrorResponseException rejection = Problems.rateLimited(tenantWith(50, 100), 1);
+
+    assertThat(rejection.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    assertThat(rejection.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");
+    assertThat(rejection.getBody().getType()).isEqualTo(URI.create("rate_limited"));
+    assertThat(rejection.getBody().getStatus()).isEqualTo(429);
+  }
+
+  // The time is a whole number of seconds and is rounded up: a caller that came back sooner
+  // could find the bucket still short.
+  @ParameterizedTest
+  @CsvSource({"2, 3, 2", "2, 4, 2", "2, 5, 3", "0.01, 1, 100", "0.3, 1, 4", "50, 100, 2"})
+  void timeToComeBackAfterIsTheCostDividedByTheRateRoundedUp(
+      double ratePerSec, int cost, String retryAfter) {
+    ErrorResponseException rejection = Problems.rateLimited(tenantWith(ratePerSec, 100), cost);
+
+    assertThat(rejection.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo(retryAfter);
+  }
+
+  @Test
+  void refusedChargeOfATenantWhoseBucketDoesNotRefillNamesNoTime() {
+    ErrorResponseException rejection = Problems.rateLimited(tenantWith(0, 100), 1);
+
+    assertRateLimitUnsatisfiable(rejection);
+  }
+
+  // A cost of exactly the burst is one that a full bucket pays.
+  @Test
+  void refusedChargeThatCostsMoreThanTheBurstNamesNoTime() {
+    assertRateLimitUnsatisfiable(Problems.rateLimited(tenantWith(50, 100), 101));
+
+    assertThat(Problems.rateLimited(tenantWith(50, 100), 100).getBody().getType())
+        .isEqualTo(URI.create("rate_limited"));
+  }
+
+  @Test
+  void requestBeyondThePermitsIsAskedToComeBackInOneSecond() {
+    ErrorResponseException rejection = Problems.concurrencyLimit();
+
+    assertThat(rejection.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    assertThat(rejection.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");
+    assertThat(rejection.getBody().getType()).isEqualTo(URI.create("concurrency_limit"));
+    assertThat(rejection.getBody().getStatus()).isEqualTo(429);
+  }
+
+  @Test
   void reusedIdempotencyKeyIsUnprocessableWithItsOwnType() {
     ErrorResponseException rejection = Problems.idempotencyKeyReused();
 
     assertThat(rejection.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_CONTENT);
     assertThat(rejection.getBody().getType()).isEqualTo(URI.create("idempotency_key_reused"));
     assertThat(rejection.getBody().getStatus()).isEqualTo(422);
+  }
+
+  private static Tenant tenantWith(double ratePerSec, int burst) {
+    return new Tenant(UUID.randomUUID(), "active", ratePerSec, burst);
+  }
+
+  private static void assertRateLimitUnsatisfiable(ErrorResponseException rejection) {
+    assertThat(rejection.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+    assertThat(rejection.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isNull();
+    assertThat(rejection.getBody().getType()).isEqualTo(URI.create("rate_limit_unsatisfiable"));
+    assertThat(rejection.getBody().getStatus()).isEqualTo(429);
   }
 
   private static void assertDatabaseBusy(ResponseEntity<ProblemDetail> response) {

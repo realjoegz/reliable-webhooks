@@ -58,7 +58,8 @@ class SqlTenantScopeTest {
             "EndpointRepository.FIND",
             "EventRepository.INSERT_DELIVERIES",
             "TenantDeliveryRepository.LIST_ATTEMPTS_OF_RUN",
-            "TenantRepository.INSERT_BUCKET");
+            "TenantRepository.INSERT_BUCKET",
+            "TokenBucket.CHARGE");
     assertThat(statements)
         .allSatisfy(
             (name, sql) -> assertThat(unscopedTenantTables(sql, tenantTables)).as(name).isEmpty());

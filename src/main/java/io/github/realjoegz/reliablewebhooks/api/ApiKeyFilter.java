@@ -13,6 +13,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Optional;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.server.PathContainer;
 import org.springframework.stereotype.Component;
@@ -26,10 +28,17 @@ import org.springframework.web.util.ServletRequestPathUtils;
  * protected without being listed here.
  */
 @Component
+@Order(ApiKeyFilter.ORDER)
 public class ApiKeyFilter extends OncePerRequestFilter {
 
   /** Request attribute holding the authenticated {@link Tenant} on tenant routes. */
   public static final String TENANT = "webhooks.tenant";
+
+  /**
+   * After the filters of Spring, and with room behind it for the one filter that needs to know the
+   * tenant.
+   */
+  static final int ORDER = Ordered.LOWEST_PRECEDENCE - 1;
 
   private static final String BEARER = "Bearer ";
 
