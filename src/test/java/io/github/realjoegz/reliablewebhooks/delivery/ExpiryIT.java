@@ -126,7 +126,7 @@ class ExpiryIT {
     Rows.ageDelivery(neverClaimed, BUDGET);
     UUID withBudgetLeft = Rows.deliveryOf(tenant.accept(http, EVENT));
     Rows.ageDelivery(withBudgetLeft, BUDGET.minusMinutes(1));
-    List<String> leftAlone = everyColumnOf(leased, withBudgetLeft, succeeded);
+    List<String> leftAlone = Rows.everyColumnOf(List.of(leased, withBudgetLeft, succeeded));
     double countedBefore = attemptsOfUnknownOutcome();
 
     expiry.run();
@@ -145,7 +145,7 @@ class ExpiryIT {
             new Rows.Attempt(0, 1, false, "unknown", null, "lease_expired", null, null));
     assertThat(attemptsOfUnknownOutcome() - countedBefore).isEqualTo(1);
 
-    assertThat(everyColumnOf(leased, withBudgetLeft, succeeded)).isEqualTo(leftAlone);
+    assertThat(Rows.everyColumnOf(List.of(leased, withBudgetLeft, succeeded))).isEqualTo(leftAlone);
     assertThat(Rows.delivery(leased))
         .isEqualTo(new Rows.Delivery("pending", 1, 0, true, null, false));
     assertThat(Rows.delivery(withBudgetLeft))
@@ -317,23 +317,6 @@ class ExpiryIT {
         .tag("reason", "lease_expired")
         .counter()
         .count();
-  }
-
-  /** The delivery rows and their attempt rows, each as the text of all of its columns. */
-  private static List<String> everyColumnOf(UUID... deliveryIds) {
-    return TestDatabase.jdbc()
-        .sql(
-            """
-            SELECT line FROM (
-              SELECT 'delivery ' || d::text AS line FROM delivery d WHERE d.id = ANY(:ids)
-              UNION ALL
-              SELECT 'attempt ' || a::text FROM delivery_attempt a WHERE a.delivery_id = ANY(:ids)
-            ) lines
-            ORDER BY line
-            """)
-        .param("ids", deliveryIds)
-        .query(String.class)
-        .list();
   }
 
   // Events with one delivery each, as ingest leaves them for one matching endpoint, but created

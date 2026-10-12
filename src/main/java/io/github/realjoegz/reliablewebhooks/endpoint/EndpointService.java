@@ -1,6 +1,7 @@
 package io.github.realjoegz.reliablewebhooks.endpoint;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
 
@@ -36,6 +37,17 @@ public class EndpointService {
       case LOOKUP_BUSY -> Refused.LOOKUP_BUSY;
       case ALLOWED -> create(tenantId, url, eventTypes);
     };
+  }
+
+  /**
+   * Gives the endpoint a new signing secret and returns it in the clear, for the one time the
+   * tenant is shown it. Empty when the tenant has no active endpoint with this id.
+   */
+  public Optional<SigningSecret> rotateSecret(UUID tenantId, UUID id) {
+    SigningSecret secret = SigningSecret.generate();
+    return endpoints.rotateSecret(tenantId, id, cipher.encrypt(secret.key()))
+        ? Optional.of(secret)
+        : Optional.empty();
   }
 
   private Registration create(UUID tenantId, String url, List<String> eventTypes) {

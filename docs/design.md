@@ -39,7 +39,7 @@ Packages:
 | `tenant/` | `TenantRepository` |
 | `endpoint/` | `EndpointService`, `EndpointRepository`, `UrlPolicy`, `SecretCipher` |
 | `ingest/` | `IngestService`, `EventRepository`, `TokenBucket` |
-| `delivery/` | `DeliveryPoller`, `PollerHeartbeat`, `DeliveryWorker`, `DeliveryRepository`, `TenantDeliveryRepository`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
+| `delivery/` | `DeliveryPoller`, `PollerHeartbeat`, `DeliveryWorker`, `DeliveryRepository`, `TenantDeliveryRepository`, `BulkReplay`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
 | `http/` | `WebhookHttpClient`, `SsrfGuardDnsResolver`, `AddressPolicy`, `DnsLookups`, `Signer` |
 | `ops/` | `WorkerLifecycle`, `StartupInvariants`, `ExpiryJob`, `CancelJob`, `RetentionJob`, `QueueGauges`, `PollerHealth` |
 | test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `UnsafeLocalReplica`, `ReplicaWorker`, `SelfStartedReplica`, `TestTenant`, `OpenRequests` |
@@ -68,14 +68,10 @@ Each row is a SIGKILL of a real replica process, landed deterministically with t
 | K4 | Mid-request | Row leased; subscriber may have processed | Same as K3 | Up to two requests, same `webhook-id` | `WorkerKillIT#killedMidRequest` |
 | K5 | After the subscriber's 2xx, before finalize commits | Row leased; subscriber has processed | Same as K3 | Exactly two requests, same `webhook-id`; one `succeeded` | `WorkerKillIT#killedAfterResponseBeforeCommit` |
 | K6 | Mid-request of a probe, holding the probe slot of an open circuit | `next_probe_at` pushed 60 s ahead; probing delivery leased | Slot reopens when that time passes; no stuck state | Next probe 60 s after the gate | `EndpointOutageIT#probeSlotReopensAfterProberKilled` |
-| K7 | In a bulk replay, after the charge and before the re-arm statement | Tokens spent; nothing re-armed | Caller repeats the call | The repeated call re-arms the rows | `ReplayIT#killedMidReplayRearmsNothing` |
-| K8 | In endpoint create, between the endpoint insert and the circuit insert | Nothing; Postgres rolls back | Caller repeats the call | No endpoint without a circuit row | `EndpointApiIT#killedDuringCreateLeavesNoHalfEndpoint` |
-| K9 | In tenant create, between the tenant insert and the bucket insert | Nothing; Postgres rolls back | Operator repeats the call | No tenant without a bucket row | `AdminApiIT#killedDuringCreateLeavesNoHalfTenant` |
 
 - K2 is state-equivalent to a lost response. The test discards the first response, kills the replica and retries on another.
 - A SIGKILL during graceful drain is K4 or K5.
-- K7 shows what its setup can show. That the re-arm itself is all-or-nothing is single-statement atomicity, not something the kill proves.
-- **Orphaned statements.** Killing a replica does not cancel the statement its backend is running. That statement may still execute, and an autocommit statement may still commit. Safety relies on the lease token and on every autocommit write being harmless when orphaned, not on the statement having stopped. The autocommit writes are the gate, the release, the bucket charge, the delete flip, the admin patches, the endpoint patch and the key rotation. Each of the first five leaves a state another row of this table or the strict-side limiter already covers. An orphaned endpoint patch sets the event types the tenant asked for, and repeating the call changes nothing. A rotation whose response was lost leaves a key that nobody holds, and the operator repeats the call.
+- **Orphaned statements.** Killing a replica does not cancel the statement its backend is running. That statement may still execute, and an autocommit statement may still commit. Safety relies on the lease token and on every autocommit write being harmless when orphaned, not on the statement having stopped. The autocommit writes are the gate, the release, the bucket charge, the delete flip, the admin patches, the endpoint patch, the key rotation and the secret rotation. Each of the first five leaves a state another row of this table or the strict-side limiter already covers. An orphaned endpoint patch sets the event types the tenant asked for, and repeating the call changes nothing. A rotation whose response was lost leaves a key that nobody holds, and the operator repeats the call. A secret rotation whose response was lost leaves a secret that nobody holds, and the tenant repeats that call too. The repeat ends the overlap of the first rotation (section 11.3).
 
 ## 4. Data model
 
@@ -200,9 +196,9 @@ A named problem type such as `rate_limited` is sent as the `type` member, as a r
 | `POST /v1/endpoints` | `{url, event_types}`. Returns `201 {"id", "secret"}`. The signing secret is shown this once. At the endpoint cap it answers `409` (section 11.5). |
 | `GET /v1/endpoints`, `GET /v1/endpoints/{id}` | Includes derived circuit state. At most 50 rows by the endpoint cap. |
 | `PATCH /v1/endpoints/{id}` | `event_types` only. Returns `204`. A new URL is a new endpoint. |
-| `DELETE /v1/endpoints/{id}` | Soft delete in one statement. Delivery to the endpoint stops at commit; its pending deliveries become `cancelled` in batches (section 15). |
-| `POST /v1/endpoints/{id}/secret/rotate` | New secret; the old one stays valid for 24 h. |
-| `POST /v1/endpoints/{id}/replay` | `{limit}`; re-arms up to `limit` dead deliveries. Returns `{replayed, remaining}`. |
+| `DELETE /v1/endpoints/{id}` | Soft delete in one statement. Returns `204`. Delivery to the endpoint stops at commit; its pending deliveries become `cancelled` in batches (section 15). |
+| `POST /v1/endpoints/{id}/secret/rotate` | New secret; the old one stays valid for 24 h (section 11.3). Returns `200 {"secret"}`. The new secret is shown this once. |
+| `POST /v1/endpoints/{id}/replay` | `{limit}`; re-arms up to `limit` dead deliveries (section 8). Returns `200 {replayed, remaining}`. |
 | `GET /v1/deliveries?endpoint_id=&state=` | Both filters are required. Keyset pages on `(created_at, id)`, `limit` at most 100, with a `next` cursor. The endpoint is resolved under the tenant first (404 otherwise). `limit` is 1 to 100, and 100 when it is absent. A page that another page follows carries `next`, and the request for that page sends it back as `cursor`. A deleted endpoint still resolves, so its deliveries can be listed. |
 | `GET /v1/deliveries/{id}` | The delivery and the attempt log of its current run (at most 13 rows). `?run=n` selects an earlier run, and a run that the delivery does not have answers `404`. An attempt is shown with its number, its outcome, its status or error, its start and its duration. The address it went to and the replica that made it are not shown. An `unknown` attempt has no duration, and its start is the time at which it was logged. |
 | `POST /v1/deliveries/{id}/replay` | Re-arms one dead delivery. Returns `204`. A delivery that is not dead answers `409`, and one whose endpoint is deleted answers `404`. |
@@ -481,22 +477,32 @@ The unit is charged before the transaction and is not refunded, also when the re
 
 Bulk replay (`POST /v1/endpoints/{id}/replay`) is bounded and resumable:
 
-- `limit` is at most `min(500, burst)`.
-- The service resolves the endpoint under the tenant (404 otherwise), counts dead rows up to `limit` and charges that many units.
-- It then runs one transaction:
+- `limit` is at most `min(500, burst)`. A larger one counts as that bound, so a call never costs more than the bucket can hold. A `limit` that is missing or below 1 answers `400`. So does a number with a fraction, and one above 2,147,483,647, the largest that an `int` holds.
+  - The burst is the one that authentication loaded with the tenant, which a replica caches for 30 s (section 11.1).
+  - With a burst of 0 the bound is 1. The bucket then refuses the call, where a bound of 0 would answer that nothing is left.
+- The service resolves the endpoint under the tenant (404 otherwise), counts dead rows up to `limit` and charges that many units. Nothing dead means nothing charged and no transaction.
+  - The count reads one row beyond `limit`. That row is neither charged nor re-armed. It is how the call knows that more are left.
+- It then runs one transaction, with `:k` the number of rows that were charged:
 
 ```sql
 SELECT id FROM endpoint WHERE id = :e AND tenant_id = :t AND status = 'active' FOR SHARE;   -- no row: 404
-UPDATE delivery
+WITH picked AS (
+  SELECT id FROM delivery
+  WHERE endpoint_id = :e AND tenant_id = :t AND state = 'dead'
+  ORDER BY created_at, id LIMIT :k
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE delivery d
 SET (the same columns as the single replay)
-WHERE id IN (SELECT id FROM delivery
-             WHERE endpoint_id = :e AND tenant_id = :t AND state = 'dead'
-             ORDER BY created_at, id LIMIT :k
-             FOR UPDATE SKIP LOCKED);
+FROM picked
+WHERE d.id = picked.id;
 ```
 
-- Re-armed rows are spread over 60 s.
+- The rows are picked in a CTE, which is what makes `LIMIT :k` a bound. A CTE that locks rows is run once. Written as `WHERE id IN (SELECT ... LIMIT :k FOR UPDATE SKIP LOCKED)`, the subquery would be one side of a join, and the planner may run such a subquery again for each row of the other side. It does so, for example, when the statistics say that the table holds a single row. Each further run passes over the rows that the statement has re-armed already, so its `LIMIT` fills up with further dead rows, and the call re-arms more rows than it charged. The claim (section 7) and the job statements (section 15) pick their rows in a CTE as well.
+- Re-armed rows are spread over 60 s, and the oldest go first.
+- `replayed` is the number of rows that the transaction re-armed. `remaining` is true when the count found more rows than that.
 - The caller repeats until `remaining` is false. No cursor is needed, because replayed rows leave the dead set.
+- The charge is not refunded, as for the single replay. A call whose endpoint is deleted between the count and the transaction has paid and answers `404`. A call that meets another replay of the same rows has paid for rows that it then passes over: those are re-armed by the other call, and `remaining` says that this one left some.
 
 ## 9. Circuit breaker
 
@@ -614,11 +620,11 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 - `/admin/**` requires a static token from the environment, compared in constant time. `StartupInvariants` refuses to start without one of at least 32 characters.
 
 **11.2 Tenant scoping.**
-- Every statement behind a tenant route carries `tenant_id = :t`. A mutating route whose first statement matches no row answers 404 and runs nothing else. The charge of a replay comes before that statement and writes the bucket of the caller only.
+- Every statement behind a tenant route carries `tenant_id = :t`. A mutating route whose first statement matches no row answers 404 and runs nothing else. The charge of a single replay comes before that statement and writes the bucket of the caller only. A bulk replay resolves its endpoint first and charges nothing for an id that it does not find.
 - `SqlTenantScopeTest` scans the repository SQL constants and fails on a tenant-table statement without it. The exemption list holds worker and job statements only, by class.
   - A tenant table is every table but `tenant`, whose rows are addressed by their own id.
   - An `INSERT` that only supplies values is not checked. It creates a row and can neither read nor change a row of another tenant.
-- `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` calls every mutating route (patch, delete, rotate, single and bulk replay) with a foreign id. It snapshots the foreign tenant's endpoint, delivery, circuit and bucket rows before the call and asserts they are identical after it, in addition to the 404. The replay with a foreign id is charged all the same, and its unit comes out of the bucket of the caller. Read routes are checked for the 404.
+- `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` calls every mutating route (patch, delete, rotate, single and bulk replay) with a foreign id. It snapshots the foreign tenant's endpoint, delivery, circuit and bucket rows before the call and asserts they are identical after it, in addition to the 404. The single replay with a foreign id is charged all the same, and its unit comes out of the bucket of the caller. Read routes are checked for the 404.
 
 **11.3 Signatures.** The format follows Standard Webhooks.
 
@@ -630,7 +636,17 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 
 - The timestamp is inside the MAC input, and the body is the stored bytes.
 - The README ships a reference verifier that rejects a timestamp more than 5 minutes away from the time of the check, whether it is older or lies ahead. Because the timestamp comes from Postgres, a replica with a wrong wall clock cannot get deliveries rejected.
-- After rotation both signatures are sent, space separated, for 24 h. Then the old secret is ignored and later purged. The database clock decides when the overlap ends.
+- After rotation both signatures are sent, space separated, for 24 h, the one of the new secret first. Then the old secret is ignored and later purged. The database clock decides when the overlap ends: the load of an attempt (section 7) returns the old secret only while `prev_secret_expires_at > now()`.
+- A rotation is one autocommit statement:
+
+```sql
+UPDATE endpoint
+SET prev_secret = secret, prev_secret_expires_at = now() + interval '24 hours', secret = :secret
+WHERE id = :id AND tenant_id = :t AND status = 'active';
+-- 0 rows: 404
+```
+
+- One old secret is kept. A second rotation inside the 24 h replaces it: the secret of before the first rotation is no longer signed with, and a subscriber that still checks with it rejects every request from then on (limitation 33).
 - A signing secret is `whsec_` plus 32 random bytes in base64, shown once. The 32 bytes are the MAC key.
 - Secrets are encrypted at rest with AES-256-GCM under a key from the environment, with a one-byte key-version prefix. The key is 32 bytes, given in base64. A stored value is the version byte, a random 96-bit nonce, then the ciphertext with its tag.
 
@@ -706,6 +722,8 @@ INSERT INTO endpoint_circuit (endpoint_id) VALUES (:id);
 
 `FOR NO KEY UPDATE` serialises creates without blocking the tenant's ingest.
 
+Each of the two create transactions, this one and the one of a tenant (section 5), is all or nothing. `EndpointApiIT#failedCircuitInsertLeavesNoEndpoint` and `AdminApiIT#failedBucketInsertLeavesNoTenant` fail the second insert behind a table lock of the test and find no row of the first.
+
 **11.6 Telemetry hygiene.** The redaction list of section 10 applies to logs, spans and metrics. Three tests assert it with a subscriber URL that carries a marker in its path and query:
 - `LogFormatIT#subscriberUrlIsReducedToHost`
 - `TracingIT#attemptSpanCarriesHostOnly`
@@ -779,7 +797,7 @@ RETURNING b.tokens;
 
 ## 13. Failure table
 
-The checked copy of this table lives in `docs/failure-table.md`, where a row appears only once the test that proves it exists. The README shows the headline rows. `FailureTableCheck` (section 16) fails the build unless every test linked from a table in either file ran and passed in the same build.
+The checked copy of this table lives in `docs/failure-table.md`, where a row appears only once the test that proves it exists. The README shows the headline rows. `FailureTableCheck` (section 16) fails the build unless every test linked from a table in either file ran and passed in the same build. A row keeps its number, and number 29 is not in use.
 
 | # | Failure | Proven behaviour | Test | Forced by |
 |---|---|---|---|---|
@@ -799,19 +817,18 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 | 14 | Subscriber DNS that never answers | Attempt fails inside the DNS budget; at most 4 stuck lookups per tenant; other tenants complete; the tenant's healthy endpoints lose no attempt and keep a closed circuit | `SlowEndpointIsolationIT#slowDnsDoesNotStarveOthers`, `#stuckDnsOfOneEndpointDoesNotFailSiblingEndpoints`, `SsrfIT#registrationDnsLookupIsBounded` | `StubDns` delegate that blocks until the test releases it |
 | 15 | One tenant's backlog starving another tenant | Held case: tenant A never exceeds 16 in flight per replica and tenant B completes meanwhile. Fast case: with a deep backlog on A's instantly answering endpoint, B's request arrives before A's 200th of 2,000 | `TenantIsolationIT#backlogOfOneTenantDoesNotStarveAnother`, `#deepBacklogOnFastEndpointDoesNotStarveAnother` | Held case: A has 5 endpoints with 4 deliveries each. The receiver holds the 4 requests of each of four endpoints, and the deliveries for the fifth stay due and unclaimed, so the tenant cap binds where no endpoint cap does. Fast case: 2,000 aged due rows for A, one newer row for B; ordering read from the receiver's request log |
 | 16 | Tenant floods ingest | Admitted units equal the bucket exactly across replicas; large bodies cost more; the 9th concurrent request gets 429 without acquiring a database connection; an unsatisfiable request gets 429 without `Retry-After`; tenant B is served | `RateLimitIT#limitIsExactAcrossReplicas`, `#refillIsExact`, `#fanOutIsChargedPerDelivery`, `#largeBodiesAreChargedBySize`, `#costAboveBurstIsUnsatisfiable`, `#ninthConcurrentRequestTakesNoConnection`, `#floodingTenantDoesNotBlockOtherTenant` | Rate 0 and fixed burst; charges of four replicas seen waiting for a bucket row that the test holds; eight requests with unfinished bodies hold A's permits; A's bucket row locked by the test |
-| 17 | Tenant replays a huge dead-letter backlog | At most `limit` rows per call, charged per row, spread over 60 s; a kill after the charge re-arms nothing | `ReplayIT#bulkReplayIsBoundedAndCharged`, `#killedMidReplayRearmsNothing` | Dead rows inserted directly; test lock on the endpoint row blocks the replay's share lock |
+| 17 | Tenant replays a huge dead-letter backlog | At most `limit` rows per call, charged per row, spread over 60 s | `ReplayIT#bulkReplayIsBoundedAndCharged` | Dead rows inserted directly |
 | 18 | Subscriber URL points at, or rebinds to, a private address | Rejected at registration; blocked at connect with zero accepted connections; redirects not followed | `SsrfIT#registrationRejectsPrivateTargets`, `#rebindingIsBlockedAtConnect`, `#redirectIsNotFollowed`, `AddressPolicyTest`, `DnsLookupsTest#systemResolverDoesNotLetADeniedAddressLiteralPast` | `StubDns` answers public first, loopback later; listener counts accepts; denied address literals given to the system resolver |
 | 19 | Absurd `Retry-After` | Clamped to between the own delay and one hour | `RetryAfterIT#clampedAtBothEnds` | Receiver sends 0, 3601 and 10^9 |
 | 20 | Rolling deploy (SIGTERM) | Nothing is claimed after the poller stopped; in-flight attempts finish and are recorded; the process exits by itself with code 143 before lease expiry | `GracefulShutdownIT#drainsInFlightAndExits` | Receiver holds 4 requests; a 5th delivery is due and unclaimed only because the endpoint is full; SIGTERM; `poller_stopped` seen; receiver released |
-| 21 | Endpoint deleted while deliveries are pending or being created | Delivery to it stops when the delete commits; pending rows become `cancelled`; nothing is created or re-armed for it afterwards; a delete by another tenant changes nothing | `EndpointDeleteIT#deleteStopsDeliveryAndCancelsPending`, `#ingestRacingDeleteLeavesNoOrphan`, `#replayRacingDeleteLeavesNoOrphan`, `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` | Receiver holds 4 requests with 2 rows still due; canary as witness; both race orders forced with two test-managed transactions |
-| 22 | Replay racing retention | A replayed delivery is never purged | `RetentionIT#replayedDeliveryIsNotPurged`, `#purgesOnlyOldTerminalRows` | Replay holds the row uncommitted; a retention run returns without waiting and leaves it; replay commits; a second run deletes nothing |
+| 21 | Endpoint deleted while deliveries are pending or being created | Delivery to it stops when the delete commits; pending rows become `cancelled`; nothing is created or re-armed for it afterwards; a delete by another tenant changes nothing | `EndpointDeleteIT#deleteStopsDeliveryAndCancelsPending`, `#deliveryClaimedBeforeTheDeleteIsNotSentAfterIt`, `#ingestRacingDeleteLeavesNoOrphan`, `#replayRacingDeleteLeavesNoOrphan`, `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` | Receiver holds 4 requests with 2 rows still due; canary as witness; test lock on `event` holds a claimed delivery in its load while the endpoint is deleted; both race orders forced with two test-managed transactions |
+| 22 | Replay racing retention | A replayed delivery is never purged | `RetentionIT#replayedDeliveryIsNotPurged`, `#purgesOnlyOldTerminalRows` | Replay holds the row uncommitted; a retention run returns without waiting and leaves it; replay commits; a second run leaves it as well; each run deletes another delivery of the same age, which is the witness that it ran |
 | 23 | Secret rotation with deliveries in flight | Both signatures during the overlap; old secret rejected after it | `SignatureIT#bothSignaturesDuringOverlap` | Expiry aged |
 | 24 | Tampered body or replayed old request | Reference verifier rejects both | `SignatureIT#verifierRejectsTamperedBodyAndStaleTimestamp` | Direct |
 | 25 | Caller forces trace sampling or picks a trace id | With sampling off, a caller's sampled flag exports nothing; with sampling on, the root span has its own trace id and carries the caller's context only as a link | `TracingIT#callerCannotForceSampling`, `#callerTraceIdBecomesLinkOnly` | Sampler probability 0, then 1; in-memory span exporter |
 | 26 | Connections to Postgres go half-open (failover, partition) | The cut-off replica's blocked call fails at the socket timeout and it resumes on new connections; another replica delivers meanwhile; a transaction left open on the server is ended by the server, so its row lock cannot pin a delivery | `DatabaseBlackholeIT#pollerResumesAfterSocketTimeout`, `#openTransactionIsEndedByServer` | `TcpProxy` stops relaying without closing, after `PgWait` shows the replica inside a statement |
 | 27 | Subscriber answers with an endless header line or body | An oversized head fails the attempt as `response_too_large`, not `deadline`; a 2xx with an endless body is a success and the connection is dropped at the limit; another tenant's delivery completes meanwhile | `OutboundRequestIT#endlessHeaderIsCutAtLimit`, `#endlessBodyIsNotDrained`, `WebhookHttpClientIT#bodyOfSixtyFourKibibytesIsReadAndOneByteMoreCostsTheConnection` | `FaultReceiver` scripts `endlessHeader` and `endlessChunkedBody`; a body in chunks is one that a client could read to its end to use the connection again; the receiver records bytes written and who closed; bodies of 64 KiB and of one byte more place the limit |
 | 28 | Subscriber answers 503 with `Set-Cookie` | Exactly one request per attempt row; no later request, from any tenant, carries a `Cookie` header | `OutboundRequestIT#oneRequestPerAttemptAndNoCookieReuse` | Two tenants' endpoints on one receiver host |
-| 29 | Replica killed while creating an endpoint or a tenant | No endpoint without its circuit row and no tenant without its bucket row; the repeated call succeeds | `EndpointApiIT#killedDuringCreateLeavesNoHalfEndpoint`, `AdminApiIT#killedDuringCreateLeavesNoHalfTenant` | Test table lock blocks the second insert of the transaction |
 | 30 | Abusive tenant must be stopped | After suspension nothing more is claimed for the tenant; its key is rejected; held rows are untouched and deliver after resume | `AdminApiIT#suspendStopsOutboundDeliveries`, `#resumeDeliversHeldDeliveries` | Receiver holds the tenant's 4 in-flight requests; a canary of another tenant witnesses that claims ran |
 | 31 | Tenant issues expensive reads, or a statement blocks | Lists are keyset pages of at most 100 rows behind a required endpoint and state; a blocked statement answers 503 inside the lock timeout | `DeliveryApiIT#listIsKeysetPagedAndBounded`, `ApiTimeoutIT#blockedStatementAnswers503`, `ProblemsTest` | Test row lock held past `lock_timeout` |
 | 32 | Subscriber URL carries a secret in its path or query | The marker appears in no log line, no span and no meter | `LogFormatIT#subscriberUrlIsReducedToHost`, `TracingIT#attemptSpanCarriesHostOnly`, `MetricsIT#noMeterHasHostOrUrlLabel` | URL with a marker in path and query; full scrape and all exported spans scanned |
@@ -831,7 +848,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
    - One endpoint drains at one delivery per claim round trip per replica, at most 4 at a time.
    - A tenant can use 16 of a replica's 64 workers unless the cap is raised.
    - When more tenants have due work than a replica has free permits, the tenants with the oldest head rows go first. Fairness is per claim, not a quota over time.
-7. **The rate limiter is strict-side.** Failed ingests are not refunded. Retries are not charged. A request that the bucket refuses has passed the request permits and has run its statements up to the charge: three for an event, one for a replay. The type and `Retry-After` of a 429 come from a tenant record cached up to 30 s.
+7. **The rate limiter is strict-side.** Failed ingests are not refunded. Retries are not charged. A request that the bucket refuses has passed the request permits and has run its statements up to the charge: three for an event, one for a single replay and three for a bulk replay. The type and `Retry-After` of a 429 come from a tenant record cached up to 30 s.
 8. **Isolation covers a bounded number of misbehaving tenants.** Two tenants each holding 8 request permits can fill the `api` pool. Eight tenants with tarpit DNS can fill the DNS pool. The 8 permits are fixed and the size of the `api` pool is a setting: in a pool of 8 connections or fewer a single tenant can hold every connection, and no startup invariant refuses such a pool.
 9. **Unauthenticated floods** (invalid keys, slow request bodies) reach the service and, for the key lookup, the database. That belongs to the ingress.
 10. **Endpoint ownership is not verified.** A tenant can aim signed POSTs at any public host, up to its own rate. There is no per-destination limit across endpoints. The operator's lever is suspension.
@@ -873,6 +890,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 30. **No storage quota.** The byte-weighted charge bounds what a tenant can store per second (section 12). There is no cap on stored bytes or on pending rows beyond rate times retention.
 31. **The delivery list is narrow.** It needs an endpoint and a state. There is no tenant-wide listing, and the attempt log is read one run at a time.
 32. **A request on a connection that the subscriber has just closed fails.** The client keeps connections for reuse and repeats no request by itself, so such a request is a failed attempt and waits for its retry. A connection that was idle for more than 2 s is tested before it is used again, which leaves the short window after a request.
+33. **One old signing secret is kept.** A second rotation inside the 24 h of the first ends that overlap early, and so does the repeat of a rotation whose response was lost. A subscriber that still checks with the secret from before the first rotation rejects every request from then on. The deliveries that it rejects are retried on the schedule until it has a secret that is signed with.
 
 ## 15. Operations
 
@@ -906,60 +924,106 @@ The database health indicator is off. The health endpoint takes no key, so it mu
 
 The JVM then exits with code 143 (128 + SIGTERM), which is the documented exit code of a clean drain. The deployment must allow at least 30 s of termination grace. Nothing needs releasing, because nothing is claimed that has not started.
 
-`ExpiryJob` is a lifecycle of the same phase as the worker, so it stops before the pools close as well. Spring stops the lifecycles of a phase one after the other and then waits until each has reported its end, for at most the 30 s that Spring Boot gives a phase. The stop of the job starts no further run and returns at once. The job reports its end when its loop is over, which is after a run that is in progress. A slow run therefore neither delays the stop of the poller nor adds its time to the drain. It still ends before the pools close, because the time bounds of the `worker` pool (section 12) end a run inside those 30 s.
+`ExpiryJob`, `CancelJob` and `RetentionJob` are lifecycles of the same phase as the worker, so they stop before the pools close as well. Spring stops the lifecycles of a phase one after the other and then waits until each has reported its end, for at most the 30 s that Spring Boot gives a phase. The stop of a job starts no further run and returns at once, and a run in progress starts no further statement. The job reports its end when its loop is over, which is after the statement that is in progress. A slow run therefore neither delays the stop of the poller nor adds its time to the drain. It still ends before the pools close, because the time bounds of the `worker` pool (section 12) end a statement inside those 30 s.
 
-**Background jobs.** They run on every replica on a timer, with no leader election. Each is an idempotent batch statement whose subquery uses `FOR UPDATE SKIP LOCKED`, so a job never waits on a row and concurrent runs are harmless.
+**Background jobs.** They run on every replica on a timer, with no leader election. Each is an idempotent batch statement that picks its rows in a CTE with `FOR UPDATE SKIP LOCKED`, so a job never waits on a row and concurrent runs are harmless. The CTE runs once, so its `LIMIT` bounds the statement whatever plan it gets (section 8).
+
+- The first run of a job comes when the replica starts, and every later run its interval after the end of the run before it.
+- Every statement of a job is a transaction of its own on the `worker` pool. A statement that outlives its replica therefore cannot commit by itself (section 3).
+- A run that fails is logged, and the next run follows after the same interval.
 
 - `ExpiryJob` (every 60 s) dead-letters pending rows past `expires_at` that are not leased. An abandoned row gets its missing attempt row in the same statement:
 
 ```sql
-WITH expired AS (
+WITH picked AS (
+  SELECT id, lease_token IS NOT NULL AS abandoned
+  FROM delivery
+  WHERE state = 'pending' AND expires_at <= now()
+    AND NOT (lease_token IS NOT NULL AND next_attempt_at > now())     -- not leased
+  ORDER BY expires_at LIMIT 1000
+  FOR UPDATE SKIP LOCKED
+), expired AS (
   UPDATE delivery d
   SET state = 'dead', dead_reason = 'expired', lease_token = NULL, completed_at = now()
-  FROM (SELECT id, lease_token IS NOT NULL AS abandoned
-        FROM delivery
-        WHERE state = 'pending' AND expires_at <= now()
-          AND NOT (lease_token IS NOT NULL AND next_attempt_at > now())     -- not leased
-        ORDER BY expires_at LIMIT 1000
-        FOR UPDATE SKIP LOCKED) x
-  WHERE d.id = x.id
-  RETURNING d.id, d.replays, d.attempts, x.abandoned
+  FROM picked
+  WHERE d.id = picked.id
+  RETURNING d.id, d.replays, d.attempts, picked.abandoned
 )
 INSERT INTO delivery_attempt (delivery_id, run, attempt_no, outcome, error)
 SELECT id, replays, attempts, 'unknown', 'lease_expired' FROM expired WHERE abandoned;
 ```
 
-  - The first run comes when the replica starts, and every later run 60 s after the end of the run before it.
-  - A run is this one statement, in a transaction on the `worker` pool. A statement that outlives its replica therefore cannot commit by itself (section 3).
-  - A run that fails is logged, and the next run follows after the same 60 s.
+  A run is this one statement.
 
 - `CancelJob` (every 30 s) cancels the pending rows of deleted endpoints, 1,000 per statement, repeating while a batch is full:
 
 ```sql
-UPDATE delivery
+WITH picked AS (
+  SELECT d.id FROM delivery d JOIN endpoint e ON e.id = d.endpoint_id
+  WHERE e.status = 'deleted' AND d.state = 'pending'
+  LIMIT 1000 FOR UPDATE OF d SKIP LOCKED
+)
+UPDATE delivery d
 SET state = 'cancelled', dead_reason = 'endpoint_deleted', lease_token = NULL, completed_at = now()
-WHERE id IN (SELECT d.id FROM delivery d JOIN endpoint e ON e.id = d.endpoint_id
-             WHERE e.status = 'deleted' AND d.state = 'pending'
-             LIMIT 1000 FOR UPDATE OF d SKIP LOCKED);
+FROM picked
+WHERE d.id = picked.id;
 ```
 
-- `RetentionJob` (hourly, batches of 1,000) runs in this order:
+- `RetentionJob` (hourly, batches of 1,000) runs in this order. Each step repeats its statement while a batch is full, and the next step begins after that:
   1. Delete terminal deliveries with `completed_at` older than 30 days:
 
      ```sql
-     DELETE FROM delivery
-     WHERE id IN (SELECT id FROM delivery
-                  WHERE state <> 'pending' AND completed_at < now() - interval '30 days'
-                  ORDER BY completed_at LIMIT 1000
-                  FOR UPDATE SKIP LOCKED);
+     WITH picked AS (
+       SELECT id FROM delivery
+       WHERE state <> 'pending' AND completed_at < now() - interval '720 hours'
+       ORDER BY completed_at LIMIT 1000
+       FOR UPDATE SKIP LOCKED
+     )
+     DELETE FROM delivery USING picked WHERE delivery.id = picked.id;
      ```
 
-     The predicate sits on the locked row inside the subquery. A row that a replay holds is skipped without waiting. A row that a replay has already committed fails the predicate. There is no lock wait in this statement.
-  2. Delete events older than 30 days that have no deliveries. Deliveries are only created at ingest, so such an event can never gain one.
-  3. Delete `deleted` endpoints that have no deliveries.
-  4. Clear expired previous secrets.
+     The predicate sits on the locked row inside the CTE. A row that a replay holds is skipped without waiting. A row that a replay has already committed fails the predicate. There is no lock wait in this statement.
 
-  The foreign keys are `RESTRICT`, so a mistake here fails loudly and does not cascade.
+     The 30 days are written as 720 hours, here and in the next step. Postgres counts the days of an interval in the time zone of the session, which a replica sets from the zone of its JVM. Across a change of the clocks `interval '30 days'` is 719 or 721 hours, and two replicas in different zones would not agree on it.
+  2. Delete events older than 30 days that have no deliveries. Deliveries are only created at ingest, so such an event can never gain one. Its idempotency key is free again from then on.
+
+     ```sql
+     WITH picked AS (
+       SELECT ev.id FROM event ev
+       WHERE ev.created_at < now() - interval '720 hours'
+         AND NOT EXISTS (SELECT 1 FROM delivery d WHERE d.event_id = ev.id)
+       ORDER BY ev.created_at LIMIT 1000
+       FOR UPDATE OF ev SKIP LOCKED
+     )
+     DELETE FROM event USING picked WHERE event.id = picked.id;
+     ```
+  3. Delete `deleted` endpoints that have no deliveries. Nothing is created for an endpoint once its delete has committed (section 6), so such an endpoint can never gain one either.
+
+     ```sql
+     WITH picked AS (
+       SELECT e.id FROM endpoint e
+       WHERE e.status = 'deleted'
+         AND NOT EXISTS (SELECT 1 FROM delivery d WHERE d.endpoint_id = e.id)
+       LIMIT 1000
+       FOR UPDATE OF e SKIP LOCKED
+     )
+     DELETE FROM endpoint USING picked WHERE endpoint.id = picked.id;
+     ```
+  4. Clear expired previous secrets:
+
+     ```sql
+     WITH picked AS (
+       SELECT id FROM endpoint
+       WHERE prev_secret_expires_at <= now()
+       LIMIT 1000
+       FOR UPDATE SKIP LOCKED
+     )
+     UPDATE endpoint SET prev_secret = NULL, prev_secret_expires_at = NULL
+     FROM picked
+     WHERE endpoint.id = picked.id;
+     ```
+
+  The foreign keys of a delivery to its event and to its endpoint are `RESTRICT`, so a mistake here fails loudly and does not cascade. The attempt rows of a delivery and the circuit row of an endpoint go with it.
 
 **Endpoint delete** is one statement:
 
@@ -981,15 +1045,15 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
 Rules:
 
 - No test sleeps to "let things happen". Waits are condition polls with a timeout.
-- **Time is aged in the data, not in the clock.** `Rows` ages a row: it subtracts an interval from its time columns, which are `next_attempt_at`, `expires_at`, `completed_at`, `next_probe_at`, `refilled_at` and `prev_secret_expires_at`. Production code and `now()` run unchanged. This drives lease expiry, the twelve-step schedule, the probe interval, the 72 h budget and retention. `Rows` also postpones a delivery: it moves the due time ahead, so that no claim takes the delivery until the test ages it by as much.
+- **Time is aged in the data, not in the clock.** `Rows` ages a row: it subtracts an interval from its time columns, which are `next_attempt_at`, `expires_at`, `completed_at`, `next_probe_at`, `refilled_at`, `prev_secret_expires_at` and the `created_at` of an event. Production code and `now()` run unchanged. This drives lease expiry, the twelve-step schedule, the probe interval, the 72 h budget, the 24 h of an old secret and retention. `Rows` also postpones a delivery: it moves the due time ahead, so that no claim takes the delivery until the test ages it by as much.
 - **A negative claim needs a witness.** "Nothing was claimed" or "no attempt was used" is asserted only after something observable proves the poller ran in the state under test. The witness is either a canary (a delivery to another endpoint or tenant, ingested after that state was reached, has succeeded) or a positive signal such as `poller_stopped`.
 - **Ordering assertions, not clocks.** Where a test is about who goes first, it reads the receiver's request log.
 - Integration tests run with production retry, breaker, lease and timeout settings. The test-profile differences are the `unsafe-local` allowance for the loopback receiver with its `http` scheme, in the classes that deliver to the receiver, and in `TracingIT` only, the sampler probability.
 - Three tests of `WebhookHttpClientIT` wait for a time bound to end a request, and their clients have a short one: an attempt deadline of 500 ms in the two that are cut at the deadline, and a lookup wait of 20 ms in the one whose lookup does not answer. The client with the short deadline is built from settings, as the application builds its client, so the bound that cuts those requests is `attempt-deadline`. A replica under test always runs with the shipped values.
 - **A replica inside the test JVM does not start its worker by itself.** The replicas of a build share one database, so a worker that ran all the time would take the deliveries of tests that are about something else, and those of a test that has to claim them itself. A test that wants deliveries sent starts the worker of its replica, or builds the pollers it needs. The worker is stopped when the test ends. One test is the exception: `WorkerLifecycleIT#replicaStartsItsWorkerByItselfAndStopsItWhenItCloses` starts a second replica the way the application starts, with nothing taken from Spring, and closes it before it ends. The attempt is recorded under the id of that replica, which shows that Spring started its worker. Its pools hold 4 connections each, because the replicas that the build keeps have theirs open.
-- **Nor does it start its expiry job.** A run that came by itself could take a delivery that a test has aged past its budget before the test is ready for it. A test that wants a run calls the run of the job. `ExpiryIT#replicaRunsItsExpiryJobByItself` is the exception here: it starts a second replica the way the application starts and waits for the first run of that replica's job. The delivery belongs to a suspended tenant, so the worker of that replica does not claim it.
+- **Nor does it start its jobs.** A run that came by itself could take a delivery that a test has aged past its budget before the test is ready for it, cancel one that a test shows as pending, or delete a row that a test has aged past retention. A test that wants a run calls the run of the job. Three tests are the exception here, one for each job: `ExpiryIT#replicaRunsItsExpiryJobByItself`, `EndpointDeleteIT#replicaRunsItsCancelJobByItself` and `RetentionIT#replicaRunsItsRetentionJobByItself`. Each starts a second replica the way the application starts and waits for the first run of that replica's job. In the first of them the delivery belongs to a suspended tenant, so the worker of that replica does not claim it.
 - **Every test of such a replica begins with an empty queue.** The pending deliveries that earlier tests left are deleted first. A worker that a test starts therefore sends the deliveries of that test and no others.
-- **A replica that runs as a process of its own is not held back.** `ReplicaProcess` starts the packaged jar, and its worker and its expiry job run as they do in production. Such a replica claims whatever is due. A test that starts one runs in a class with a replica inside the test JVM as well, which takes the requests that set the test up and whose worker does not run while the process does, so the test begins with an empty queue and the process finds the deliveries of that test only. The process is killed when the test ends. In the two kills of `EndpointOutageIT` that worker runs before the process and after it: it fails the delivery five times and is stopped before the process starts, and it is started again once the process is gone. In `probeSlotReopensAfterProberKilled` it is then the second replica, which sends the next probe, and in `expiredAfterHolderKilledReplaysCleanly` it delivers the replay.
+- **A replica that runs as a process of its own is not held back.** `ReplicaProcess` starts the packaged jar, and its worker and its jobs run as they do in production. Such a replica claims whatever is due. A test that starts one runs in a class with a replica inside the test JVM as well, which takes the requests that set the test up and whose worker does not run while the process does, so the test begins with an empty queue and the process finds the deliveries of that test only. The process is killed when the test ends. In the two kills of `EndpointOutageIT` that worker runs before the process and after it: it fails the delivery five times and is stopped before the process starts, and it is started again once the process is gone. In `probeSlotReopensAfterProberKilled` it is then the second replica, which sends the next probe, and in `expiredAfterHolderKilledReplaysCleanly` it delivers the replay.
 - **A replica without a running worker is not live.** Its poller does not loop, so its `poller` indicator reports down once 60 s have passed since the replica started or since a test last stopped its worker. The two tests that ask a replica inside the test JVM for its health, `ApiKeyAuthIT#healthProbesNeedNoKey` and `DatabasePoolsIT#healthEndpointBorrowsNoPooledConnection`, start its worker first.
 
 Harness:
@@ -1003,11 +1067,11 @@ Harness:
 | `TcpProxy` | In-process TCP forwarder between one replica and Postgres. `blackhole()` keeps every existing connection open and relays nothing more on it, ever; new connections are accepted and ignored. `heal()` lets new connections relay again. |
 | `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use, with room for 300 connections: a replica holds 32, and besides the replicas inside the test JVM a test runs up to two as processes. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. `stop()` and `start()` stop the container and start it again. The container is created with a host port that was free at that moment, because Docker gives a container that starts again another port unless its port was named. |
 | `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection with the replica id as `application_name`, an admin token and a secret-encryption key. |
-| `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker and the expiry job of the replica are left to the tests, and the queue is emptied before each test. |
+| `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker and the jobs of the replica are left to the tests, and the queue is emptied before each test. |
 | `UnsafeLocalReplica` | An `InProcessReplica` with the `unsafe-local` profile and its allowance: plain `http` and the loopback address, where `FaultReceiver` listens. The classes with this annotation share a second application context. |
 | `ReplicaWorker` | Starts and stops the delivery worker of a replica inside the test JVM. Each start gets a `WorkerLifecycle` and a poller of its own from the application context, wired as the application wires them, and runs the start and stop that Spring runs. |
-| `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker and its expiry job, and closing it stops them. A test can give it the heartbeat of its poller, built on a clock that the test moves. |
-| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, sends an event and replays a delivery as that tenant, has the tenant's limits and status set through the admin API, and counts the tenant's event, endpoint and delivery rows. |
+| `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker and its jobs, and closing it stops them. A test can give it the heartbeat of its poller, built on a clock that the test moves. |
+| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, deletes one and rotates its secret, sends an event, and replays one delivery or the dead deliveries of an endpoint as that tenant. Has the tenant's limits and status set through the admin API, and counts the tenant's event, endpoint and delivery rows. |
 | `OpenRequests` | Counts, for each tenant, the requests that a route of a replica inside the test JVM has been given and has not finished. A request is counted once every filter has let it through and before the route reads its body, so a test that keeps requests unfinished can wait until they are behind the filters. |
 
 How each proof is forced.
@@ -1024,8 +1088,6 @@ How each proof is forced.
   | K1, row 4 | Endpoint row | Fan-out insert, inside the ingest transaction |
   | K3, row 3 | `LOCK TABLE event IN ACCESS EXCLUSIVE MODE` | The load `SELECT` of a closed-circuit delivery |
   | K5, row 2 | Delivery row, taken while the receiver holds the request | F1, inside the finalize transaction |
-  | K7, row 17 | Endpoint row | The replay's share lock, after the charge committed |
-  | K8, K9, row 29 | `LOCK TABLE` on `endpoint_circuit` or `rate_bucket` | The second insert of the create transaction |
 
   - **Only transactions and reads.** A lock-block kill is landed only on a statement inside an explicit transaction or on a read. The orphaned backend then finds end-of-file before any `COMMIT` and rolls back, or has nothing to commit. No kill is landed on a blocked autocommit write, because that write would commit after the kill and change the state under test.
   - **K3 in detail.** The delivery is accepted while no worker runs and is postponed by an hour, so the replica finds nothing due when it starts. The test locks `event`, ages the delivery by that hour from a second connection, waits until the load is blocked, kills, and releases. The surviving replica is started after the kill.
@@ -1076,6 +1138,11 @@ How each proof is forced.
   Two time bounds apply. The receiver holds the eight requests until the container has stopped, and a held request is cut at the attempt deadline of 15 s, so the requests have to arrive and the container has to stop inside that time. The eight results then have to be recorded before their replicas give the finalize up, 55 s after the claims began, so stopping and starting the container together have to fit into that time. A run that took longer than either would fail and not pass: an attempt that was cut is recorded as a failure, and a delivery whose finalize was given up is claimed again and sent a second time.
 
   The container keeps its host port because it was created with one. The replicas inside the test JVM lose their connections as well, and their pools replace them when a later test borrows one.
+- **(j) Delete races.** `EndpointDeleteIT` forces both orders of a delete against an ingest, and against the two replays, and a delete between the claim of a delivery and its load. In the races with an ingest or a replay, the racer that goes first runs inside a transaction that the test opens on the `api` pool of the replica: it is the code of the service, and the test decides when it commits. The other racer is a request to the replica, and the test commits once `PgWait` shows that request waiting for the endpoint row. The lock timeout of the `api` pool gives the test 2 s for this.
+  - Delete first: the transaction of the test holds the delete. The ingest has matched the endpoint and waits in its fan-out, and each replay has paid and waits at its share lock. After the commit the event is accepted without a delivery for the endpoint, and each replay answers `404` and re-arms nothing.
+  - Delete second: the transaction of the test holds the ingest, or the two replays, and the delete waits for the row. After the commit the delete answers `204`. The delivery that the ingest created or a replay re-armed is pending then, and a run of `CancelJob` cancels it.
+  - Delete between claim and load: `deliveryClaimedBeforeTheDeleteIsNotSentAfterIt` locks `event` as K3 does, without a kill, so a delivery that is claimed waits in its load. A delivery for a second endpoint is claimed first. Once it is seen waiting, the test makes the delivery for the first endpoint due, sees both loads wait, deletes that endpoint and releases the lock. The second delivery succeeds with its first attempt, so the loads were answered and not ended by the lock timeout of the `worker` pool, which gives the test 5 s from the first wait. The first delivery is not sent. It stays leased, and a run of `CancelJob` cancels it. The worker is stopped before the rows are read, which waits for the attempts in flight.
+- **(k) Retention.** `RetentionIT#replayedDeliveryIsNotPurged` holds the replay of a delivery that died more than 30 days ago in such a transaction and calls a retention run while it is open. The run is on the `worker` pool, whose lock timeout would fail a run that waited for the row. `#purgesOnlyOldTerminalRows` has a succeeded, a dead and a cancelled delivery that ended 30 days ago, one of each that ended a minute later, and a pending delivery whose due time and expiry lie more than 30 days in the past. The run deletes the first three and leaves the other four.
 
 **The failure-table check.** `FailureTableCheck` is a small main class run by `exec-maven-plugin` in `verify`, after Failsafe.
 

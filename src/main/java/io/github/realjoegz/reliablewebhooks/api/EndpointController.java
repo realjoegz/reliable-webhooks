@@ -1,5 +1,6 @@
 package io.github.realjoegz.reliablewebhooks.api;
 
+import io.github.realjoegz.reliablewebhooks.delivery.BulkReplay;
 import io.github.realjoegz.reliablewebhooks.endpoint.Endpoint;
 import io.github.realjoegz.reliablewebhooks.endpoint.EndpointRepository;
 import io.github.realjoegz.reliablewebhooks.endpoint.EndpointService;
@@ -12,6 +13,7 @@ import java.util.UUID;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -49,12 +51,25 @@ public class EndpointController {
 
   record PatchEndpoint(List<String> eventTypes) {}
 
+  record RotatedSecret(String secret) {
+
+    /** Leaves out the secret, so that printing cannot leak it. */
+    @Override
+    public String toString() {
+      return "RotatedSecret[redacted]";
+    }
+  }
+
+  record ReplayDead(Integer limit) {}
+
   private final EndpointService service;
   private final EndpointRepository endpoints;
+  private final BulkReplay bulkReplay;
 
-  EndpointController(EndpointService service, EndpointRepository endpoints) {
+  EndpointController(EndpointService service, EndpointRepository endpoints, BulkReplay bulkReplay) {
     this.service = service;
     this.endpoints = endpoints;
+    this.bulkReplay = bulkReplay;
   }
 
   @PostMapping
@@ -97,6 +112,38 @@ public class EndpointController {
       throw notFound();
     }
     return ResponseEntity.noContent().build();
+  }
+
+  @DeleteMapping("/{id}")
+  ResponseEntity<Void> delete(
+      @RequestAttribute(ApiKeyFilter.TENANT) Tenant tenant, @PathVariable UUID id) {
+    if (!endpoints.delete(tenant.id(), id)) {
+      throw notFound();
+    }
+    return ResponseEntity.noContent().build();
+  }
+
+  @PostMapping("/{id}/secret/rotate")
+  ResponseEntity<RotatedSecret> rotateSecret(
+      @RequestAttribute(ApiKeyFilter.TENANT) Tenant tenant, @PathVariable UUID id) {
+    String secret =
+        service.rotateSecret(tenant.id(), id).orElseThrow(EndpointController::notFound).value();
+    return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new RotatedSecret(secret));
+  }
+
+  @PostMapping("/{id}/replay")
+  BulkReplay.Replayed replay(
+      @RequestAttribute(ApiKeyFilter.TENANT) Tenant tenant,
+      @PathVariable UUID id,
+      @RequestBody ReplayDead request) {
+    if (request.limit() == null || request.limit() < 1) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "limit must be 1 or more");
+    }
+    return switch (bulkReplay.replay(tenant, id, request.limit())) {
+      case BulkReplay.Replayed replayed -> replayed;
+      case BulkReplay.Refused.ENDPOINT_NOT_FOUND -> throw notFound();
+      case BulkReplay.RateLimited limited -> throw Problems.rateLimited(tenant, limited.cost());
+    };
   }
 
   private static void requireEventTypes(List<String> eventTypes) {

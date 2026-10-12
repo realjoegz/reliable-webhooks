@@ -10,8 +10,8 @@ import org.springframework.context.support.GenericApplicationContext;
 
 /**
  * A second replica inside the test JVM that starts the way the application starts. Nothing of it is
- * left to the tests: Spring starts its delivery worker and its expiry job, and closing it stops
- * them. A test uses it to show what a replica does by itself, and closes it before it ends.
+ * left to the tests: Spring starts its delivery worker and its jobs, and closing it stops them. A
+ * test uses it to show what a replica does by itself, and closes it before it ends.
  */
 public final class SelfStartedReplica {
 

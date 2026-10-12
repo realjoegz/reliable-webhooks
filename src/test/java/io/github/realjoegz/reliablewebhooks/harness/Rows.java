@@ -7,8 +7,9 @@ import java.util.UUID;
 
 /**
  * Reads the rows that a delivery leaves behind, the circuit row of an endpoint and the bucket row
- * of a tenant, and ages them. Ageing is how a test lets time pass: it moves the time columns of a
- * row into the past, and the service and the database clock run unchanged.
+ * of a tenant, and ages them, as well as an event and the secret from before a rotation. Ageing is
+ * how a test lets time pass: it moves the time columns of a row into the past, and the service and
+ * the database clock run unchanged.
  */
 public final class Rows {
 
@@ -146,6 +147,23 @@ public final class Rows {
         .single();
   }
 
+  /** The delivery rows and their attempt rows, each as the text of all of its columns. */
+  public static List<String> everyColumnOf(List<UUID> deliveryIds) {
+    return TestDatabase.jdbc()
+        .sql(
+            """
+            SELECT line FROM (
+              SELECT 'delivery ' || d::text AS line FROM delivery d WHERE d.id = ANY(:ids)
+              UNION ALL
+              SELECT 'attempt ' || a::text FROM delivery_attempt a WHERE a.delivery_id = ANY(:ids)
+            ) lines
+            ORDER BY line
+            """)
+        .param("ids", deliveryIds.toArray(UUID[]::new))
+        .query(String.class)
+        .list();
+  }
+
   /**
    * The wait that the finalize of an attempt gave its delivery: from the time at which the attempt
    * was recorded to the time at which the delivery is due next. An attempt row holds when the
@@ -254,6 +272,36 @@ public final class Rows {
             """)
         .param("seconds", by.toNanos() / 1e9)
         .param("t", tenantId)
+        .update();
+  }
+
+  /** Moves the creation of an event into the past. Its deliveries keep their times. */
+  public static void ageEvent(UUID eventId, Duration by) {
+    TestDatabase.jdbc()
+        .sql(
+            """
+            UPDATE event SET created_at = created_at - make_interval(secs => :seconds)
+            WHERE id = :id
+            """)
+        .param("seconds", by.toNanos() / 1e9)
+        .param("id", eventId)
+        .update();
+  }
+
+  /**
+   * Moves the time until which the secret from before a rotation counts into the past. An endpoint
+   * whose secret was not rotated has no such time and stays as it is.
+   */
+  public static void agePreviousSecret(UUID endpointId, Duration by) {
+    TestDatabase.jdbc()
+        .sql(
+            """
+            UPDATE endpoint
+            SET prev_secret_expires_at = prev_secret_expires_at - make_interval(secs => :seconds)
+            WHERE id = :id
+            """)
+        .param("seconds", by.toNanos() / 1e9)
+        .param("id", endpointId)
         .update();
   }
 

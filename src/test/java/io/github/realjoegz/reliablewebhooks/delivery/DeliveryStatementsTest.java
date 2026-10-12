@@ -13,10 +13,14 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 /**
- * The statements of the worker, of the circuit breaker and of the single replay are the statements
+ * The statements of the worker, of the circuit breaker and of the two replays are the statements
  * that the design writes out. Each is looked for in the design as it is in the code, with its
  * comments, apart from how its lines are laid out. The insert for an abandoned attempt is not among
  * them: the design gives its values in a sentence.
+ *
+ * <p>The design writes the columns that a replay sets once, for the replay of one delivery, and
+ * names them for the replay of many. The code has them once as well, and both statements are made
+ * of that one text.
  */
 class DeliveryStatementsTest {
 
@@ -48,7 +52,14 @@ class DeliveryStatementsTest {
         arguments("F3 failure", CircuitBreaker.COUNT_FAILURE),
         arguments("F3 probe failure", CircuitBreaker.BACK_OFF_PROBE),
         arguments("replay, endpoint lock", TenantDeliveryRepository.LOCK_ENDPOINT_FOR_REPLAY),
-        arguments("replay, re-arm", TenantDeliveryRepository.REARM));
+        arguments("replay, re-arm", TenantDeliveryRepository.REARM),
+        arguments(
+            "bulk replay, endpoint lock", TenantDeliveryRepository.LOCK_ENDPOINT_FOR_BULK_REPLAY),
+        arguments(
+            "bulk replay, re-arm",
+            TenantDeliveryRepository.REARM_OLDEST_DEAD.replace(
+                TenantDeliveryRepository.REARM_COLUMNS,
+                "SET (the same columns as the single replay)\n")));
   }
 
   private static String withoutLayout(String text) {

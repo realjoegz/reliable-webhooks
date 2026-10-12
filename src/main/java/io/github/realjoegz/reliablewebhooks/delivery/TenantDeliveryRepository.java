@@ -7,6 +7,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -67,15 +68,54 @@ public class TenantDeliveryRepository {
       WHERE d.id = :id AND d.tenant_id = :t AND e.status = 'active' FOR SHARE OF e
       """;
 
-  static final String REARM =
+  // What a replay writes to a delivery, for one delivery and for many. Each row gets a due time
+  // of its own within the 60 seconds.
+  static final String REARM_COLUMNS =
       """
-      UPDATE delivery
       SET state = 'pending', attempts = 0, replays = replays + 1, dead_reason = NULL, completed_at = NULL,
           lease_token = NULL,
           next_attempt_at = now() + random() * interval '60 seconds',
           expires_at = now() + interval '72 hours'
-      WHERE id = :id AND tenant_id = :t AND state = 'dead'
       """;
+
+  static final String REARM =
+      "UPDATE delivery\n" + REARM_COLUMNS + "WHERE id = :id AND tenant_id = :t AND state = 'dead'";
+
+  static final String ACTIVE_ENDPOINT_EXISTS =
+      """
+      SELECT EXISTS (SELECT 1 FROM endpoint
+                     WHERE id = :e AND tenant_id = :t AND status = 'active')
+      """;
+
+  // The index delivery_by_endpoint ends the count at the limit.
+  static final String COUNT_DEAD =
+      """
+      SELECT count(*) FROM (SELECT 1 FROM delivery
+                            WHERE endpoint_id = :e AND tenant_id = :t AND state = 'dead'
+                            LIMIT :rows) dead
+      """;
+
+  static final String LOCK_ENDPOINT_FOR_BULK_REPLAY =
+      "SELECT id FROM endpoint WHERE id = :e AND tenant_id = :t AND status = 'active' FOR SHARE";
+
+  // The rows are picked in a CTE, which Postgres runs once. A subquery of IN can be run again for
+  // each row that it is compared with. It then passes over the rows that the statement has
+  // re-armed already, and its LIMIT fills up with rows that nobody paid for.
+  static final String REARM_OLDEST_DEAD =
+      """
+      WITH picked AS (
+        SELECT id FROM delivery
+        WHERE endpoint_id = :e AND tenant_id = :t AND state = 'dead'
+        ORDER BY created_at, id LIMIT :k
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE delivery d
+      """
+          + REARM_COLUMNS
+          + """
+            FROM picked
+            WHERE d.id = picked.id
+            """;
 
   /**
    * A delivery as its tenant reads it. The attempts are those of its current run, and the replays
@@ -204,6 +244,55 @@ public class TenantDeliveryRepository {
           }
           boolean rearmed = jdbc.sql(REARM).param("id", id).param("t", tenantId).update() == 1;
           return rearmed ? Replay.REPLAYED : Replay.NOT_DEAD;
+        });
+  }
+
+  boolean activeEndpointExists(UUID tenantId, UUID endpointId) {
+    return jdbc.sql(ACTIVE_ENDPOINT_EXISTS)
+        .param("e", endpointId)
+        .param("t", tenantId)
+        .query(Boolean.class)
+        .single();
+  }
+
+  /** The number of dead deliveries of the endpoint, or {@code atMost} when there are more. */
+  int countDead(UUID tenantId, UUID endpointId, int atMost) {
+    return jdbc.sql(COUNT_DEAD)
+        .param("e", endpointId)
+        .param("t", tenantId)
+        .param("rows", atMost)
+        .query(Integer.class)
+        .single();
+  }
+
+  /**
+   * Makes up to {@code rows} dead deliveries of the endpoint pending again, those that were created
+   * first, each as the replay of one delivery does. Returns how many they were, or nothing when the
+   * tenant has no active endpoint with this id.
+   *
+   * <p>The endpoint is share-locked as for one delivery, so no delivery is made pending once the
+   * deletion of its endpoint has committed. A dead delivery that another transaction holds is
+   * passed over and not waited for: it is being replayed already, or deleted.
+   */
+  OptionalInt replayOldestDead(UUID tenantId, UUID endpointId, int rows) {
+    return transactions.execute(
+        transaction -> {
+          boolean endpointIsActive =
+              jdbc.sql(LOCK_ENDPOINT_FOR_BULK_REPLAY)
+                  .param("e", endpointId)
+                  .param("t", tenantId)
+                  .query(UUID.class)
+                  .optional()
+                  .isPresent();
+          if (!endpointIsActive) {
+            return OptionalInt.empty();
+          }
+          return OptionalInt.of(
+              jdbc.sql(REARM_OLDEST_DEAD)
+                  .param("e", endpointId)
+                  .param("t", tenantId)
+                  .param("k", rows)
+                  .update());
         });
   }
 

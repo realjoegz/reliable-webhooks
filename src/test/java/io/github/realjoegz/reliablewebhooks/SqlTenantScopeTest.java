@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.realjoegz.reliablewebhooks.delivery.CircuitBreaker;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository;
+import io.github.realjoegz.reliablewebhooks.ops.CancelRepository;
 import io.github.realjoegz.reliablewebhooks.ops.ExpiryRepository;
+import io.github.realjoegz.reliablewebhooks.ops.RetentionRepository;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
@@ -39,7 +41,12 @@ import org.springframework.stereotype.Repository;
 class SqlTenantScopeTest {
 
   private static final Set<Class<?>> WORKER_AND_JOB_REPOSITORIES =
-      Set.of(DeliveryRepository.class, CircuitBreaker.class, ExpiryRepository.class);
+      Set.of(
+          DeliveryRepository.class,
+          CircuitBreaker.class,
+          ExpiryRepository.class,
+          CancelRepository.class,
+          RetentionRepository.class);
 
   private static final Path MIGRATIONS = Path.of("src/main/resources/db/migration");
   private static final Pattern CREATE_TABLE = Pattern.compile("CREATE TABLE (\\w+)");
@@ -56,8 +63,11 @@ class SqlTenantScopeTest {
     assertThat(statements)
         .containsKeys(
             "EndpointRepository.FIND",
+            "EndpointRepository.SOFT_DELETE",
+            "EndpointRepository.ROTATE_SECRET",
             "EventRepository.INSERT_DELIVERIES",
             "TenantDeliveryRepository.LIST_ATTEMPTS_OF_RUN",
+            "TenantDeliveryRepository.REARM_OLDEST_DEAD",
             "TenantRepository.INSERT_BUCKET",
             "TokenBucket.CHARGE");
     assertThat(statements)

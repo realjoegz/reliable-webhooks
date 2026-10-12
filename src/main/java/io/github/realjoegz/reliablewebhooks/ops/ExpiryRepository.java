@@ -14,17 +14,19 @@ public class ExpiryRepository {
 
   static final String EXPIRE =
       """
-      WITH expired AS (
+      WITH picked AS (
+        SELECT id, lease_token IS NOT NULL AS abandoned
+        FROM delivery
+        WHERE state = 'pending' AND expires_at <= now()
+          AND NOT (lease_token IS NOT NULL AND next_attempt_at > now())     -- not leased
+        ORDER BY expires_at LIMIT 1000
+        FOR UPDATE SKIP LOCKED
+      ), expired AS (
         UPDATE delivery d
         SET state = 'dead', dead_reason = 'expired', lease_token = NULL, completed_at = now()
-        FROM (SELECT id, lease_token IS NOT NULL AS abandoned
-              FROM delivery
-              WHERE state = 'pending' AND expires_at <= now()
-                AND NOT (lease_token IS NOT NULL AND next_attempt_at > now())     -- not leased
-              ORDER BY expires_at LIMIT 1000
-              FOR UPDATE SKIP LOCKED) x
-        WHERE d.id = x.id
-        RETURNING d.id, d.replays, d.attempts, x.abandoned
+        FROM picked
+        WHERE d.id = picked.id
+        RETURNING d.id, d.replays, d.attempts, picked.abandoned
       )
       INSERT INTO delivery_attempt (delivery_id, run, attempt_no, outcome, error)
       SELECT id, replays, attempts, 'unknown', 'lease_expired' FROM expired WHERE abandoned

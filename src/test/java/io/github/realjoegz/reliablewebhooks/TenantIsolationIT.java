@@ -136,18 +136,22 @@ class TenantIsolationIT {
     }
   }
 
-  // One tenant owns an endpoint, an event and a dead delivery. Another tenant, with a key of its
-  // own, sends every request that names one of them by its id. Each is answered with 404, and the
-  // endpoint, circuit, delivery and bucket rows of the owner are afterwards what they were, column
-  // for column.
+  // One tenant owns an endpoint, two events and their two dead deliveries. Another tenant, with a
+  // key of its own, sends every request that names one of them by its id. Each is answered with
+  // 404, and the endpoint, circuit, delivery and bucket rows of the owner are afterwards what
+  // they were, column for column.
   //
-  // A replay is charged before it looks for its delivery. The replay of the foreign delivery
+  // The replay of one delivery is charged before it looks for its delivery. With a foreign id it
   // therefore costs a unit although it is refused, and the unit comes out of the bucket of the
-  // tenant that sent it. That tenant has a rate of 0, so its bucket holds what its charges left.
+  // tenant that sent it. The replay of the dead deliveries of an endpoint looks for the endpoint
+  // first, and with a foreign id it costs nothing. That tenant has a rate of 0, so its bucket
+  // holds what its charges left: one unit less.
   //
-  // The delivery is dead, which is the one state in which a replay changes it. The owner then
-  // sends the same requests: each read finds its row, and the patch and the replay change theirs.
-  // What the other tenant sent was therefore refused for its sender and for nothing else.
+  // The deliveries are dead, which is the one state in which a replay changes them. The owner
+  // then sends the same requests. Each read finds its row, the patch changes the endpoint, each
+  // of the two replays makes one delivery pending, the rotation answers with a secret, and the
+  // delete comes last and leaves no endpoint to read. What the other tenant sent was therefore
+  // refused for its sender and for nothing else.
   @Test
   void mutatingRoutesLeaveForeignTenantUntouched() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start()) {
@@ -158,9 +162,12 @@ class TenantIsolationIT {
       UUID endpoint = owner.register(http, receiver.url("/hook"), "*");
       UUID event = owner.accept(http, EVENT);
       UUID delivery = Rows.deliveryOf(event);
+      UUID secondDelivery = Rows.deliveryOf(owner.accept(http, EVENT));
       Rows.ageDelivery(delivery, BUDGET);
+      Rows.ageDelivery(secondDelivery, BUDGET);
       expiry.run();
       assertThat(Rows.delivery(delivery).state()).isEqualTo("dead");
+      assertThat(Rows.delivery(secondDelivery).state()).isEqualTo("dead");
       List<String> rows = rowsOf(owner);
       List<String> reads =
           List.of(
@@ -172,6 +179,9 @@ class TenantIsolationIT {
 
       expectNotFound(patch(other, endpoint));
       expectNotFound(other.replay(http, delivery));
+      expectNotFound(other.replayDead(http, endpoint, 10));
+      expectNotFound(other.rotateSecret(http, endpoint));
+      expectNotFound(other.delete(http, endpoint));
       for (String read : reads) {
         expectNotFound(get(other, read));
       }
@@ -183,13 +193,32 @@ class TenantIsolationIT {
         get(owner, read).expectStatus().isOk();
       }
       patch(owner, endpoint).expectStatus().isNoContent();
-      owner.replay(http, delivery).expectStatus().isNoContent();
       get(owner, "/v1/endpoints/" + endpoint)
           .expectBody()
           .jsonPath("$.event_types")
           .isEqualTo(OTHER_EVENT_TYPES.get("event_types"));
-      assertThat(Rows.delivery(delivery))
-          .isEqualTo(new Rows.Delivery("pending", 0, 1, false, null, false));
+      Rows.Delivery replayed = new Rows.Delivery("pending", 0, 1, false, null, false);
+      owner.replay(http, delivery).expectStatus().isNoContent();
+      assertThat(Rows.delivery(delivery)).isEqualTo(replayed);
+      owner
+          .replayDead(http, endpoint, 10)
+          .expectStatus()
+          .isOk()
+          .expectBody()
+          .jsonPath("$.replayed")
+          .isEqualTo(1)
+          .jsonPath("$.remaining")
+          .isEqualTo(false);
+      assertThat(Rows.delivery(secondDelivery)).isEqualTo(replayed);
+      owner
+          .rotateSecret(http, endpoint)
+          .expectStatus()
+          .isOk()
+          .expectBody()
+          .jsonPath("$.secret")
+          .exists();
+      owner.delete(http, endpoint).expectStatus().isNoContent();
+      expectNotFound(get(owner, "/v1/endpoints/" + endpoint));
     }
   }
 

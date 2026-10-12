@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -99,18 +100,14 @@ class EndpointLimitIT {
     assertThat(activeEndpointsOf(tenant)).isEqualTo(20);
   }
 
-  // No route deletes an endpoint yet, so the test sets the status that a delete will set.
   @Test
   void deletedEndpointDoesNotCountTowardsTheCap() {
     TestTenant tenant = TestTenant.create(http, "cap-after-delete");
     setCap(tenant, 1);
-    assertThat(create(tenant)).isEqualTo(HttpStatus.CREATED);
+    UUID endpoint = tenant.register(http, "https://" + HOST + "/hook", "*");
     assertThat(create(tenant)).isEqualTo(HttpStatus.CONFLICT);
 
-    TestDatabase.jdbc()
-        .sql("UPDATE endpoint SET status = 'deleted', deleted_at = now() WHERE tenant_id = :t")
-        .param("t", tenant.id())
-        .update();
+    tenant.delete(http, endpoint).expectStatus().isNoContent();
 
     assertThat(create(tenant)).isEqualTo(HttpStatus.CREATED);
     assertThat(create(tenant)).isEqualTo(HttpStatus.CONFLICT);

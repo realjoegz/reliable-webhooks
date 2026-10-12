@@ -69,6 +69,8 @@ class DeliveryWorkerTest {
   private static final String URL = "https://hooks.example.com/hook";
   private static final byte[] KEY =
       "0123456789abcdef0123456789abcdef".getBytes(StandardCharsets.UTF_8);
+  private static final byte[] KEY_BEFORE_THE_ROTATION =
+      "fedcba9876543210fedcba9876543210".getBytes(StandardCharsets.UTF_8);
   private static final byte[] BODY = "{\"id\":\"1\"}".getBytes(StandardCharsets.UTF_8);
   private static final long SIGNED_AT = 1_800_000_000;
 
@@ -107,7 +109,7 @@ class DeliveryWorkerTest {
   private final class Deliveries extends DeliveryRepository {
 
     private Optional<Loaded> loaded =
-        Optional.of(new Loaded(URL, cipher.encrypt(KEY), BODY, SIGNED_AT));
+        Optional.of(new Loaded(URL, List.of(cipher.encrypt(KEY)), BODY, SIGNED_AT));
     private Duration loadTakes = Duration.ZERO;
     private RuntimeException loadFailure;
     private boolean leaseHeld = true;
@@ -237,15 +239,34 @@ class DeliveryWorkerTest {
         .containsOnlyKeys("webhook-id", "webhook-timestamp", "webhook-signature")
         .containsEntry("webhook-id", delivery.id().toString())
         .containsEntry("webhook-timestamp", Long.toString(SIGNED_AT));
-    assertThat(
-            ReferenceVerifier.isGenuine(
-                "whsec_" + Base64.getEncoder().encodeToString(KEY),
-                sent.headers().get("webhook-id"),
-                sent.headers().get("webhook-timestamp"),
-                sent.headers().get("webhook-signature"),
-                sent.body(),
-                Instant.ofEpochSecond(SIGNED_AT)))
-        .isTrue();
+    assertThat(sent.headers().get("webhook-signature")).doesNotContain(" ");
+    assertThat(isGenuine(sent, KEY)).isTrue();
+  }
+
+  // The load returned the secret from before a rotation as well, which it does for 24 hours. The
+  // request carries a signature for each of the two, the one of the current secret first, so a
+  // subscriber that still checks with the old secret accepts it like one that has the new one.
+  @Test
+  void requestIsSignedWithTheSecretFromBeforeARotationAsWellWhileTheLoadReturnsIt()
+      throws GeneralSecurityException {
+    deliveries.loaded =
+        Optional.of(
+            new Loaded(
+                URL,
+                List.of(cipher.encrypt(KEY), cipher.encrypt(KEY_BEFORE_THE_ROTATION)),
+                BODY,
+                SIGNED_AT));
+
+    worker.attempt(claimed(1), claimStarted);
+
+    Sent sent = client.sent.getFirst();
+    String[] signatures = sent.headers().get("webhook-signature").split(" ");
+    assertThat(signatures).hasSize(2).allMatch(signature -> signature.startsWith("v1,"));
+    assertThat(isGenuine(sent, KEY)).isTrue();
+    assertThat(isGenuine(sent, KEY_BEFORE_THE_ROTATION)).isTrue();
+    assertThat(isGenuine(sent, signatures[0], KEY)).isTrue();
+    assertThat(isGenuine(sent, signatures[0], KEY_BEFORE_THE_ROTATION)).isFalse();
+    assertThat(isGenuine(sent, signatures[1], KEY_BEFORE_THE_ROTATION)).isTrue();
   }
 
   @ParameterizedTest
@@ -591,6 +612,21 @@ class DeliveryWorkerTest {
         UUID.randomUUID(),
         false,
         circuitOpen);
+  }
+
+  private static boolean isGenuine(Sent sent, byte[] key) throws GeneralSecurityException {
+    return isGenuine(sent, sent.headers().get("webhook-signature"), key);
+  }
+
+  private static boolean isGenuine(Sent sent, String signatures, byte[] key)
+      throws GeneralSecurityException {
+    return ReferenceVerifier.isGenuine(
+        "whsec_" + Base64.getEncoder().encodeToString(key),
+        sent.headers().get("webhook-id"),
+        sent.headers().get("webhook-timestamp"),
+        signatures,
+        sent.body(),
+        Instant.ofEpochSecond(SIGNED_AT));
   }
 
   private static String lineLogged(CapturedOutput output, String message) {

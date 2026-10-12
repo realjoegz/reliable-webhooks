@@ -17,6 +17,7 @@ import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Outcome;
 import io.github.realjoegz.reliablewebhooks.http.WebhookHttpClient.Response;
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
@@ -53,7 +54,7 @@ class DeliveryWorker {
   private final DeliveryRepository deliveries;
   private final CircuitBreaker circuits;
   private final WebhookHttpClient http;
-  private final SecretCipher secrets;
+  private final SecretCipher cipher;
   private final DeliveryMeters meters;
   private final FinalizeRetry finalizeRetry;
   private final DeliveryLog fields;
@@ -67,14 +68,14 @@ class DeliveryWorker {
       DeliveryRepository deliveries,
       CircuitBreaker circuits,
       WebhookHttpClient http,
-      SecretCipher secrets,
+      SecretCipher cipher,
       DeliveryMeters meters,
       WebhooksProperties properties) {
     this(
         deliveries,
         circuits,
         http,
-        secrets,
+        cipher,
         meters,
         properties.delivery(),
         properties.replicaId(),
@@ -86,7 +87,7 @@ class DeliveryWorker {
       DeliveryRepository deliveries,
       CircuitBreaker circuits,
       WebhookHttpClient http,
-      SecretCipher secrets,
+      SecretCipher cipher,
       DeliveryMeters meters,
       Delivery settings,
       String replica,
@@ -95,7 +96,7 @@ class DeliveryWorker {
     this.deliveries = deliveries;
     this.circuits = circuits;
     this.http = http;
-    this.secrets = secrets;
+    this.cipher = cipher;
     this.meters = meters;
     this.fields = new DeliveryLog(replica);
     this.finalizeRetry =
@@ -170,9 +171,9 @@ class DeliveryWorker {
   }
 
   private Outcome send(Claimed delivery, Loaded loaded) {
+    List<byte[]> keys = loaded.secrets().stream().map(cipher::decrypt).toList();
     Map<String, String> headers =
-        Signer.headers(
-            delivery.id(), loaded.signedAt(), loaded.body(), secrets.decrypt(loaded.secret()));
+        Signer.headers(delivery.id(), loaded.signedAt(), loaded.body(), keys);
     return http.send(delivery.tenantId(), URI.create(loaded.url()), headers, loaded.body());
   }
 

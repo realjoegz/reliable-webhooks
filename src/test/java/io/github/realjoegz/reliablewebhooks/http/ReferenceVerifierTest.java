@@ -10,6 +10,7 @@ import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -27,7 +28,8 @@ class ReferenceVerifierTest {
   private static final byte[] BODY =
       "{\"id\":\"1\",\"type\":\"order.created\"}".getBytes(StandardCharsets.UTF_8);
 
-  private final Map<String, String> headers = Signer.headers(DELIVERY, SIGNED_AT, BODY, KEY);
+  private final Map<String, String> headers =
+      Signer.headers(DELIVERY, SIGNED_AT, BODY, List.of(KEY));
 
   // The example of the Standard Webhooks specification. The verifier accepts a signature that
   // this service did not make, so the format is the one of the specification.

@@ -10,9 +10,10 @@ import org.springframework.test.web.servlet.client.RestTestClient;
 
 /**
  * A tenant created through the admin API of a replica, with the API key it was shown. It makes the
- * requests that the tests of several classes send as a tenant: it registers an endpoint, sends an
- * event and replays a delivery. It also has the limits and the status of the tenant set through the
- * admin API, and counts the event, endpoint and delivery rows of the tenant.
+ * requests that the tests of several classes send as a tenant: it registers an endpoint, deletes
+ * one and rotates its secret, sends an event, and replays one delivery or the dead deliveries of an
+ * endpoint. It also has the limits and the status of the tenant set through the admin API, and
+ * counts the event, endpoint and delivery rows of the tenant.
  */
 public record TestTenant(UUID id, String apiKey) {
 
@@ -107,6 +108,30 @@ public record TestTenant(UUID id, String apiKey) {
   public RestTestClient.ResponseSpec replay(RestTestClient http, UUID deliveryId) {
     return http.post()
         .uri("/v1/deliveries/{id}/replay", deliveryId)
+        .headers(headers -> headers.setBearerAuth(apiKey))
+        .exchange();
+  }
+
+  /** Asks for the replay of up to {@code limit} dead deliveries of an endpoint. */
+  public RestTestClient.ResponseSpec replayDead(RestTestClient http, UUID endpointId, int limit) {
+    return http.post()
+        .uri("/v1/endpoints/{id}/replay", endpointId)
+        .headers(headers -> headers.setBearerAuth(apiKey))
+        .contentType(MediaType.APPLICATION_JSON)
+        .body(Map.of("limit", limit))
+        .exchange();
+  }
+
+  public RestTestClient.ResponseSpec delete(RestTestClient http, UUID endpointId) {
+    return http.delete()
+        .uri("/v1/endpoints/{id}", endpointId)
+        .headers(headers -> headers.setBearerAuth(apiKey))
+        .exchange();
+  }
+
+  public RestTestClient.ResponseSpec rotateSecret(RestTestClient http, UUID endpointId) {
+    return http.post()
+        .uri("/v1/endpoints/{id}/secret/rotate", endpointId)
         .headers(headers -> headers.setBearerAuth(apiKey))
         .exchange();
   }

@@ -75,7 +75,7 @@ class FanOutIT {
     UUID oneOfSeveral = tenant.register(http, HOOK, "order.paid", "order.created");
     tenant.register(http, HOOK, "order.paid");
     tenant.register(http, HOOK, "order.created.v2", "order");
-    markDeleted(tenant.register(http, HOOK, "*"));
+    tenant.delete(http, tenant.register(http, HOOK, "*")).expectStatus().isNoContent();
     other.register(http, HOOK, "*");
 
     UUID event = accept(tenant, ORDER_CREATED);
@@ -121,10 +121,11 @@ class FanOutIT {
     assertThat(deliveriesOf(event)).isEmpty();
   }
 
-  // No route deletes an endpoint yet, so the test runs the update that a delete will run. It
-  // holds that update uncommitted until the request is seen waiting for the endpoint row. The
-  // request has matched both endpoints by then, and it reads the status of the deleted one again
-  // once the commit lets it have the row.
+  // The test makes the change of a delete in a transaction of its own, and holds it uncommitted
+  // until the request is seen waiting for the endpoint row. The request has matched both
+  // endpoints by then, and it reads the status of the deleted one again once the commit lets it
+  // have the row. EndpointDeleteIT shows the same against the statement of the delete route, and
+  // the other order of the two as well.
   @Test
   void endpointDeletedAfterTheMatchGetsNoDelivery() throws Exception {
     TestTenant tenant = TestTenant.create(http, "deleted-after-match");
@@ -166,13 +167,6 @@ class FanOutIT {
 
   private UUID eventIdIn(ExchangeResult accepted) {
     return UUID.fromString(json.readTree(accepted.getResponseBodyContent()).get("id").asString());
-  }
-
-  private static void markDeleted(UUID endpointId) {
-    TestDatabase.jdbc()
-        .sql("UPDATE endpoint SET status = 'deleted', deleted_at = now() WHERE id = :id")
-        .param("id", endpointId)
-        .update();
   }
 
   private static List<Delivery> deliveriesOf(UUID eventId) {

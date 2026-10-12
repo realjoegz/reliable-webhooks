@@ -126,10 +126,14 @@ public class DeliveryRepository {
       boolean abandoned,
       boolean circuitOpen) {}
 
-  /** What the request of an attempt is made of. The timestamp is the database clock in seconds. */
-  record Loaded(String url, byte[] secret, byte[] body, long signedAt) {
+  /**
+   * What the request of an attempt is made of. The secrets are as they are stored: the one of the
+   * endpoint and, for 24 hours after a rotation, the one before it. The timestamp is the database
+   * clock in seconds.
+   */
+  record Loaded(String url, List<byte[]> secrets, byte[] body, long signedAt) {
 
-    /** Leaves out the URL, the secret and the body, none of which may reach a log. */
+    /** Leaves out the URL, the secrets and the body, none of which may reach a log. */
     @Override
     public String toString() {
       return "Loaded[signedAt=%d]".formatted(signedAt);
@@ -224,18 +228,23 @@ public class DeliveryRepository {
 
   /**
    * Empty when the token is no longer the lease of the delivery, or its endpoint has been deleted.
+   * Whether the secret before a rotation still counts is decided by the statement, on the database
+   * clock.
    */
   Optional<Loaded> load(Claimed delivery) {
     return jdbc.sql(LOAD)
         .param("id", delivery.id())
         .param("token", delivery.leaseToken())
         .query(
-            (row, n) ->
-                new Loaded(
-                    row.getString("url"),
-                    row.getBytes("secret"),
-                    row.getBytes("body"),
-                    row.getLong("signed_at")))
+            (row, n) -> {
+              byte[] secret = row.getBytes("secret");
+              byte[] previous = row.getBytes("prev_secret");
+              return new Loaded(
+                  row.getString("url"),
+                  previous == null ? List.of(secret) : List.of(secret, previous),
+                  row.getBytes("body"),
+                  row.getLong("signed_at"));
+            })
         .optional();
   }
 

@@ -5,8 +5,10 @@ import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -27,15 +29,21 @@ public final class Signer {
   private Signer() {}
 
   /**
-   * The three headers of a request for the delivery. The timestamp is in Unix seconds, and the key
-   * is the 32 bytes that the secret of the endpoint carries.
+   * The three headers of a request for the delivery. The timestamp is in Unix seconds, and a key is
+   * the 32 bytes that a secret of the endpoint carries. The signature header holds one signature
+   * for each key, in the order of the keys and separated by spaces. A subscriber that knows one of
+   * the secrets finds its signature among them.
    */
   public static Map<String, String> headers(
-      UUID deliveryId, long timestamp, byte[] body, byte[] key) {
+      UUID deliveryId, long timestamp, byte[] body, List<byte[]> keys) {
     Map<String, String> headers = new LinkedHashMap<>();
     headers.put(ID, deliveryId.toString());
     headers.put(TIMESTAMP, Long.toString(timestamp));
-    headers.put(SIGNATURE, VERSION + signature(deliveryId, timestamp, body, key));
+    headers.put(
+        SIGNATURE,
+        keys.stream()
+            .map(key -> VERSION + signature(deliveryId, timestamp, body, key))
+            .collect(Collectors.joining(" ")));
     return headers;
   }
 

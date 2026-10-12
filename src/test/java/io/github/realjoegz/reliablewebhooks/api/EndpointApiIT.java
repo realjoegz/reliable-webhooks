@@ -11,11 +11,15 @@ import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,6 +42,7 @@ class EndpointApiIT {
   private static final String URL = "https://" + HOST + "/hooks/1";
   private static final String SECRET_FORMAT = "whsec_[A-Za-z0-9+/]{43}=";
   private static final String ISO_INSTANT = "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z";
+  private static final Duration OVERLAP = Duration.ofHours(24);
 
   @Autowired RestTestClient http;
   @Autowired StubDns dns;
@@ -265,28 +270,78 @@ class EndpointApiIT {
 
     expectNotFound(read(tenant, UUID.randomUUID()));
     expectNotFound(patch(tenant, UUID.randomUUID(), Map.of("event_types", List.of("*"))));
+    expectNotFound(tenant.rotateSecret(http, UUID.randomUUID()));
+    expectNotFound(tenant.delete(http, UUID.randomUUID()));
   }
 
-  // No route deletes an endpoint yet, so the test sets the status that a delete will set.
+  // The row of a deleted endpoint stays, with its status and the time of the delete. For the
+  // tenant the endpoint is gone: no route finds it, and a second delete finds none either.
   @Test
-  void deletedEndpointIsNeitherListedNorReadNorPatched() {
+  void deletedEndpointIsNeitherListedNorReadNorPatchedNorDeletedAgain() {
     TestTenant tenant = TestTenant.create(http, "deleted");
     UUID id = create(tenant, URL, List.of("*"));
     UUID kept = create(tenant, URL, List.of("*"));
 
-    TestDatabase.jdbc()
-        .sql("UPDATE endpoint SET status = 'deleted', deleted_at = now() WHERE id = :id")
-        .param("id", id)
-        .update();
+    tenant.delete(http, id).expectStatus().isNoContent().expectBody().isEmpty();
 
+    assertThat(statusAndWhetherDeletedAtIsSet(id)).isEqualTo("deleted, true");
+    assertThat(statusAndWhetherDeletedAtIsSet(kept)).isEqualTo("active, false");
     expectNotFound(read(tenant, id));
     expectNotFound(patch(tenant, id, Map.of("event_types", List.of("order.paid"))));
+    expectNotFound(tenant.rotateSecret(http, id));
+    expectNotFound(tenant.delete(http, id));
     list(tenant)
         .expectBody()
         .jsonPath("$.length()")
         .isEqualTo(1)
         .jsonPath("$[0].id")
         .isEqualTo(kept.toString());
+  }
+
+  // A rotation answers with a new secret, once, and stores it as the secret of the endpoint. The
+  // secret that it replaces is kept beside it, for 24 hours of the database clock. A second
+  // rotation keeps the secret of the first, and the one from before the first is gone.
+  @Test
+  void rotationShowsTheNewSecretOnceAndKeepsTheOneBeforeItForTwentyFourHours() {
+    TestTenant tenant = TestTenant.create(http, "rotation");
+    TestTenant.Endpoint endpoint = tenant.registerForSecret(http, URL, "*");
+    assertThat(storedSecretsOf(endpoint.id())).containsExactly(endpoint.secret(), null);
+    assertThat(previousSecretExpiresAt(endpoint.id())).isEmpty();
+
+    Instant before = databaseClock();
+    Map<String, String> answer =
+        tenant
+            .rotateSecret(http, endpoint.id())
+            .expectStatus()
+            .isOk()
+            .expectHeader()
+            .cacheControl(CacheControl.noStore())
+            .expectBody(new ParameterizedTypeReference<Map<String, String>>() {})
+            .returnResult()
+            .getResponseBody();
+    Instant after = databaseClock();
+    String rotated = answer.get("secret");
+
+    assertThat(answer).containsOnlyKeys("secret");
+    assertThat(rotated).matches(SECRET_FORMAT).isNotEqualTo(endpoint.secret());
+    assertThat(storedSecretsOf(endpoint.id())).containsExactly(rotated, endpoint.secret());
+    assertThat(previousSecretExpiresAt(endpoint.id()))
+        .hasValueSatisfying(
+            expiresAt ->
+                assertThat(expiresAt).isBetween(before.plus(OVERLAP), after.plus(OVERLAP)));
+    String shown =
+        read(tenant, endpoint.id()).expectBody(String.class).returnResult().getResponseBody();
+    assertThat(shown).doesNotContain(rotated.substring("whsec_".length()));
+
+    String rotatedAgain =
+        tenant
+            .rotateSecret(http, endpoint.id())
+            .expectBody(new ParameterizedTypeReference<Map<String, String>>() {})
+            .returnResult()
+            .getResponseBody()
+            .get("secret");
+
+    assertThat(storedSecretsOf(endpoint.id())).containsExactly(rotatedAgain, rotated);
   }
 
   @Test
@@ -484,6 +539,50 @@ class EndpointApiIT {
         .contentType(MediaType.APPLICATION_JSON)
         .body(body)
         .exchange();
+  }
+
+  /**
+   * The secret of an endpoint and the one from before its last rotation, each in the form in which
+   * a tenant is shown a secret. The second is null when the endpoint keeps none.
+   */
+  private List<String> storedSecretsOf(UUID endpointId) {
+    return TestDatabase.jdbc()
+        .sql("SELECT secret, prev_secret FROM endpoint WHERE id = :id")
+        .param("id", endpointId)
+        .query(
+            (row, n) ->
+                Arrays.asList(shown(row.getBytes("secret")), shown(row.getBytes("prev_secret"))))
+        .single();
+  }
+
+  private String shown(byte[] stored) {
+    return stored == null
+        ? null
+        : "whsec_" + Base64.getEncoder().encodeToString(cipher.decrypt(stored));
+  }
+
+  /** Until when the secret from before the last rotation counts. Empty when none is kept. */
+  private static Optional<Instant> previousSecretExpiresAt(UUID endpointId) {
+    return TestDatabase.jdbc()
+        .sql("SELECT prev_secret_expires_at FROM endpoint WHERE id = :id")
+        .param("id", endpointId)
+        .query(
+            (row, n) ->
+                Optional.ofNullable(row.getObject(1, OffsetDateTime.class))
+                    .map(OffsetDateTime::toInstant))
+        .single();
+  }
+
+  private static Instant databaseClock() {
+    return TestDatabase.jdbc().sql("SELECT now()").query(OffsetDateTime.class).single().toInstant();
+  }
+
+  private static String statusAndWhetherDeletedAtIsSet(UUID endpointId) {
+    return TestDatabase.jdbc()
+        .sql("SELECT status || ', ' || (deleted_at IS NOT NULL) FROM endpoint WHERE id = :id")
+        .param("id", endpointId)
+        .query(String.class)
+        .single();
   }
 
   private static void openCircuit(UUID endpointId, String nextProbeAt) {

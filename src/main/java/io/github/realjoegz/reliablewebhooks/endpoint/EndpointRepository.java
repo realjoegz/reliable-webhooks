@@ -52,6 +52,19 @@ public class EndpointRepository {
       WHERE id = :id AND tenant_id = :t AND status = 'active'
       """;
 
+  static final String SOFT_DELETE =
+      """
+      UPDATE endpoint SET status = 'deleted', deleted_at = now()
+      WHERE id = :id AND tenant_id = :t AND status = 'active'
+      """;
+
+  static final String ROTATE_SECRET =
+      """
+      UPDATE endpoint
+      SET prev_secret = secret, prev_secret_expires_at = now() + interval '24 hours', secret = :secret
+      WHERE id = :id AND tenant_id = :t AND status = 'active'
+      """;
+
   private final JdbcClient jdbc;
   private final TransactionTemplate transactions;
 
@@ -106,6 +119,37 @@ public class EndpointRepository {
   public boolean setEventTypes(UUID tenantId, UUID id, List<String> eventTypes) {
     return jdbc.sql(SET_EVENT_TYPES)
             .param("event_types", eventTypes.toArray(String[]::new))
+            .param("id", id)
+            .param("t", tenantId)
+            .update()
+        == 1;
+  }
+
+  /**
+   * Marks the endpoint as deleted, and returns false when the tenant has no active endpoint with
+   * this id. It is one statement on the row of the endpoint and touches no delivery, however many
+   * wait for the endpoint.
+   *
+   * <p>The statement needs the row for itself. An ingest or a replay that is creating or re-arming
+   * a delivery for the endpoint holds a share lock on it, so the delete waits until that
+   * transaction has ended. One that comes later waits for the delete, and then reads the status
+   * under its own lock. Once the delete has committed, no delivery is created or re-armed for the
+   * endpoint, and neither the claim nor the load of an attempt finds it.
+   */
+  public boolean delete(UUID tenantId, UUID id) {
+    return jdbc.sql(SOFT_DELETE).param("id", id).param("t", tenantId).update() == 1;
+  }
+
+  /**
+   * Makes the given secret the one of the endpoint, and keeps the one that it replaces for 24 hours
+   * of the database clock. Returns false when the tenant has no active endpoint with this id.
+   *
+   * <p>One secret is kept. A second rotation inside the 24 hours replaces it, and the secret from
+   * before the first rotation is no longer signed with.
+   */
+  boolean rotateSecret(UUID tenantId, UUID id, byte[] encryptedSecret) {
+    return jdbc.sql(ROTATE_SECRET)
+            .param("secret", encryptedSecret)
             .param("id", id)
             .param("t", tenantId)
             .update()

@@ -189,15 +189,14 @@ class DeliveryApiIT {
         list(tenant, UUID.randomUUID(), "pending", null, null), "No endpoint has this id");
   }
 
-  // No route deletes an endpoint yet, so the test sets the status that a delete will set. The
-  // endpoint itself is no longer read, and its deliveries still are.
+  // The endpoint itself is no longer read, and its deliveries still are.
   @Test
   void deliveriesOfADeletedEndpointAreStillListed() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start()) {
       TestTenant tenant = TestTenant.create(http, "list-deleted-endpoint");
       UUID endpoint = tenant.register(http, receiver.url("/hook"), "*");
       UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
-      markDeleted(endpoint);
+      tenant.delete(http, endpoint).expectStatus().isNoContent();
 
       http.get()
           .uri("/v1/endpoints/{id}", endpoint)
@@ -398,9 +397,9 @@ class DeliveryApiIT {
     }
   }
 
-  // No route deletes an endpoint yet, so the test sets the status that a delete will set. The
-  // delivery is dead, so the status of its endpoint is all that stands against the replay: once
-  // the endpoint is active again, the same request is accepted.
+  // The delivery is dead, so the status of its endpoint is all that stands against the replay.
+  // No route makes a deleted endpoint active again. The test writes that status itself, and the
+  // same request is then accepted.
   @Test
   void replayOfADeliveryWhoseEndpointWasDeletedIsNotFound() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start()) {
@@ -409,7 +408,7 @@ class DeliveryApiIT {
       UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
       Rows.ageDelivery(delivery, BUDGET);
       expiry.run();
-      markDeleted(endpoint);
+      tenant.delete(http, endpoint).expectStatus().isNoContent();
       String dead = rowOf(delivery);
 
       expectNotFound(
@@ -558,13 +557,6 @@ class DeliveryApiIT {
         .param("endpoint", endpointId)
         .query(UUID.class)
         .single();
-  }
-
-  private static void markDeleted(UUID endpointId) {
-    TestDatabase.jdbc()
-        .sql("UPDATE endpoint SET status = 'deleted', deleted_at = now() WHERE id = :id")
-        .param("id", endpointId)
-        .update();
   }
 
   /** The delivery row as the text of all of its columns. */

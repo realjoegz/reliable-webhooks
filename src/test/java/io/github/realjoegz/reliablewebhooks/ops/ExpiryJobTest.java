@@ -8,10 +8,7 @@ import io.github.realjoegz.reliablewebhooks.delivery.DeliveryMeters;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
@@ -20,7 +17,6 @@ import org.junit.jupiter.api.Test;
 class ExpiryJobTest {
 
   private static final Duration SIXTY_SECONDS = Duration.ofSeconds(60);
-  private static final Duration FAR_LONGER_THAN_A_TEST_WAITS = Duration.ofMinutes(5);
   private static final Duration TIME_LIMIT = Duration.ofSeconds(10);
 
   private final MeterRegistry registry = new SimpleMeterRegistry();
@@ -57,34 +53,6 @@ class ExpiryJobTest {
         throw failure;
       }
       return attemptRowsOfARun;
-    }
-  }
-
-  /**
-   * Keeps how long the loop wanted to wait, and waits far longer than that. A wait therefore ends
-   * when the job is stopped or when the test says that its time is up, and not because the time
-   * that the loop asked for has passed.
-   */
-  private static final class Waits implements ExpiryJob.Wait {
-
-    private final List<Duration> asked = new CopyOnWriteArrayList<>();
-    private final AtomicBoolean timeIsUp = new AtomicBoolean();
-    private volatile Semaphore permits;
-
-    // A permit from the test stands for the time that has passed. Only a permit from the job is a
-    // stop.
-    @Override
-    public boolean forPermit(Semaphore permits, Duration atMost) throws InterruptedException {
-      this.permits = permits;
-      asked.add(atMost);
-      boolean permitted =
-          permits.tryAcquire(FAR_LONGER_THAN_A_TEST_WAITS.toNanos(), TimeUnit.NANOSECONDS);
-      return permitted && !timeIsUp.getAndSet(false);
-    }
-
-    private void timeIsUp() {
-      timeIsUp.set(true);
-      permits.release();
     }
   }
 

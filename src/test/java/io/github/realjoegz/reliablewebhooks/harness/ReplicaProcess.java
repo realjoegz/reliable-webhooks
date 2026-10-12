@@ -23,8 +23,8 @@ import org.springframework.test.web.servlet.client.RestTestClient;
 /**
  * A replica that runs as a process of its own: the packaged jar in a child JVM, connected to {@link
  * TestDatabase}, listening on a free port. It is what a test sends a real signal to. Nothing of it
- * is left to the test: its delivery worker and its expiry job run as they do in production, so a
- * test has to expect that it claims whatever is due.
+ * is left to the test: its delivery worker and its jobs run as they do in production, so a test has
+ * to expect that it claims whatever is due.
  *
  * <p>It runs with the shipped configuration and the {@code unsafe-local} profile, like the replica
  * of {@link UnsafeLocalReplica}, so it can deliver to {@link FaultReceiver}. The jar does not hold
