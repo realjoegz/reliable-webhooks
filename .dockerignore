@@ -1,0 +1,7 @@
+# The image is built from the Maven wrapper, the POM and the main sources. Nothing else of the
+# checkout reaches the build, so no local file can end up in a layer.
+*
+!.mvn
+!mvnw
+!pom.xml
+!src/main

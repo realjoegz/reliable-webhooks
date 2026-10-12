@@ -35,3 +35,33 @@ jobs:
             target/surefire-reports
             target/failsafe-reports
           if-no-files-found: ignore
+
+  local-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: docker compose build
+
+      - run: docker compose up --detach --wait
+
+      - run: scripts/demo.sh
+
+      - run: scripts/check-observability.sh
+
+      # The JVM is the process of the container, so a stop sends it the SIGTERM that starts the
+      # drain. It leaves 143 when it ended by itself, and 137 when it was killed after the 30 s
+      # that a stop allows it.
+      - run: |
+          docker compose stop replica-2
+          container=$(docker compose ps --all --quiet replica-2)
+          exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container")
+          echo "replica-2 exited with $exit_code"
+          test "$exit_code" = 143
+
+      - if: failure()
+        run: docker compose logs --no-color
+
+      - if: always()
+        run: docker compose down --volumes

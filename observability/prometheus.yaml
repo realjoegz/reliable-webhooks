@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: reliable-webhooks
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - replica-1:8080
+          - replica-2:8080

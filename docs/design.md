@@ -921,7 +921,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 9. **Unauthenticated floods** (invalid keys, slow request bodies) reach the service and, for the key lookup, the database. That belongs to the ingress.
 10. **Endpoint ownership is not verified.** A tenant can aim signed POSTs at any public host, up to its own rate. There is no per-destination limit across endpoints. The operator's lever is suspension.
 11. **The SSRF policy works at the IP layer.** It cannot see an internal service on public address space or a public proxy that forwards inward. HTTP proxies are unsupported.
-12. **A stuck native DNS lookup holds its thread** until the OS resolver gives up. The image should set short resolver timeouts.
+12. **A stuck native DNS lookup holds its thread** until the OS resolver gives up. The image asks the resolver for a shorter wait (section 15): it sets `RES_OPTIONS` to `timeout:1 attempts:2`. By `resolv.conf(5)` the resolver of glibc reads the variable and then waits 1 s for a name server and asks it twice, where its defaults are 5 s and twice. That is for each name server and each name that the resolver tries, and a search list makes it try several names. No test measures the wait: the options are set, and what they do is what the manual of the resolver says. An image on another C library would not read the variable, and would have to get the options through `/etc/resolv.conf`, which the container runtime writes.
 13. **The breaker counts consecutive failures only.** An endpoint that fails most of the time, or is slow but successful, never opens. Backoff and the bulkhead are the only protection there.
 14. **Probes consume an attempt** of whichever held delivery wins the gate.
 15. **A delete or a suspension does not recall a request already claimed.** If the cancel wins the race, the result of such a request is not recorded.
@@ -1110,6 +1110,32 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
 - An attempt already in flight is recorded as what it was, unless the cancel reaches its row first (limitation 15).
 
 **Tenant suspension** is the patch statement of section 5 with `status` alone. It writes the tenant row and no delivery rows.
+
+**Container image.** The `Dockerfile` builds the jar with the Maven wrapper on a JDK 21 image and unpacks it into the layers of Spring Boot, so the libraries are a layer that a change to the service does not rebuild. The image that runs is `gcr.io/distroless/java21-debian13`: a JRE on glibc, without a shell or a package manager. Both base images are pinned by digest.
+
+- The process of the container is the JVM, started with `-XX:+ExitOnOutOfMemoryError`, which the startup invariants demand. The SIGTERM of a stop reaches it and starts the drain above. The CI job of the local stack stops a replica and requires the exit code 143.
+- It runs as the user 65532 and not as root.
+- It writes to `/tmp` and nowhere else, because Tomcat creates its working directory there when it starts. With a writable `/tmp` mounted, the root filesystem can be read-only.
+- `RES_OPTIONS` is set to `timeout:1 attempts:2`, which asks the resolver of glibc for a shorter wait for a name server (limitation 12).
+- The image holds no credential, and the build takes none: only the Maven wrapper, the POM and the main sources reach it. The database URL with its user and password, the admin token and the secret-encryption key come from the environment of the container.
+
+**Local stack.** `compose.yaml` runs that image on one machine: two replicas on one PostgreSQL, the example subscriber, Prometheus, which scrapes both replicas, Grafana with one dashboard on the meters of section 10, and Jaeger, which the replicas export their spans to. It is for development and for nothing else:
+
+- The replicas run with the `unsafe-local` profile and the allowance of section 11.4: plain `http`, and the address range of the network of the stack, where the subscriber is. A tenant of the stack can therefore aim a delivery at any container of it.
+- Its credentials are development values and are written in the file.
+- The replicas sample every trace, so that each event of a run has its trace. A replica samples a tenth of them unless `management.tracing.sampling.probability` says otherwise.
+- The replicas have a read-only root filesystem with a `/tmp` in memory, and 30 s to stop.
+- On a new stack, `docker compose up --wait` returns once the database accepts connections, the subscriber listens and Prometheus has scraped both replicas. A counter that was scraped before its first event shows that event as an increase, which is what the dashboard draws.
+- That check of Prometheus is no check of the replicas, whose image has no shell for one of their own. A scrape of the last hour counts for it, so Prometheus stays healthy while a replica is stopped or replaced, and the command then returns before that replica takes requests. `scripts/demo.sh` therefore waits for the readiness probe of both replicas before its first request.
+- Every port that the stack publishes is bound to the loopback address of the machine. Grafana, Prometheus and Jaeger have the ports that the README links. The replicas and the subscriber get ports that Docker chooses, which `docker compose port` prints, so the stack needs those three ports free and no others.
+
+`examples/subscriber/Subscriber.java` is the subscriber of the stack: one file that the `java` command of a JDK compiles and starts, and a JRE cannot. The stack runs it on the JDK image of the build, at the same digest, as a user that is not root. It checks a request with a copy of the reference verifier (section 11.3), which `ReferenceVerifierTest#exampleSubscriberCarriesTheVerifier` holds to the original, prints the request and answers `200`, or `401` when the request is not genuine. It is given its signing secret with `PUT /secret`, and `PUT /status` sets the status that it answers a genuine request with, which makes it a subscriber that fails.
+
+`scripts/demo.sh` is the walk through the API on that stack: it creates a tenant, registers the subscriber as an endpoint, sends an event to one replica, reads the delivery from the other until it has succeeded and finds the line in which the subscriber reports the signature of that delivery as verified. It then sends the subscriber a request with a signature that the secret does not give, which is answered with `401`. Last it tells the subscriber to answer `503` and sends a second event. The first attempt of that delivery fails, the subscriber is told to answer `200` again, and the retry succeeds, 5 to 10 s after the failure (section 8). The subscriber has then verified two requests with the `webhook-id` of that delivery. The script ends with an error when a step fails.
+
+`scripts/check-observability.sh` asks the stack for what the demo left in it. Grafana has to serve the dashboard and to return a number for every query of it. Grafana runs each query through the data source of its panel, over the time range of the dashboard, as it does for the page. Jaeger has to return a trace of the service `reliable-webhooks` with the span of an attempt that succeeded.
+
+The job `local-stack` of the CI workflow builds the image, starts the stack, runs both scripts and then stops a replica, which has to end with the exit code 143.
 
 ## 16. Test strategy and harness
 

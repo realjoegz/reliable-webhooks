@@ -10,7 +10,7 @@ What it does today:
 - **It keeps running when the database does not.** While the database restarts, a replica answers an event with `503` and goes on. A result that it could not record is recorded if the database is back within 55 seconds of the claim. After that the result is given up, and the delivery is sent again once its lease has run out.
 - **It keeps endpoints and tenants apart, and connects to public addresses only.** A slow endpoint, a host whose lookup never answers, a tenant with a deep backlog or a tenant that floods the API does not keep another tenant waiting.
 
-Every feature of the service that the design describes is built, and [Current state](#current-state) lists them. What remains lies outside the service: packaging and load testing. The design is in [docs/design.md](docs/design.md).
+Every feature of the service that the design describes is built, and [Current state](#current-state) lists them. What remains lies outside the service: a deployment and load testing. The design is in [docs/design.md](docs/design.md).
 
 ## Failure table
 
@@ -69,7 +69,7 @@ Built and tested:
 - **Outbound client.** One client sends every request. It keeps no cookies, follows no redirect, asks for no compressed response and sends no request a second time, also not after a 429 or a 503. It reads a status line and header lines of up to 8 KiB each, with their line ends, and up to 100 headers. A response beyond that is a failed attempt, recorded as `response_too_large`. It reads 64 KiB of a body and then closes the connection without reading the rest, which does not change the outcome of the attempt. Cutting a response costs its own connection and nothing else: a request of another tenant that is open to the same host at that moment is answered, and its delivery succeeds.
 - **Address check at connect time.** The client looks a host up through the same bounded lookups as registration and connects only to addresses that the lookup returned and the address policy allows. An address literal in a URL takes the same path. A host that resolved to a public address when its endpoint was registered and resolves to a private one at delivery gets no connection. When a replica has no room for a lookup, the delivery is given back for 2 seconds without an attempt being counted or recorded.
 - **Isolation.** An endpoint that does not answer has four requests open and no more, and deliveries for another endpoint of its tenant and for another tenant succeed meanwhile. A host whose lookup never answers fails an attempt as `timeout` after the 2 seconds that a lookup may take. No more than four lookups of its tenant are stuck at a time, and another tenant is delivered meanwhile. The tenant itself waits while they are stuck: a delivery for another of its endpoints, whose host does resolve, is given back without an attempt, and its first attempt succeeds once the resolver answers again. A tenant has at most 16 attempts in flight. While 16 are held, its other deliveries stay unclaimed, also those for an endpoint with nothing in flight, and another tenant is delivered meanwhile. With 2,000 deliveries due for one endpoint that answers at once, a newer delivery of another tenant arrives before a tenth of them have. These are rows 13 to 15 of the failure table.
-- **Local allowance.** `webhooks.ssrf.allow-cidrs` lets address ranges through that the policy would deny, and `webhooks.ssrf.allow-http` lets an endpoint use `http`. Both are for tests. The gauge `webhooks.ssrf.allowlist.entries` holds the number of allowed ranges.
+- **Local allowance.** `webhooks.ssrf.allow-cidrs` lets address ranges through that the policy would deny, and `webhooks.ssrf.allow-http` lets an endpoint use `http`. Both are for tests and for the stack of [Run it locally](#run-it-locally). The gauge `webhooks.ssrf.allowlist.entries` holds the number of allowed ranges.
 - **Stopping.** A replica that gets a SIGTERM takes itself out of readiness and stops its poller, which claims nothing from then on. The attempts that are in flight finish and record their results, and the web server still answers while they do. Then the process ends by itself with exit code 143. A delivery that is due and was not claimed stays as it is. This is row 20 of the failure table.
 - **Kills.** The tests kill a replica with SIGKILL at the six points of the [kill table](docs/failure-table.md#kill-table). Killed inside its ingest transaction, it leaves no event, and the same key is accepted afterwards. Killed after the commit, it leaves the event with its deliveries, and the same key is answered as a repeat. Killed after a claim, in the middle of a request or after the response and before its commit, it leaves a lease that runs out. The replica that claims the delivery then logs the attempt of the dead one as `unknown` and delivers. These are rows 1 to 4. Killed in the middle of a probe, it leaves the probe slot taken for 60 seconds and nothing to clean up, and the next probe comes after that. No kill lands while an endpoint or a tenant is created. That neither is left half created is tested with those two transactions failing without a kill.
 - **Liveness.** `/actuator/health/liveness` reports a replica as down when the loop of its poller has finished no iteration for 60 seconds, and as up again once it has. The readiness probe does not ask the poller. A claim that fails ends its iteration like any other, so a database that is down does not make a replica look dead.
@@ -90,7 +90,7 @@ Built and tested:
 - **Log fields.** The line that records an attempt carries the ids of its tenant, event, delivery and endpoint, the number of the attempt, its outcome and reason, the state that it left the delivery in, the replica, and the trace id and span id of the span of that attempt. A line that is logged while a route handles a request carries the trace id and span id of the request, the replica and, on a tenant route, the tenant. Of a subscriber URL, a line and a span hold the host and nothing else. A marker in the path and the query of such a URL is in no line that a replica wrote, in no span that it exported and in no scrape, and no line holds the API key, the admin token, the signing secret, a signature or the payload. This is row 32.
 - **The failure-table check.** The build deletes the old test reports, runs the tests and then fails unless every test linked from a failure table ran and passed.
 
-Not built, and outside the service: packaging and load tests. There is no container image and no deployment for the service, and it has not been run under load.
+Not built, and outside the service: a deployment and load tests. There is a container image and a stack for one machine ([Run it locally](#run-it-locally)), but no deployment to a cluster, and the service has not been run under load.
 
 ## Guarantees
 
@@ -134,6 +134,21 @@ producer --POST /v1/events--> [replica: api] --one tx--> event + delivery rows (
 - Every replica runs a poller that claims due deliveries with `FOR UPDATE SKIP LOCKED`. A claim is a lease with a random token. If the replica dies, the lease runs out and another replica takes the delivery.
 - A worker sends the signed request and records the outcome in one transaction. Only the holder of the current lease token can record anything.
 - Failed deliveries are retried on a backoff schedule and end as `dead`, and so does a delivery that is still pending after 72 hours. A `dead` delivery can be replayed. A circuit breaker per endpoint, kept in Postgres, holds the deliveries to an endpoint that is down.
+
+## Run it locally
+
+```
+docker compose up --build --detach --wait
+scripts/demo.sh
+```
+
+The first command needs Docker with Compose. It builds the image and starts PostgreSQL, two replicas, the subscriber of [examples/subscriber](examples/subscriber/Subscriber.java), Prometheus, Grafana and Jaeger. The second needs `curl` 7.82 or later and `jq` and is the API in one run: it creates a tenant, registers the subscriber as an endpoint, sends an event, reads the delivery until it has succeeded and prints the line in which the subscriber reports its signature as verified. Then the subscriber answers a forged request with `401`, and fails the first attempt of a second delivery, which succeeds with its retry. CI runs both, and then `scripts/check-observability.sh`, which asks Grafana for the data of every query of the dashboard and Jaeger for the trace of a delivery.
+
+- Grafana, <http://localhost:3000/d/reliable-webhooks>: a dashboard of the queue, the attempts, the time to success, the open circuits and the ingest results.
+- Prometheus, <http://localhost:9090/targets>: the two replicas as scrape targets.
+- Jaeger, <http://localhost:16686>: the spans that the replicas export, under the service `reliable-webhooks`.
+
+The stack is for a development machine. Its credentials are written in `compose.yaml`, and its replicas run with the `unsafe-local` profile: they deliver over plain `http` and to the private addresses of the compose network, where the subscriber is. A replica in production runs without that profile and then refuses to start with either allowance. `docker compose down --volumes` removes the stack with its data.
 
 ## Requirements
 

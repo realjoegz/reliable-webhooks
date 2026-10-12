@@ -1,0 +1,132 @@
+# The service on one machine, for development: PostgreSQL, two replicas, the example subscriber,
+# and Prometheus, Grafana and Jaeger to watch them.
+#
+# - Every password, token and key in this file is a development value. It is public and protects
+#   nothing.
+# - The replicas run with the unsafe-local profile. The subscriber has a private address and
+#   speaks plain http, so the replicas allow http and the address range of this network, and a
+#   tenant of this stack can aim a delivery at any container in it. A replica in production runs
+#   without the profile, and then refuses to start with either allowance set.
+# - Every published port is bound to the loopback address of the host.
+
+x-replica: &replica
+  build: .
+  image: reliable-webhooks:local
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment:
+    WEBHOOKS_DATABASE_URL: jdbc:postgresql://postgres:5432/webhooks
+    WEBHOOKS_DATABASE_USERNAME: webhooks
+    WEBHOOKS_DATABASE_PASSWORD: password-for-local-development-only
+    WEBHOOKS_ADMINTOKEN: admin-token-for-local-development-only
+    # The 32 bytes "secret-key-for-local-development" in base64.
+    WEBHOOKS_SECRETENCRYPTIONKEY: c2VjcmV0LWtleS1mb3ItbG9jYWwtZGV2ZWxvcG1lbnQ=
+    SPRING_PROFILES_ACTIVE: unsafe-local
+    WEBHOOKS_SSRF_ALLOWHTTP: "true"
+    # The subnet of the network at the end of this file.
+    WEBHOOKS_SSRF_ALLOWCIDRS: 172.28.0.0/24
+    MANAGEMENT_OPENTELEMETRY_TRACING_EXPORT_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+    # Spring Boot samples a tenth of the traces unless it is told otherwise. Here every event has
+    # its trace.
+    MANAGEMENT_TRACING_SAMPLING_PROBABILITY: "1.0"
+  # The image needs no writable root filesystem. Tomcat keeps a working directory under /tmp.
+  read_only: true
+  tmpfs:
+    - /tmp
+  # A replica that is stopped finishes the attempts in flight first. The design asks for 30 s.
+  stop_grace_period: 30s
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: webhooks
+      POSTGRES_USER: webhooks
+      POSTGRES_PASSWORD: password-for-local-development-only
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # Over TCP: while the image sets the database up, a server answers on the socket file only,
+      # and is stopped again before the one that stays is started.
+      test: [CMD, pg_isready, --host=127.0.0.1, --username=webhooks, --dbname=webhooks]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # The replicas and the subscriber are published on host ports that Docker chooses, so that no
+  # port has to be free for them. "docker compose port replica-1 8080" prints the address of one.
+  replica-1:
+    <<: *replica
+    ports:
+      - "127.0.0.1::8080"
+
+  replica-2:
+    <<: *replica
+    ports:
+      - "127.0.0.1::8080"
+
+  # The JDK and not a JRE, because java compiles the one source file when it starts. It is the
+  # image that the Dockerfile builds with. That image names no user, so one that is not root is
+  # named here.
+  subscriber:
+    image: eclipse-temurin:21-jdk-alpine@sha256:0bfc69a4758a86710e5c474032d28400a8bd00874766f9e8b1642ac2fd293159
+    user: "65532:65532"
+    command: [java, /subscriber/Subscriber.java, "8082"]
+    volumes:
+      - ./examples/subscriber:/subscriber:ro
+    ports:
+      - "127.0.0.1::8082"
+    healthcheck:
+      test: [CMD, nc, -z, 127.0.0.1, "8082"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./observability/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - 127.0.0.1:9090:9090
+    healthcheck:
+      # Healthy once it has scraped both replicas. "docker compose up --wait" on a new stack
+      # therefore returns with every counter scraped before its first event, and the dashboard
+      # shows that event as an increase. A scrape of the last hour counts, so Prometheus stays
+      # healthy while a replica is stopped or replaced. This is no check of the replicas, whose
+      # image has no shell for one of their own: scripts/demo.sh waits for their readiness.
+      test:
+        - CMD-SHELL
+        - >-
+          promtool query instant http://localhost:9090
+          'count(max_over_time(up[1h]) == 1) == 2' | grep -q .
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    environment:
+      # The dashboard opens without a login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - ./observability/grafana/datasource.yaml:/etc/grafana/provisioning/datasources/prometheus.yaml:ro
+      - ./observability/grafana/dashboards.yaml:/etc/grafana/provisioning/dashboards/reliable-webhooks.yaml:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - 127.0.0.1:3000:3000
+
+  # All in one process, with the traces in memory. It takes OTLP over http on port 4318.
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    ports:
+      - 127.0.0.1:16686:16686
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  postgres-data:

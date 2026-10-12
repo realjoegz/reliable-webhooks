@@ -27,6 +27,8 @@ class ReferenceVerifierTest {
   private static final Instant NOW = Instant.ofEpochSecond(SIGNED_AT);
   private static final byte[] BODY =
       "{\"id\":\"1\",\"type\":\"order.created\"}".getBytes(StandardCharsets.UTF_8);
+  private static final Path SOURCE =
+      Path.of("src/test/java/io/github/realjoegz/reliablewebhooks/http/ReferenceVerifier.java");
 
   private final Map<String, String> headers =
       Signer.headers(DELIVERY, SIGNED_AT, BODY, List.of(KEY));
@@ -181,13 +183,28 @@ class ReferenceVerifierTest {
 
   @Test
   void readmeQuotesTheVerifier() throws IOException {
-    String source =
-        Files.readString(
-            Path.of(
-                "src/test/java/io/github/realjoegz/reliablewebhooks/http/ReferenceVerifier.java"));
+    String source = Files.readString(SOURCE);
     String quoted = source.substring(source.indexOf("public final class ReferenceVerifier"));
 
     assertThat(Files.readString(Path.of("README.md"))).contains("```java\n" + quoted + "```\n");
+  }
+
+  // The example subscriber is one file outside the build, so it cannot call the verifier. It has
+  // the tolerance and the method as a copy, and what this class shows of them holds for the copy.
+  @Test
+  void exampleSubscriberCarriesTheVerifier() throws IOException {
+    String source = Files.readString(SOURCE);
+    String tolerance =
+        source.substring(
+            source.indexOf("  private static final Duration TOLERANCE"),
+            source.indexOf("  private ReferenceVerifier()"));
+    String method =
+        source.substring(
+            source.indexOf("  /**\n   * Whether a request is genuine"), source.lastIndexOf("}"));
+
+    assertThat(Files.readString(Path.of("examples/subscriber/Subscriber.java")))
+        .contains(tolerance)
+        .contains(method);
   }
 
   private boolean isGenuine(String secret, byte[] body, Instant now)
