@@ -3,17 +3,15 @@ package io.github.realjoegz.reliablewebhooks.ops;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-import io.github.realjoegz.reliablewebhooks.ReliableWebhooksApplication;
 import io.github.realjoegz.reliablewebhooks.harness.FaultReceiver;
 import io.github.realjoegz.reliablewebhooks.harness.ReplicaSettings;
 import io.github.realjoegz.reliablewebhooks.harness.ReplicaWorker;
 import io.github.realjoegz.reliablewebhooks.harness.Rows;
+import io.github.realjoegz.reliablewebhooks.harness.SelfStartedReplica;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import io.github.realjoegz.reliablewebhooks.harness.UnsafeLocalReplica;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -23,7 +21,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.web.server.context.WebServerGracefulShutdownLifecycle;
@@ -66,7 +63,8 @@ class WorkerLifecycleIT {
       tenant.register(http, receiver.url("/hook"), "*");
       UUID delivery = Rows.deliveryOf(tenant.accept(http, EVENT));
 
-      try (ConfigurableApplicationContext replica = startReplica(STARTED_BY_SPRING)) {
+      try (ConfigurableApplicationContext replica =
+          SelfStartedReplica.start(STARTED_BY_SPRING, "unsafe-local")) {
         await()
             .untilAsserted(
                 () -> assertThat(Rows.delivery(delivery).state()).isEqualTo("succeeded"));
@@ -159,22 +157,5 @@ class WorkerLifecycleIT {
       assertThat(receiver.requests()).hasSize(MAX_IN_FLIGHT_FOR_AN_ENDPOINT);
       assertThat(receiver.peakConcurrency("/hook")).isEqualTo(MAX_IN_FLIGHT_FOR_AN_ENDPOINT);
     }
-  }
-
-  // The settings go in as arguments, which count for more than the configuration that ships. The
-  // pools are small because the replicas that the build keeps have theirs open already, and the
-  // database of the tests takes a hundred connections.
-  private static ConfigurableApplicationContext startReplica(String replicaId) {
-    Map<String, String> settings = new HashMap<>(ReplicaSettings.properties(replicaId));
-    settings.put("webhooks.database.api.max-size", "4");
-    settings.put("webhooks.database.worker.max-size", "4");
-    settings.put("server.port", "0");
-    String[] arguments =
-        settings.entrySet().stream()
-            .map(setting -> "--" + setting.getKey() + "=" + setting.getValue())
-            .toArray(String[]::new);
-    return new SpringApplicationBuilder(ReliableWebhooksApplication.class)
-        .profiles("unsafe-local")
-        .run(arguments);
   }
 }

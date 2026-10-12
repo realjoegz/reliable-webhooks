@@ -15,8 +15,8 @@ import org.springframework.test.context.ContextConfiguration;
  * same replica: one application context, and so one pair of connection pools.
  *
  * <p>The replica runs with the shipped configuration, so it connects to public addresses only. Its
- * delivery worker runs only while a test has started it through {@link ReplicaWorker}, and every
- * test begins with an empty queue.
+ * delivery worker runs only while a test has started it through {@link ReplicaWorker}, its expiry
+ * job runs only when a test calls it, and every test begins with an empty queue.
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)

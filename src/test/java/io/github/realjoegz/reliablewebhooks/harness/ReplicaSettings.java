@@ -10,7 +10,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 /**
  * The settings a replica under test needs beyond the shipped configuration. As a context
  * initializer it applies them to a replica that runs inside the test JVM, and keeps the delivery
- * worker of that replica from starting with it.
+ * worker and the expiry job of that replica from starting with it.
  */
 public final class ReplicaSettings
     implements ApplicationContextInitializer<ConfigurableApplicationContext> {
@@ -43,15 +43,18 @@ public final class ReplicaSettings
   @Override
   public void initialize(ConfigurableApplicationContext context) {
     TestPropertyValues.of(properties(IN_PROCESS_REPLICA)).applyTo(context);
-    context.addBeanFactoryPostProcessor(ReplicaSettings::leaveTheWorkerToTheTests);
+    context.addBeanFactoryPostProcessor(ReplicaSettings::leaveTheWorkerAndTheExpiryJobToTheTests);
   }
 
   // Spring starts a lifecycle bean only if it is a singleton. As prototypes, the worker lifecycle
   // and its poller are not started with the replica, and ReplicaWorker gets a new pair of them
-  // for every start.
-  private static void leaveTheWorkerToTheTests(ConfigurableListableBeanFactory beans) {
+  // for every start. The expiry job is not started either, and a test that wants a run of it
+  // calls the run.
+  private static void leaveTheWorkerAndTheExpiryJobToTheTests(
+      ConfigurableListableBeanFactory beans) {
     beans.getBeanDefinition("workerLifecycle").setScope(BeanDefinition.SCOPE_PROTOTYPE);
     beans.getBeanDefinition("deliveryPoller").setScope(BeanDefinition.SCOPE_PROTOTYPE);
+    beans.getBeanDefinition("expiryJob").setScope(BeanDefinition.SCOPE_PROTOTYPE);
   }
 
   private static String jdbcUrlAs(String applicationName) {

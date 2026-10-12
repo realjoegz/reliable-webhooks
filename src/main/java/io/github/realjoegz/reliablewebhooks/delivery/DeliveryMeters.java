@@ -11,7 +11,7 @@ import org.springframework.stereotype.Component;
  * delivery or a host.
  */
 @Component
-class DeliveryMeters {
+public class DeliveryMeters {
 
   private final Map<AttemptReason, Counter> attempts = new EnumMap<>(AttemptReason.class);
   private final Counter releasedForBusyLookup;
@@ -21,7 +21,7 @@ class DeliveryMeters {
 
   // The Prometheus registry renders the names with underscores and the suffix _total, as
   // webhooks_delivery_attempts_total and so on.
-  DeliveryMeters(MeterRegistry meters) {
+  public DeliveryMeters(MeterRegistry meters) {
     for (AttemptReason reason : AttemptReason.values()) {
       attempts.put(
           reason,
@@ -40,6 +40,14 @@ class DeliveryMeters {
   /** An attempt row was written. */
   void attemptRecorded(AttemptReason reason) {
     attempts.get(reason).increment();
+  }
+
+  /**
+   * Attempt rows were written for leases that ran out with nothing recorded. The expiry job writes
+   * them as a claim does, for the deliveries that it dead-letters.
+   */
+  public void abandonedAttemptsRecorded(int rows) {
+    attempts.get(AttemptReason.LEASE_EXPIRED).increment(rows);
   }
 
   void releasedForBusyLookup() {

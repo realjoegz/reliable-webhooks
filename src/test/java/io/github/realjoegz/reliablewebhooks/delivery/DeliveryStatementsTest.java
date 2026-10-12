@@ -12,9 +12,10 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 /**
- * The statements of the worker are the statements that the design writes out. Each is looked for in
- * the design as it is in the code, with its comments, apart from how its lines are laid out. The
- * insert for an abandoned attempt is not among them: the design gives its values in a sentence.
+ * The statements of the worker and of the single replay are the statements that the design writes
+ * out. Each is looked for in the design as it is in the code, with its comments, apart from how its
+ * lines are laid out. The insert for an abandoned attempt is not among them: the design gives its
+ * values in a sentence.
  */
 class DeliveryStatementsTest {
 
@@ -32,7 +33,9 @@ class DeliveryStatementsTest {
         arguments("release", DeliveryRepository.RELEASE),
         arguments("load", DeliveryRepository.LOAD),
         arguments("F1", DeliveryRepository.FENCE_AND_CHANGE_STATE),
-        arguments("F2", DeliveryRepository.INSERT_ATTEMPT));
+        arguments("F2", DeliveryRepository.INSERT_ATTEMPT),
+        arguments("replay, endpoint lock", TenantDeliveryRepository.LOCK_ENDPOINT_FOR_REPLAY),
+        arguments("replay, re-arm", TenantDeliveryRepository.REARM));
   }
 
   private static String withoutLayout(String text) {

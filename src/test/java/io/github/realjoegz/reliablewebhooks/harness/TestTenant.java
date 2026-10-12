@@ -10,7 +10,8 @@ import org.springframework.test.web.servlet.client.RestTestClient;
 
 /**
  * A tenant created through the admin API of a replica, with the API key it was shown. It makes the
- * two requests that most tests start from, and counts the event and delivery rows of the tenant.
+ * requests that the tests of several classes send as a tenant: it registers an endpoint, sends an
+ * event and replays a delivery. It also counts the event and delivery rows of the tenant.
  */
 public record TestTenant(UUID id, String apiKey) {
 
@@ -84,6 +85,14 @@ public record TestTenant(UUID id, String apiKey) {
             .returnResult()
             .getResponseBody();
     return UUID.fromString(accepted.get("id"));
+  }
+
+  /** Asks for the replay of a delivery. What the answer has to be is up to the test. */
+  public RestTestClient.ResponseSpec replay(RestTestClient http, UUID deliveryId) {
+    return http.post()
+        .uri("/v1/deliveries/{id}/replay", deliveryId)
+        .headers(headers -> headers.setBearerAuth(apiKey))
+        .exchange();
   }
 
   public int eventRows() {

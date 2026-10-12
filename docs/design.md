@@ -39,10 +39,10 @@ Packages:
 | `tenant/` | `TenantRepository` |
 | `endpoint/` | `EndpointService`, `EndpointRepository`, `UrlPolicy`, `SecretCipher` |
 | `ingest/` | `IngestService`, `EventRepository`, `TokenBucket` |
-| `delivery/` | `DeliveryPoller`, `DeliveryWorker`, `DeliveryRepository`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
+| `delivery/` | `DeliveryPoller`, `DeliveryWorker`, `DeliveryRepository`, `TenantDeliveryRepository`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
 | `http/` | `WebhookHttpClient`, `SsrfGuardDnsResolver`, `AddressPolicy`, `DnsLookups`, `Signer` |
 | `ops/` | `WorkerLifecycle`, `StartupInvariants`, `ExpiryJob`, `CancelJob`, `RetentionJob`, `QueueGauges`, `PollerHealth` |
-| test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `UnsafeLocalReplica`, `ReplicaWorker`, `TestTenant` |
+| test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `UnsafeLocalReplica`, `ReplicaWorker`, `SelfStartedReplica`, `TestTenant` |
 | test `tools/` | `FailureTableCheck` |
 
 The table names the classes that carry the design. The value types and helpers next to them are not listed.
@@ -203,9 +203,9 @@ A named problem type such as `rate_limited` is sent as the `type` member, as a r
 | `DELETE /v1/endpoints/{id}` | Soft delete in one statement. Delivery to the endpoint stops at commit; its pending deliveries become `cancelled` in batches (section 15). |
 | `POST /v1/endpoints/{id}/secret/rotate` | New secret; the old one stays valid for 24 h. |
 | `POST /v1/endpoints/{id}/replay` | `{limit}`; re-arms up to `limit` dead deliveries. Returns `{replayed, remaining}`. |
-| `GET /v1/deliveries?endpoint_id=&state=` | Both filters are required. Keyset pages on `(created_at, id)`, `limit` at most 100, with a `next` cursor. The endpoint is resolved under the tenant first (404 otherwise). |
-| `GET /v1/deliveries/{id}` | The delivery and the attempt log of its current run (at most 13 rows). `?run=n` selects an earlier run. |
-| `POST /v1/deliveries/{id}/replay` | Re-arms one dead delivery. |
+| `GET /v1/deliveries?endpoint_id=&state=` | Both filters are required. Keyset pages on `(created_at, id)`, `limit` at most 100, with a `next` cursor. The endpoint is resolved under the tenant first (404 otherwise). `limit` is 1 to 100, and 100 when it is absent. A page that another page follows carries `next`, and the request for that page sends it back as `cursor`. A deleted endpoint still resolves, so its deliveries can be listed. |
+| `GET /v1/deliveries/{id}` | The delivery and the attempt log of its current run (at most 13 rows). `?run=n` selects an earlier run, and a run that the delivery does not have answers `404`. An attempt is shown with its number, its outcome, its status or error, its start and its duration. The address it went to and the replica that made it are not shown. An `unknown` attempt has no duration, and its start is the time at which it was logged. |
+| `POST /v1/deliveries/{id}/replay` | Re-arms one dead delivery. Returns `204`. A delivery that is not dead answers `409`, and one whose endpoint is deleted answers `404`. |
 
 **Derived circuit state.** An endpoint reads as `closed`, `open` or `half_open`. Only `closed` and `open` are stored (section 9). `half_open` is an open circuit whose `next_probe_at` has passed, which means the next claim may take one delivery to the endpoint as a probe. The read statement decides it with the database clock.
 
@@ -559,7 +559,7 @@ Circuit state is shared, but what feeds it is observed by one replica at a time.
 | `webhooks_dns_lookups_total` | `result` = ok, timeout, busy, failed, blocked |
 | `webhooks_ssrf_allowlist_entries` (gauge) | none; must be 0 in production |
 
-`webhooks_delivery_attempts_total` counts attempt rows: an attempt is counted when its finalize has committed, and an abandoned attempt (`unknown`, `lease_expired`) when the claim that found it has. An attempt whose finalize lost its lease is counted on `webhooks_finalize_lost_lease_total` only.
+`webhooks_delivery_attempts_total` counts attempt rows: an attempt is counted when its finalize has committed, and an abandoned attempt (`unknown`, `lease_expired`) when the claim or the expiry run that found it has. An attempt whose finalize lost its lease is counted on `webhooks_finalize_lost_lease_total` only.
 
 `webhooks_ingest_requests_total` counts a request that the ingest route answered with one of these results, once, when the request is over. `invalid` is a `400`, a `413` or a `422`, and `busy` is a `503`. Nothing else is counted:
 - a request that is refused before it reaches the route, by authentication or for its media type;
@@ -753,6 +753,8 @@ RETURNING b.tokens;
 
 The checked copy of this table lives in `docs/failure-table.md`, where a row appears only once the test that proves it exists. The README shows the headline rows. `FailureTableCheck` (section 16) fails the build unless every test linked from a table in either file ran and passed in the same build.
 
+Until the circuit breaker exists, the checked copy carries one provisional row under the number 9 in place of rows 9 and 10. Without a breaker, an endpoint that is down gets all twelve attempts of a delivery, so the row claims what holds then: twelve attempts, dead letter and a replay that delivers, and a pending delivery past 72 hours is dead-lettered. Its tests are `DeadLetterReplayIT#exhaustedAfterTwelveAttempts`, `#replayedDeliveryIsDeliveredOnce` and `ExpiryIT#pendingPastBudgetBecomesDead`. Rows 9 and 10 take its place when the breaker exists.
+
 | # | Failure | Proven behaviour | Test | Forced by |
 |---|---|---|---|---|
 | 1 | Worker killed mid-delivery | Redelivered after the lease; attempt 1 `unknown`, attempt 2 `success` | `WorkerKillIT#killedMidRequest` | Receiver holds the request; SIGKILL; lease aged |
@@ -876,6 +878,8 @@ The database health indicator is off. The health endpoint takes no key, so it mu
 
 The JVM then exits with code 143 (128 + SIGTERM), which is the documented exit code of a clean drain. The deployment must allow at least 30 s of termination grace. Nothing needs releasing, because nothing is claimed that has not started.
 
+`ExpiryJob` is a lifecycle of the same phase as the worker, so it stops before the pools close as well. Spring stops the lifecycles of a phase one after the other and then waits until each has reported its end, for at most the 30 s that Spring Boot gives a phase. The stop of the job starts no further run and returns at once. The job reports its end when its loop is over, which is after a run that is in progress. A slow run therefore neither delays the stop of the poller nor adds its time to the drain. It still ends before the pools close, because the time bounds of the `worker` pool (section 12) end a run inside those 30 s.
+
 **Background jobs.** They run on every replica on a timer, with no leader election. Each is an idempotent batch statement whose subquery uses `FOR UPDATE SKIP LOCKED`, so a job never waits on a row and concurrent runs are harmless.
 
 - `ExpiryJob` (every 60 s) dead-letters pending rows past `expires_at` that are not leased. An abandoned row gets its missing attempt row in the same statement:
@@ -896,6 +900,10 @@ WITH expired AS (
 INSERT INTO delivery_attempt (delivery_id, run, attempt_no, outcome, error)
 SELECT id, replays, attempts, 'unknown', 'lease_expired' FROM expired WHERE abandoned;
 ```
+
+  - The first run comes when the replica starts, and every later run 60 s after the end of the run before it.
+  - A run is this one statement, in a transaction on the `worker` pool. A statement that outlives its replica therefore cannot commit by itself (section 3).
+  - A run that fails is logged, and the next run follows after the same 60 s.
 
 - `CancelJob` (every 30 s) cancels the pending rows of deleted endpoints, 1,000 per statement, repeating while a batch is full:
 
@@ -951,6 +959,7 @@ Rules:
 - Integration tests run with production retry, breaker, lease and timeout settings. The test-profile differences are the `unsafe-local` allowance for the loopback receiver with its `http` scheme, in the classes that deliver to the receiver, and in `TracingIT` only, the sampler probability.
 - Three tests of `WebhookHttpClientIT` wait for a time bound to end a request, and their clients have a short one: an attempt deadline of 500 ms in the two that are cut at the deadline, and a lookup wait of 20 ms in the one whose lookup does not answer. The client with the short deadline is built from settings, as the application builds its client, so the bound that cuts those requests is `attempt-deadline`. A replica under test always runs with the shipped values.
 - **A replica inside the test JVM does not start its worker by itself.** The replicas of a build share one database, so a worker that ran all the time would take the deliveries of tests that are about something else, and those of a test that has to claim them itself. A test that wants deliveries sent starts the worker of its replica, or builds the pollers it needs. The worker is stopped when the test ends. One test is the exception: `WorkerLifecycleIT#replicaStartsItsWorkerByItselfAndStopsItWhenItCloses` starts a second replica the way the application starts, with nothing taken from Spring, and closes it before it ends. The attempt is recorded under the id of that replica, which shows that Spring started its worker. Its pools hold 4 connections each, because the replicas that the build keeps have theirs open.
+- **Nor does it start its expiry job.** A run that came by itself could take a delivery that a test has aged past its budget before the test is ready for it. A test that wants a run calls the run of the job. `ExpiryIT#replicaRunsItsExpiryJobByItself` is the exception here: it starts a second replica the way the application starts and waits for the first run of that replica's job. The delivery belongs to a suspended tenant, so the worker of that replica does not claim it.
 - **Every test of such a replica begins with an empty queue.** The pending deliveries that earlier tests left are deleted first. A worker that a test starts therefore sends the deliveries of that test and no others.
 
 Harness:
@@ -964,10 +973,11 @@ Harness:
 | `TcpProxy` | In-process TCP forwarder between one replica and Postgres. `blackhole()` keeps every existing connection open and relays nothing more on it, ever; new connections are accepted and ignored. `heal()` lets new connections relay again. |
 | `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. |
 | `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection with the replica id as `application_name`, an admin token and a secret-encryption key. |
-| `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker of the replica is left to the tests, and the queue is emptied before each test. |
+| `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker and the expiry job of the replica are left to the tests, and the queue is emptied before each test. |
 | `UnsafeLocalReplica` | An `InProcessReplica` with the `unsafe-local` profile and its allowance: plain `http` and the loopback address, where `FaultReceiver` listens. The classes with this annotation share a second application context. |
 | `ReplicaWorker` | Starts and stops the delivery worker of a replica inside the test JVM. Each start gets a `WorkerLifecycle` and a poller of its own from the application context, wired as the application wires them, and runs the start and stop that Spring runs. |
-| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint and sends an event as that tenant, and counts the tenant's event and delivery rows. |
+| `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker and its expiry job, and closing it stops them. |
+| `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, sends an event and replays a delivery as that tenant, and counts the tenant's event and delivery rows. |
 
 How each proof is forced.
 

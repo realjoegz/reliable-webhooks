@@ -9,13 +9,16 @@ import io.github.realjoegz.reliablewebhooks.harness.Rows;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import io.github.realjoegz.reliablewebhooks.harness.UnsafeLocalReplica;
+import io.github.realjoegz.reliablewebhooks.ops.ExpiryJob;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.client.RestTestClient;
 
 @UnsafeLocalReplica
@@ -36,9 +39,13 @@ class TenantIsolationIT {
       MAX_IN_FLIGHT_FOR_A_TENANT / MAX_IN_FLIGHT_FOR_AN_ENDPOINT;
   private static final int DEEP_BACKLOG = 2_000;
   private static final int A_TENTH_OF_THE_BACKLOG = DEEP_BACKLOG / 10;
+  private static final Duration BUDGET = Duration.ofHours(72);
+  private static final Map<String, List<String>> OTHER_EVENT_TYPES =
+      Map.of("event_types", List.of("order.paid"));
 
   @Autowired RestTestClient http;
   @Autowired ReplicaWorker worker;
+  @Autowired ExpiryJob expiry;
 
   // A tenant has five endpoints, and the receiver holds every request that it gets for them. Four
   // of the endpoints have four deliveries each. All sixteen are in flight, which is all that a
@@ -127,6 +134,103 @@ class TenantIsolationIT {
           .extracting(FaultReceiver.Request::path)
           .contains("/other-tenant");
     }
+  }
+
+  // One tenant owns an endpoint, an event and a dead delivery. Another tenant, with a key of its
+  // own, sends every request that names one of them by its id. Each is answered with 404, and the
+  // endpoint, circuit and delivery rows of the owner are afterwards what they were, column for
+  // column.
+  //
+  // The delivery is dead, which is the one state in which a replay changes it. The owner then
+  // sends the same requests: each read finds its row, and the patch and the replay change theirs.
+  // What the other tenant sent was therefore refused for its sender and for nothing else.
+  @Test
+  void mutatingRoutesLeaveForeignTenantUntouched() throws Exception {
+    try (FaultReceiver receiver = FaultReceiver.start()) {
+      TestTenant owner = TestTenant.create(http, "owner-of-the-rows");
+      TestTenant other = TestTenant.create(http, "holder-of-foreign-ids");
+      UUID endpoint = owner.register(http, receiver.url("/hook"), "*");
+      UUID event = owner.accept(http, EVENT);
+      UUID delivery = Rows.deliveryOf(event);
+      Rows.ageDelivery(delivery, BUDGET);
+      expiry.run();
+      assertThat(Rows.delivery(delivery).state()).isEqualTo("dead");
+      List<String> rows = rowsOf(owner);
+      List<String> reads =
+          List.of(
+              "/v1/endpoints/" + endpoint,
+              "/v1/events/" + event,
+              "/v1/deliveries/" + delivery,
+              "/v1/deliveries/" + delivery + "?run=0",
+              "/v1/deliveries?endpoint_id=" + endpoint + "&state=dead");
+
+      expectNotFound(patch(other, endpoint));
+      expectNotFound(other.replay(http, delivery));
+      for (String read : reads) {
+        expectNotFound(get(other, read));
+      }
+
+      assertThat(rowsOf(owner)).isEqualTo(rows);
+
+      for (String read : reads) {
+        get(owner, read).expectStatus().isOk();
+      }
+      patch(owner, endpoint).expectStatus().isNoContent();
+      owner.replay(http, delivery).expectStatus().isNoContent();
+      get(owner, "/v1/endpoints/" + endpoint)
+          .expectBody()
+          .jsonPath("$.event_types")
+          .isEqualTo(OTHER_EVENT_TYPES.get("event_types"));
+      assertThat(Rows.delivery(delivery))
+          .isEqualTo(new Rows.Delivery("pending", 0, 1, false, null, false));
+    }
+  }
+
+  private RestTestClient.ResponseSpec get(TestTenant tenant, String pathAndQuery) {
+    return http.get()
+        .uri(pathAndQuery)
+        .headers(headers -> headers.setBearerAuth(tenant.apiKey()))
+        .exchange();
+  }
+
+  private RestTestClient.ResponseSpec patch(TestTenant tenant, UUID endpointId) {
+    return http.patch()
+        .uri("/v1/endpoints/{id}", endpointId)
+        .headers(headers -> headers.setBearerAuth(tenant.apiKey()))
+        .contentType(MediaType.APPLICATION_JSON)
+        .body(OTHER_EVENT_TYPES)
+        .exchange();
+  }
+
+  private static void expectNotFound(RestTestClient.ResponseSpec response) {
+    response
+        .expectStatus()
+        .isNotFound()
+        .expectHeader()
+        .contentType(MediaType.APPLICATION_PROBLEM_JSON);
+  }
+
+  /**
+   * The endpoint, circuit and delivery rows of a tenant, each as the text of all of its columns.
+   */
+  private static List<String> rowsOf(TestTenant tenant) {
+    return TestDatabase.jdbc()
+        .sql(
+            """
+            SELECT line FROM (
+              SELECT 'endpoint ' || e::text AS line FROM endpoint e WHERE e.tenant_id = :t
+              UNION ALL
+              SELECT 'circuit ' || c::text
+              FROM endpoint_circuit c JOIN endpoint e ON e.id = c.endpoint_id
+              WHERE e.tenant_id = :t
+              UNION ALL
+              SELECT 'delivery ' || d::text FROM delivery d WHERE d.tenant_id = :t
+            ) lines
+            ORDER BY line
+            """)
+        .param("t", tenant.id())
+        .query(String.class)
+        .list();
   }
 
   // Events with one delivery each, as ingest leaves them for one matching endpoint, but an hour
