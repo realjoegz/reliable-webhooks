@@ -16,6 +16,7 @@ import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.transaction.TransactionSystemException;
 
 class FinalizeRetryTest {
 
@@ -121,6 +122,24 @@ class FinalizeRetryTest {
     assertThat(retry.run(DELIVERY, claimStarted, finalize)).isTrue();
 
     assertThat(finalize.triesAt).hasSize(2);
+  }
+
+  // The first statement of the finalize ran on a connection that the database had closed, and
+  // the rollback failed on it too. Spring throws the failure of the rollback, which has no state,
+  // and keeps the failure of the statement beside it. That one decides.
+  @Test
+  void failureBehindARollbackThatFailedIsTriedAgain() {
+    TransactionSystemException rollbackFailed =
+        new TransactionSystemException(
+            "JDBC rollback failed", new SQLException("Connection is closed"));
+    rollbackFailed.initApplicationException(databaseFailure("57P01"));
+    Finalize finalize = new Finalize(true);
+    finalize.failures.add(rollbackFailed);
+
+    assertThat(retry.run(DELIVERY, claimStarted, finalize)).isTrue();
+
+    assertThat(finalize.triesAt).hasSize(2);
+    assertThat(errors()).isZero();
   }
 
   // A constraint, a value that does not fit its column, a statement that is wrong, and a server

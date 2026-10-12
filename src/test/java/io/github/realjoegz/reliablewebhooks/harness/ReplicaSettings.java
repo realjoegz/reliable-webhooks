@@ -25,11 +25,16 @@ public final class ReplicaSettings
 
   /** The settings of a replica with the given id, which is also its application_name. */
   public static Map<String, String> properties(String replicaId) {
+    return properties(replicaId, TestDatabase.jdbcUrl());
+  }
+
+  /** The same for a replica that reaches the database at another URL, such as that of a proxy. */
+  public static Map<String, String> properties(String replicaId, String jdbcUrl) {
     return Map.of(
         "webhooks.replica-id",
         replicaId,
         "webhooks.database.url",
-        jdbcUrlAs(replicaId),
+        withApplicationName(jdbcUrl, replicaId),
         "webhooks.database.username",
         TestDatabase.username(),
         "webhooks.database.password",
@@ -57,8 +62,7 @@ public final class ReplicaSettings
     beans.getBeanDefinition("expiryJob").setScope(BeanDefinition.SCOPE_PROTOTYPE);
   }
 
-  private static String jdbcUrlAs(String applicationName) {
-    String url = TestDatabase.jdbcUrl();
-    return url + (url.contains("?") ? "&" : "?") + "ApplicationName=" + applicationName;
+  private static String withApplicationName(String jdbcUrl, String applicationName) {
+    return jdbcUrl + (jdbcUrl.contains("?") ? "&" : "?") + "ApplicationName=" + applicationName;
   }
 }

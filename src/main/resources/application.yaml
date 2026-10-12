@@ -35,6 +35,10 @@ management:
     health:
       probes:
         enabled: true
+      group:
+        liveness:
+          # A replica whose poller no longer loops is not live, whatever else still answers.
+          include: livenessState,poller
   health:
     db:
       # The health endpoint takes no key. It must not borrow connections from the pools.

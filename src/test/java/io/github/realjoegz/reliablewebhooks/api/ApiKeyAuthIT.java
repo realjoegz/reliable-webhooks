@@ -1,9 +1,11 @@
 package io.github.realjoegz.reliablewebhooks.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import io.github.realjoegz.reliablewebhooks.harness.InProcessReplica;
 import io.github.realjoegz.reliablewebhooks.harness.ReplicaSettings;
+import io.github.realjoegz.reliablewebhooks.harness.ReplicaWorker;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import java.net.URI;
 import java.util.Map;
@@ -24,6 +26,7 @@ class ApiKeyAuthIT {
   private record NewTenant(UUID id, String apiKey) {}
 
   @Autowired RestTestClient http;
+  @Autowired ReplicaWorker worker;
   @LocalServerPort int port;
 
   @Test
@@ -184,17 +187,24 @@ class ApiKeyAuthIT {
     createTenantAt(path, "Bearer " + ReplicaSettings.ADMIN_TOKEN, name).expectStatus().isCreated();
   }
 
+  // A replica is live while its poller loops, and the replica of this class leaves its worker to
+  // the tests. The probe answers UP once the worker runs and its poller has been through its loop.
   @ParameterizedTest
   @ValueSource(strings = {"/actuator/health/liveness", "/actuator/health/readiness"})
   void healthProbesNeedNoKey(String probe) {
-    http.get()
-        .uri(probe)
-        .exchange()
-        .expectStatus()
-        .isOk()
-        .expectBody()
-        .jsonPath("$.status")
-        .isEqualTo("UP");
+    worker.start();
+
+    await()
+        .untilAsserted(
+            () ->
+                http.get()
+                    .uri(probe)
+                    .exchange()
+                    .expectStatus()
+                    .isOk()
+                    .expectBody()
+                    .jsonPath("$.status")
+                    .isEqualTo("UP"));
   }
 
   // Every rejected credential gets this one answer, so the answer cannot tell which check failed.

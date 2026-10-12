@@ -139,13 +139,13 @@ class IngestMeterIT {
     awaitCounts(before.plusBusy(1));
   }
 
-  // The test ends the backend of the request while it waits for the endpoint row. A connection
-  // that broke is not a database that was busy, so the answer is a 500, which has no result. The
-  // accepted event at the end is the witness: it is counted, so the counters were at work while
-  // the request before it was not counted.
+  // The test ends the backend of the request while it waits for the endpoint row, which is what a
+  // database that shuts down does to it. The statement fails, and so does the rollback that
+  // follows it on the same connection. A failure of that kind can pass, so the answer is a 503
+  // and the request is counted as busy, like the one that waited too long.
   @Test
-  void requestAnsweredWithAStatusThatHasNoResultIsNotCounted() throws Exception {
-    TestTenant tenant = TestTenant.create(http, "meter-no-result");
+  void requestWhoseConnectionTheDatabaseEndedIsCountedAsBusy() throws Exception {
+    TestTenant tenant = TestTenant.create(http, "meter-ended");
     dns.answer(HOST, "93.184.216.34");
     UUID endpoint = tenant.register(http, "https://" + HOST + "/hook", "*");
     Counts before = counts();
@@ -165,13 +165,40 @@ class IngestMeterIT {
                       .returnResult()
                       .getStatus());
       PgWait.untilBlocked("INSERT INTO delivery", ReplicaSettings.IN_PROCESS_REPLICA);
-      endBackendBlockedIn("INSERT INTO delivery");
+      assertThat(PgWait.endBlocked("INSERT INTO delivery", ReplicaSettings.IN_PROCESS_REPLICA))
+          .isEqualTo(1);
 
-      assertThat(answer.get()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+      assertThat(answer.get()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
       blocker.rollback();
     }
+    awaitCounts(before.plusBusy(1));
+    assertThat(tenant.eventRows()).isZero();
+  }
 
-    tenant.send(http, TestTenant.newIdempotencyKey(), ORDER_17).expectStatus().isAccepted();
+  // The replica has the key of the tenant in its cache when the test deletes the row of the
+  // tenant. The next request with that key passes the authentication, and its event then names a
+  // tenant that does not exist. That is a fault and none of the results, so the answer is a 500.
+  // The accepted event of another tenant at the end is the witness: it is counted, so the
+  // counters were at work while the request before it was not counted.
+  @Test
+  void requestAnsweredWithAStatusThatHasNoResultIsNotCounted() {
+    TestTenant removed = TestTenant.create(http, "meter-no-result");
+    TestTenant witness = TestTenant.create(http, "meter-witness");
+    http.get()
+        .uri("/v1/endpoints")
+        .headers(headers -> headers.setBearerAuth(removed.apiKey()))
+        .exchange()
+        .expectStatus()
+        .isOk();
+    deleteByHand(removed);
+    Counts before = counts();
+
+    removed
+        .send(http, TestTenant.newIdempotencyKey(), ORDER_17)
+        .expectStatus()
+        .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+
+    witness.send(http, TestTenant.newIdempotencyKey(), ORDER_17).expectStatus().isAccepted();
     awaitCounts(before.plusAccepted(1));
   }
 
@@ -240,19 +267,12 @@ class IngestMeterIT {
         .exchange();
   }
 
-  private static void endBackendBlockedIn(String sqlFragment) {
+  private static void deleteByHand(TestTenant tenant) {
     TestDatabase.jdbc()
-        .sql(
-            """
-            SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-            WHERE application_name = :replica
-              AND wait_event_type = 'Lock'
-              AND strpos(query, :fragment) > 0
-            """)
-        .param("replica", ReplicaSettings.IN_PROCESS_REPLICA)
-        .param("fragment", sqlFragment)
-        .query(Boolean.class)
-        .list();
+        .sql("DELETE FROM rate_bucket WHERE tenant_id = :t")
+        .param("t", tenant.id())
+        .update();
+    TestDatabase.jdbc().sql("DELETE FROM tenant WHERE id = :t").param("t", tenant.id()).update();
   }
 
   private static byte[] eventOf(int bytes) {

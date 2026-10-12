@@ -1,5 +1,6 @@
 package io.github.realjoegz.reliablewebhooks.delivery;
 
+import io.github.realjoegz.reliablewebhooks.DatabaseFailures;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Delivery;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Attempt;
@@ -110,7 +111,8 @@ class DeliveryWorker {
     } catch (RuntimeException failure) {
       // A database that restarts fails the load of every attempt in flight. That passes, and the
       // lease brings each delivery back. Any other failure is a fault.
-      LoggingEventBuilder line = FinalizeRetry.isTransient(failure) ? log.atWarn() : log.atError();
+      LoggingEventBuilder line =
+          DatabaseFailures.isTransient(failure) ? log.atWarn() : log.atError();
       fields.about(delivery, line).setCause(failure).log("attempt_left_for_reclaim");
     }
   }

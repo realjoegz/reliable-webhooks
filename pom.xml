@@ -164,6 +164,10 @@
           </includes>
           <!-- Tests that start the service in the test JVM must satisfy StartupInvariants. -->
           <argLine>-XX:+ExitOnOutOfMemoryError</argLine>
+          <systemPropertyVariables>
+            <!-- The jar that the tests start as replicas with processes of their own. -->
+            <replica.jar>${project.build.directory}/${project.build.finalName}.jar</replica.jar>
+          </systemPropertyVariables>
         </configuration>
       </plugin>
 

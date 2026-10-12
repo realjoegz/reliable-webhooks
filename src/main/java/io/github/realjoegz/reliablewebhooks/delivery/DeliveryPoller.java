@@ -30,6 +30,7 @@ public class DeliveryPoller {
   private final DeliveryRepository deliveries;
   private final DeliveryWorker worker;
   private final DeliveryMeters meters;
+  private final PollerHeartbeat heartbeat;
   private final Duration lease;
   private final int maxInFlight;
   private final Wait betweenClaims;
@@ -50,11 +51,13 @@ public class DeliveryPoller {
       DeliveryRepository deliveries,
       DeliveryWorker worker,
       DeliveryMeters meters,
+      PollerHeartbeat heartbeat,
       WebhooksProperties properties) {
     this(
         deliveries,
         worker,
         meters,
+        heartbeat,
         properties,
         (permits, atMost) -> permits.tryAcquire(atMost.toNanos(), TimeUnit.NANOSECONDS));
   }
@@ -63,11 +66,13 @@ public class DeliveryPoller {
       DeliveryRepository deliveries,
       DeliveryWorker worker,
       DeliveryMeters meters,
+      PollerHeartbeat heartbeat,
       WebhooksProperties properties,
       Wait betweenClaims) {
     this.deliveries = deliveries;
     this.worker = worker;
     this.meters = meters;
+    this.heartbeat = heartbeat;
     this.lease = properties.delivery().lease();
     this.maxInFlight = properties.delivery().maxInFlight();
     this.room = new Semaphore(maxInFlight);
@@ -78,12 +83,17 @@ public class DeliveryPoller {
    * Claims until {@link #stop()} is called. A claim that brought a row is followed by the next one
    * at once. After any other claim the loop waits, at most for the backoff and no longer than until
    * an attempt has finished, because that is when there is room for a row again.
+   *
+   * <p>Every pass beats the heartbeat, also one whose claim failed. A database that is down
+   * therefore does not make the replica look stuck. Only a loop that no longer comes by does.
    */
   public void run() {
     while (!stopped) {
       attemptFinished.drainPermits();
       int free = room.availablePermits();
-      if (free > 0 && claimAndStart(free)) {
+      boolean claimedARow = free > 0 && claimAndStart(free);
+      heartbeat.beat();
+      if (claimedARow) {
         backoff.reset();
       } else if (!waitedForNextClaim()) {
         return;

@@ -7,6 +7,7 @@ import java.sql.SQLException;
 import java.sql.SQLTransientConnectionException;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.QueryTimeoutException;
 import org.springframework.http.HttpHeaders;
@@ -14,7 +15,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.CannotGetJdbcConnectionException;
+import org.springframework.jdbc.UncategorizedSQLException;
 import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.transaction.TransactionSystemException;
 import org.springframework.web.ErrorResponseException;
 
 class ProblemsTest {
@@ -54,6 +57,33 @@ class ProblemsTest {
         problems.unhandled(
             new CannotCreateTransactionException(
                 "begin", new CannotGetJdbcConnectionException("borrow", borrowTimeout))));
+  }
+
+  // A statement on a connection that the pool handed out without testing it, because it had been
+  // used a moment before, and that the database had closed since.
+  @Test
+  void failedConnectionIsDatabaseBusy() {
+    SQLException connectionFailure =
+        new SQLException("An I/O error occurred while sending to the backend.", "08006");
+
+    assertDatabaseBusy(
+        problems.unhandled(new DataAccessResourceFailureException("select", connectionFailure)));
+  }
+
+  // The same inside a transaction: the rollback fails on that connection too, and Spring throws
+  // the failure of the rollback with the failure of the statement beside it.
+  @Test
+  void statementOfATransactionThatWasEndedByADatabaseShuttingDownIsDatabaseBusy() {
+    TransactionSystemException rollbackFailed =
+        new TransactionSystemException(
+            "JDBC rollback failed", new SQLException("Connection is closed"));
+    rollbackFailed.initApplicationException(
+        new UncategorizedSQLException(
+            "insert",
+            "",
+            new SQLException("terminating connection due to administrator command", "57P01")));
+
+    assertDatabaseBusy(problems.unhandled(rollbackFailed));
   }
 
   @Test

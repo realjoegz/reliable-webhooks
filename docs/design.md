@@ -34,12 +34,12 @@ Packages:
 
 | Package | Contents |
 |---|---|
-| (root) | `ReliableWebhooksApplication`, `WebhooksProperties` (every `webhooks.*` setting), `DatabasePools` |
+| (root) | `ReliableWebhooksApplication`, `WebhooksProperties` (every `webhooks.*` setting), `DatabasePools`, `DatabaseFailures` |
 | `api/` | Controllers, `Problems`, `ApiKeyFilter`, `TenantConcurrencyFilter`, `UntrustedTraceContextFilter`, `IngestMeter` |
 | `tenant/` | `TenantRepository` |
 | `endpoint/` | `EndpointService`, `EndpointRepository`, `UrlPolicy`, `SecretCipher` |
 | `ingest/` | `IngestService`, `EventRepository`, `TokenBucket` |
-| `delivery/` | `DeliveryPoller`, `DeliveryWorker`, `DeliveryRepository`, `TenantDeliveryRepository`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
+| `delivery/` | `DeliveryPoller`, `PollerHeartbeat`, `DeliveryWorker`, `DeliveryRepository`, `TenantDeliveryRepository`, `CircuitBreaker`, `RetrySchedule`, `Bulkhead` |
 | `http/` | `WebhookHttpClient`, `SsrfGuardDnsResolver`, `AddressPolicy`, `DnsLookups`, `Signer` |
 | `ops/` | `WorkerLifecycle`, `StartupInvariants`, `ExpiryJob`, `CancelJob`, `RetentionJob`, `QueueGauges`, `PollerHealth` |
 | test `harness/` | `ReplicaProcess`, `FaultReceiver`, `Rows`, `PgWait`, `StubDns`, `TcpProxy`, `TestDatabase`, `ReplicaSettings`, `InProcessReplica`, `UnsafeLocalReplica`, `ReplicaWorker`, `SelfStartedReplica`, `TestTenant` |
@@ -218,7 +218,7 @@ Problem types used for rejection:
 | 429 | `rate_limit_unsatisfiable` | The tenant's rate is 0 or the cost exceeds its burst. No `Retry-After`, because waiting cannot help. |
 | 429 | `lookup_busy` | Registration could not get a DNS slot. `Retry-After: 2`. |
 | 403 | `tenant_suspended` | The tenant is suspended. |
-| 503 | `database_busy` | Lock timeout, statement timeout or no connection inside the borrow wait. `Retry-After: 1`. |
+| 503 | `database_busy` | A transient database error, as section 7 lists them: among them a lock timeout, a statement timeout, no connection inside the borrow wait and a connection that failed, as it does when the database restarts. `Retry-After: 1`. |
 
 Admin routes take `Authorization: Bearer <admin token>`:
 
@@ -414,7 +414,7 @@ Timing rules:
 | Attempt deadline | 15 s, hard | Covers DNS (2 s wait), connect (3 s), TLS, request and the whole response. A watchdog aborts the request at the deadline, so a drip-fed response cannot outlive it. | `SlowEndpointIsolationIT#drippingResponseIsCutAtDeadline` |
 | Lease | 60 s | `StartupInvariants` requires lease >= deadline + 30 s. | `StartupInvariantsTest` |
 | Start cutoff | 35 s after the claim call began | A worker that could not finish inside its lease does not send. The row stays leased and is reclaimed. `StartupInvariants` requires start cutoff + deadline <= finalize cutoff. | `DeliveryWorkerTest#doesNotSendAfterStartCutoff` (injected monotonic time source), `StartupInvariantsTest` |
-| Finalize retry | Until 55 s after the claim call began, transient errors only | Covers a database restart; after that the row is left for reclaim. `StartupInvariants` requires finalize cutoff < lease. | `DatabaseRestartIT` (one request, one `success` row across the restart), `FinalizeRetryTest`, `StartupInvariantsTest` |
+| Finalize retry | Until 55 s after the claim call began, transient errors only | Covers a database restart; after that the row is left for reclaim. `StartupInvariants` requires finalize cutoff < lease. | `DatabaseRestartIT` (one request, one `success` row across the restart), `FinalizeRetryIT`, `FinalizeRetryTest`, `DatabaseFailuresTest`, `StartupInvariantsTest` |
 
 - **The lease is liveness, the token is safety.** If a replica stalls past its lease, another replica reclaims and both may send. That is a duplicate with the same `webhook-id`, which at-least-once allows. Only the current token holder can pass F1, so the stale replica's result, attempt row and circuit update all roll back.
 - **Clocks.** Lease expiry is decided by Postgres. The replica's cutoffs use `System.nanoTime()` measured from before the claim was sent, so its view of the lease is always the shorter one. Wall-clock skew between replica and database has no effect, including on the signature timestamp.
@@ -425,6 +425,10 @@ Timing rules:
   - deadlock (`40P01`), lock timeout (`55P03`) and statement timeout (`57014`).
 
   Anything else, such as a data or constraint error (classes 22, 23), is a bug. It is not retried, it is counted on `webhooks_finalize_errors_total` and logged at error, and the row is left for reclaim.
+
+  A statement that fails because its connection is gone is followed by a rollback that fails as well. What the transaction then throws is the failure of the rollback, which the pool reports without an SQLSTATE. In that case the failure of the statement decides. `FinalizeRetryIT` ends the backend of a finalize that waits for its row, as a database that shuts down does, and the result is recorded by the next try from the one request. `IngestMeterIT#requestWhoseConnectionTheDatabaseEndedIsCountedAsBusy` does the same to an ingest, which answers `503`.
+
+  `DatabaseFailures` holds this rule. The API uses it too: a request that fails with a transient error answers `503 database_busy` (section 5).
 
   A retry starts 200 ms after the failure before it, and none starts after the 55 s.
 
@@ -747,7 +751,7 @@ RETURNING b.tokens;
 - The three session limits are sent as startup options of the connection. They are the session defaults, so `RESET ALL` leaves them in place.
 - A pool applies its bounds after it has read the JDBC URL, so a parameter in the URL cannot remove one.
 - `StartupInvariants` reads the session limits from a live session of each pool, not from the configuration.
-- On tenant routes these errors map to `503 database_busy`.
+- On tenant routes these errors map to `503 database_busy`, like every transient error of section 7.
 
 ## 13. Failure table
 
@@ -764,7 +768,7 @@ Until the circuit breaker exists, the checked copy carries one provisional row u
 | 5 | Duplicate submit | One event; same id returned; different body gets 422 | `IdempotencyIT#sameKeyReturnsSameEvent`, `#concurrentSameKeyCreatesOneEvent`, `#sameKeyDifferentBodyIsRejected` | Request 1 blocked in its transaction; request 2 seen waiting on the unique index |
 | 6 | Two replicas race for one delivery | One claimer gets it; the other skips without waiting | `ClaimRaceIT#secondClaimerSkipsLockedRow`, `#fourReplicasDeliverEachEventOnce` | Two open transactions; then 4 pollers over 2,000 deliveries |
 | 7 | Lease expires while the first replica is still sending | Both may send; only the lease holder's result is recorded | `LeaseFenceIT#lateFinalizeAfterReclaimChangesNothing`, `#repeatedFinalizeIsNoOp` | Lease aged between claim and finalize |
-| 8 | Database restart | No delivery lost; the delivery in flight across the restart is recorded once from one request; ingest answers 503 and the same key succeeds afterwards; replicas stay up | `DatabaseRestartIT#inFlightAndQueuedSurviveRestart` | Receiver holds a request; container restart on a fixed port; receiver released |
+| 8 | Database restart | No delivery lost; the delivery in flight across the restart is recorded once from one request; ingest answers 503 and the same key succeeds afterwards; replicas stay up | `DatabaseRestartIT#inFlightAndQueuedSurviveRestart` | Receiver holds the four requests of each of two replicas, with two more deliveries due and unclaimed; the container is stopped, the receiver released and an event refused; the container is started again on the host port that it had |
 | 9 | Endpoint down for hours | Circuit opens after 5 failures; held deliveries use no attempts; one probe fleet-wide per interval; probe backoff stays capped; recovery drains | `EndpointOutageIT#circuitOpensAndHolds`, `#oneProbeAdmittedAcrossConcurrentClaimers`, `#probeBackoffIsCappedAfterManyFailures`, `#recoveryDrainsHeldDeliveries`, `#probeSlotReopensAfterProberKilled` | Two connections on the gate; probe time aged; `probe_failures` set to 1000; a canary on a second endpoint witnesses that claims ran |
 | 10 | Endpoint down for good | A single delivery ends `dead (exhausted)` after 5 attempts and 7 probes; a backlog ends `dead (expired)` at 72 h; a delivery whose holder was killed expires with that attempt logged `unknown`; replay delivers and its run starts at attempt 1 | `EndpointOutageIT#hardDownEndpointWithDefaultBreakerSettings`, `#heldDeliveriesExpireAfterBudget`, `#expiredAfterHolderKilledReplaysCleanly`, `ExpiryIT#pendingPastBudgetBecomesDead` | Production breaker and retry settings; rows aged |
 | 11 | One event always rejected by a healthy endpoint | Twelve attempts, each wait inside its schedule window, then `dead (exhausted)`; replay delivers once | `DeadLetterReplayIT#exhaustedAfterTwelveAttempts`, `#replayedDeliveryIsDeliveredOnce`, `RetryScheduleTest` | Breaker at defaults; other deliveries succeed in between |
@@ -782,7 +786,7 @@ Until the circuit breaker exists, the checked copy carries one provisional row u
 | 23 | Secret rotation with deliveries in flight | Both signatures during the overlap; old secret rejected after it | `SignatureIT#bothSignaturesDuringOverlap` | Expiry aged |
 | 24 | Tampered body or replayed old request | Reference verifier rejects both | `SignatureIT#verifierRejectsTamperedBodyAndStaleTimestamp` | Direct |
 | 25 | Caller forces trace sampling or picks a trace id | With sampling off, a caller's sampled flag exports nothing; with sampling on, the root span has its own trace id and carries the caller's context only as a link | `TracingIT#callerCannotForceSampling`, `#callerTraceIdBecomesLinkOnly` | Sampler probability 0, then 1; in-memory span exporter |
-| 26 | Connections to Postgres go half-open (failover, partition) | The cut-off replica's blocked call fails at the socket timeout and it resumes on new connections; another replica delivers meanwhile; a transaction left open on the server is ended within 10 s, so its row lock cannot pin a delivery | `DatabaseBlackholeIT#pollerResumesAfterSocketTimeout`, `#openTransactionIsEndedByServer` | `TcpProxy` stops relaying without closing, after `PgWait` shows the replica inside a statement |
+| 26 | Connections to Postgres go half-open (failover, partition) | The cut-off replica's blocked call fails at the socket timeout and it resumes on new connections; another replica delivers meanwhile; a transaction left open on the server is ended by the server, so its row lock cannot pin a delivery | `DatabaseBlackholeIT#pollerResumesAfterSocketTimeout`, `#openTransactionIsEndedByServer` | `TcpProxy` stops relaying without closing, after `PgWait` shows the replica inside a statement |
 | 27 | Subscriber answers with an endless header line or body | An oversized head fails the attempt as `response_too_large`, not `deadline`; a 2xx with an endless body is a success and the connection is dropped at the limit; another tenant's delivery completes meanwhile | `OutboundRequestIT#endlessHeaderIsCutAtLimit`, `#endlessBodyIsNotDrained`, `WebhookHttpClientIT#bodyOfSixtyFourKibibytesIsReadAndOneByteMoreCostsTheConnection` | `FaultReceiver` scripts `endlessHeader` and `endlessBody`; the receiver records bytes written and who closed; bodies of 64 KiB and of one byte more place the limit |
 | 28 | Subscriber answers 503 with `Set-Cookie` | Exactly one request per attempt row; no later request, from any tenant, carries a `Cookie` header | `OutboundRequestIT#oneRequestPerAttemptAndNoCookieReuse` | Two tenants' endpoints on one receiver host |
 | 29 | Replica killed while creating an endpoint or a tenant | No endpoint without its circuit row and no tenant without its bucket row; the repeated call succeeds | `EndpointApiIT#killedDuringCreateLeavesNoHalfEndpoint`, `AdminApiIT#killedDuringCreateLeavesNoHalfTenant` | Test table lock blocks the second insert of the transaction |
@@ -836,6 +840,7 @@ Until the circuit breaker exists, the checked copy carries one provisional row u
     - A legitimate statement slower than `statement_timeout` fails. On a very large pending set the gauge query times out and the gauges go stale.
     - A transaction whose client was cut off pins its row locks for up to 10 s.
     - A call on a dead connection is noticed only after the socket timeout.
+    - The other connections of a pool that went half-open are still in it then. Each costs a borrower one aliveness test of 1 s, and a borrow wait of 3 s has room for three of them. A pool of 16 therefore needs about 20 s more until a claim gets a connection that works.
 28. **An orphaned autocommit statement can commit after its client died** (section 3). The design tolerates this; it does not prevent it.
 29. **DNS admission is per tenant per replica.**
     - While a tenant's lookup slots are stuck, each of its other deliveries on that replica is claimed, refused its lookup and given back for 2 s. The delivery loses no attempt, but every time it comes due it costs the replica and the database one claim, one load and one release.
@@ -866,7 +871,7 @@ Until the circuit breaker exists, the checked copy carries one provisional row u
 - No JVM proxy properties.
 - SSRF allowlist empty and `http` disabled unless the `unsafe-local` profile is active.
 
-**Liveness.** The `poller` health indicator belongs to the liveness group. It reports down when the poller loop has not finished an iteration for 60 s. A failed claim also finishes an iteration, so a database outage does not restart pods. Only a poller that stopped looping does. `PollerHeartbeatTest` covers it with an injected time source.
+**Liveness.** The `poller` health indicator (`PollerHealth`) belongs to the liveness group, next to the liveness state of Spring Boot. It reports down when the poller loop has not finished an iteration for 60 s, which it reads from `PollerHeartbeat` on the monotonic clock of the replica. A failed claim also finishes an iteration, so a database outage does not restart pods. Only a poller that stopped looping does. A heartbeat that was never beaten counts from the start of the replica. `PollerHeartbeatTest` covers the rule with an injected time source, and `DeliveryPollerTest` that the loop beats after a claim that failed. `PollerHealthIT` asks the probes of a replica whose poller is seen waiting in its claim, behind a table lock of the test, after the test has moved the clock of its heartbeat by 60 s: the liveness probe answers down and the readiness probe up, and the liveness probe answers up again once the claim has ended.
 
 The database health indicator is off. The health endpoint takes no key, so it must not borrow pooled connections.
 
@@ -953,7 +958,7 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
 Rules:
 
 - No test sleeps to "let things happen". Waits are condition polls with a timeout.
-- **Time is aged in the data, not in the clock.** `Rows` ages a row: it subtracts an interval from its time columns, which are `next_attempt_at`, `expires_at`, `completed_at`, `next_probe_at`, `refilled_at` and `prev_secret_expires_at`. Production code and `now()` run unchanged. This drives lease expiry, the twelve-step schedule, the probe interval, the 72 h budget and retention.
+- **Time is aged in the data, not in the clock.** `Rows` ages a row: it subtracts an interval from its time columns, which are `next_attempt_at`, `expires_at`, `completed_at`, `next_probe_at`, `refilled_at` and `prev_secret_expires_at`. Production code and `now()` run unchanged. This drives lease expiry, the twelve-step schedule, the probe interval, the 72 h budget and retention. `Rows` also postpones a delivery: it moves the due time ahead, so that no claim takes the delivery until the test ages it by as much.
 - **A negative claim needs a witness.** "Nothing was claimed" or "no attempt was used" is asserted only after something observable proves the poller ran in the state under test. The witness is either a canary (a delivery to another endpoint or tenant, ingested after that state was reached, has succeeded) or a positive signal such as `poller_stopped`.
 - **Ordering assertions, not clocks.** Where a test is about who goes first, it reads the receiver's request log.
 - Integration tests run with production retry, breaker, lease and timeout settings. The test-profile differences are the `unsafe-local` allowance for the loopback receiver with its `http` scheme, in the classes that deliver to the receiver, and in `TracingIT` only, the sampler probability.
@@ -961,22 +966,24 @@ Rules:
 - **A replica inside the test JVM does not start its worker by itself.** The replicas of a build share one database, so a worker that ran all the time would take the deliveries of tests that are about something else, and those of a test that has to claim them itself. A test that wants deliveries sent starts the worker of its replica, or builds the pollers it needs. The worker is stopped when the test ends. One test is the exception: `WorkerLifecycleIT#replicaStartsItsWorkerByItselfAndStopsItWhenItCloses` starts a second replica the way the application starts, with nothing taken from Spring, and closes it before it ends. The attempt is recorded under the id of that replica, which shows that Spring started its worker. Its pools hold 4 connections each, because the replicas that the build keeps have theirs open.
 - **Nor does it start its expiry job.** A run that came by itself could take a delivery that a test has aged past its budget before the test is ready for it. A test that wants a run calls the run of the job. `ExpiryIT#replicaRunsItsExpiryJobByItself` is the exception here: it starts a second replica the way the application starts and waits for the first run of that replica's job. The delivery belongs to a suspended tenant, so the worker of that replica does not claim it.
 - **Every test of such a replica begins with an empty queue.** The pending deliveries that earlier tests left are deleted first. A worker that a test starts therefore sends the deliveries of that test and no others.
+- **A replica that runs as a process of its own is not held back.** `ReplicaProcess` starts the packaged jar, and its worker and its expiry job run as they do in production. Such a replica claims whatever is due. A test that starts one runs in a class with a replica inside the test JVM as well, which takes the requests that set the test up and whose worker stays stopped, so the test begins with an empty queue and the process finds the deliveries of that test only. The process is killed when the test ends.
+- **A replica without a running worker is not live.** Its poller does not loop, so its `poller` indicator reports down once 60 s have passed since the replica started or since a test last stopped its worker. The two tests that ask a replica inside the test JVM for its health, `ApiKeyAuthIT#healthProbesNeedNoKey` and `DatabasePoolsIT#healthEndpointBorrowsNoPooledConnection`, start its worker first.
 
 Harness:
 
 | Piece | What it does |
 |---|---|
 | `FaultReceiver` | In-process HTTP server. Per-path scripts: status with optional response headers, a body of a given length, delay, hold until released, drip, close without response, redirect, `endlessHeader`, `endlessBody`. Records every request with its headers, counts accepted connections and peak concurrency per path, and for the endless scripts the bytes written and whether the peer closed first. |
-| `ReplicaProcess` | Starts the packaged jar as a child JVM against the Testcontainers database, with the replica id as `application_name`. Captures stdout. `kill()` is SIGKILL, `terminate()` is SIGTERM, `exitCode()` waits for the process to end by itself. |
-| `PgWait` | `untilBlocked(sqlFragment, replica)` polls `pg_stat_activity` for a backend of that replica waiting on a lock in a statement containing the fragment. The lock timeout of the replica's pool ends that wait, so the test has that long to act. `untilGone(replica)` waits until its backends have left. |
+| `ReplicaProcess` | Starts the packaged jar as a child JVM against the Testcontainers database, with the replica id as `application_name`, the JVM flag that `StartupInvariants` demands and the `unsafe-local` allowance, on a port that the operating system chose. It can start the replica behind a `TcpProxy`. Returns once the readiness probe of the replica answers. Captures stdout and passes it on to the output of the build. `kill()` is SIGKILL and returns once the process is gone, `terminate()` is SIGTERM, `exitCode()` waits for the process to end by itself. |
+| `PgWait` | `untilBlocked(sqlFragment, replica)` polls `pg_stat_activity` for a backend of that replica waiting on a lock in a statement containing the fragment. The lock timeout of the replica's pool ends that wait, so the test has that long to act. `endBlocked(sqlFragment, replica)` ends those backends, as a database that shuts down ends a session, and returns how many they were. `untilGone(replica)` waits until its backends have left, which is where a replica that was killed ends up. `untilNoTransaction(replica)` waits until none of its backends is in a transaction. It is for a replica whose connections went silent: nothing closes them, so its backends do not leave. |
 | `StubDns` | The resolver behind `DnsLookups` in a replica inside the test JVM, in place of the system resolver: scripted answers per call, or block until released. A name that no test scripted does not resolve. |
 | `TcpProxy` | In-process TCP forwarder between one replica and Postgres. `blackhole()` keeps every existing connection open and relays nothing more on it, ever; new connections are accepted and ignored. `heal()` lets new connections relay again. |
-| `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. |
+| `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use, with room for 300 connections: a replica holds 32, and besides the replicas inside the test JVM a test runs up to two as processes. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. `stop()` and `start()` stop the container and start it again. The container is created with a host port that was free at that moment, because Docker gives a container that starts again another port unless its port was named. |
 | `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection with the replica id as `application_name`, an admin token and a secret-encryption key. |
 | `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker and the expiry job of the replica are left to the tests, and the queue is emptied before each test. |
 | `UnsafeLocalReplica` | An `InProcessReplica` with the `unsafe-local` profile and its allowance: plain `http` and the loopback address, where `FaultReceiver` listens. The classes with this annotation share a second application context. |
 | `ReplicaWorker` | Starts and stops the delivery worker of a replica inside the test JVM. Each start gets a `WorkerLifecycle` and a poller of its own from the application context, wired as the application wires them, and runs the start and stop that Spring runs. |
-| `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker and its expiry job, and closing it stops them. |
+| `SelfStartedReplica` | Starts a second replica inside the test JVM the way the application starts, with pools of 4 connections. Nothing of it is left to the tests: Spring starts its worker and its expiry job, and closing it stops them. A test can give it the heartbeat of its poller, built on a clock that the test moves. |
 | `TestTenant` | A tenant created through the admin API of a replica, with the API key it was shown. Registers an endpoint, sends an event and replays a delivery as that tenant, and counts the tenant's event and delivery rows. |
 
 How each proof is forced.
@@ -997,7 +1004,9 @@ How each proof is forced.
   | K8, K9, row 29 | `LOCK TABLE` on `endpoint_circuit` or `rate_bucket` | The second insert of the create transaction |
 
   - **Only transactions and reads.** A lock-block kill is landed only on a statement inside an explicit transaction or on a read. The orphaned backend then finds end-of-file before any `COMMIT` and rolls back, or has nothing to commit. No proof blocks an autocommit write, because that write would commit after the kill and change the state under test.
-  - **K3 in detail.** The delivery is inserted not yet due. The test locks `event`, makes the row due from a second connection, waits until the load is blocked, kills, and releases. The surviving replica is started after the kill.
+  - **K3 in detail.** The delivery is accepted while no worker runs and is postponed by an hour, so the replica finds nothing due when it starts. The test locks `event`, ages the delivery by that hour from a second connection, waits until the load is blocked, kills, and releases. The surviving replica is started after the kill.
+  - **After the kill.** `kill()` returns when the process is gone, and only then does the test release its lock. `PgWait.untilGone` then waits for the backend that outlived its replica, so the state that the test asserts next is the state that the kill left.
+  - **K2** has no window that a lock could hold open. The test sends the request, reads from the database that the event is committed, kills the replica and sends the request again to another one.
   - **K4 and K6** use the receiver's hold, not a lock.
   - No hook exists in production code and no timing is assumed. The pool `lock_timeout` values (2 s and 5 s) leave room for a 10 ms poll.
 - **(b) Claim race.** `secondClaimerSkipsLockedRow` runs the real claim on connection A without committing. A second delivery for the same endpoint is accepted then, and the claim runs on connection B, whose transaction begins with it. B returns without waiting, and with the second delivery only: it saw the due rows and passed over the locked one. B has a lock timeout, so a claim that waited would fail. After both commit, a claim gets zero rows. The four-poller test is a volume check on top of this, not the proof.
@@ -1010,9 +1019,10 @@ How each proof is forced.
   1. Five due deliveries for one endpoint; the receiver holds.
   2. Wait until the receiver holds 4 requests. The fifth is due and unclaimed only because the endpoint is full.
   3. SIGTERM. Wait for `poller_stopped` on the child's stdout.
-  4. Release the receiver.
+  4. Ask the replica for its readiness. It answers `503` with `OUT_OF_SERVICE`: readiness went out first, and the web server still answers while the worker drains.
+  5. Release the receiver.
 
-  It asserts four `success` rows and four requests, the fifth delivery still at `attempts = 0` with no lease, and that the process ended by itself with exit code 143 inside the drain time. A poller that kept claiming would take the fifth as soon as a slot freed.
+  It asserts four `success` rows and four requests, the fifth delivery still at `attempts = 0` with no lease, and that the process ended by itself with exit code 143 inside the drain time. A poller that kept claiming would take the fifth as soon as a slot freed. A succeeded delivery keeps the end of its last lease as its due time. For each of the four that time still lies ahead on the database clock when the process has ended, so the exit came before a lease ran out.
 - **(f) Rate limit.**
   - `limitIsExactAcrossReplicas` sets rate 0 and burst 20 and sends 200 requests to 4 replicas, 8 at a time per replica so the request permits never reject. It asserts exactly 20 accepted and that every other response is a well-formed `429 rate_limit_unsatisfiable` problem document without `Retry-After`.
   - `refillIsExact` uses rate 0.01 per second and ages `refilled_at` by 500 s. Exactly 5 are accepted, and the next token is 100 s away.
@@ -1024,10 +1034,20 @@ How each proof is forced.
   - `pollerResumesAfterSocketTimeout`:
     1. The test locks the `delivery` table until the claim of the replica behind `TcpProxy` is seen blocked, calls `blackhole()` and releases the lock.
     2. A second replica delivers a new event meanwhile.
-    3. After `heal()` the second replica is stopped and a delivery is made due, which only the first can now deliver.
+    3. After `heal()` the second replica is stopped and a delivery that was postponed until then is made due, which only the first can now deliver.
 
-    Without a socket timeout the poller never returns from its read.
-  - `openTransactionIsEndedByServer`: F1 is blocked as in K5, then the proxy is blackholed and the lock released. The backend now idles in a transaction holding the row. The test waits with `PgWait.untilGone`, ages the lease and asserts a second replica reclaims and delivers.
+    Without a socket timeout the poller never returns from its read. The output of the first replica shows the claim that failed and the socket read that timed out.
+  - `openTransactionIsEndedByServer`: F1 is blocked as in K5, then the proxy is blackholed and the lock released. The backend now idles in a transaction holding the row. Its replica is alive and nothing closes the connection, so only the server can end that transaction. The test waits with `PgWait.untilNoTransaction`, starts a second replica, ages the lease and asserts that this replica reclaims and delivers. The test waits for the end of the transaction and does not measure the 10 s. That the limit is 10 s is what `DatabasePoolsIT` reads from a live session.
+- **(i) Database restart.** `DatabaseRestartIT` runs two replicas as processes against the database of the build.
+  1. Ten deliveries for one endpoint; the receiver holds. Wait until it holds eight requests, four of each replica. Two deliveries are due and unclaimed.
+  2. Stop the container. Release the receiver, so eight attempts have their result and no database to record it in. Send an event to one replica: it answers `503 database_busy`.
+  3. Start the container. Send the same request until it is no longer refused. Every answer before the `202` is a `503`.
+
+  It asserts that all eleven deliveries succeeded with one attempt, one `success` row and one request each, that each replica recorded at least the four results it held, and that both processes are still running.
+
+  Two time bounds apply. The receiver holds the eight requests until the container has stopped, and a held request is cut at the attempt deadline of 15 s, so the requests have to arrive and the container has to stop inside that time. The eight results then have to be recorded before their replicas give the finalize up, 55 s after the claims began, so stopping and starting the container together have to fit into that time. A run that took longer than either would fail and not pass: an attempt that was cut is recorded as a failure, and a delivery whose finalize was given up is claimed again and sent a second time.
+
+  The container keeps its host port because it was created with one. The replicas inside the test JVM lose their connections as well, and their pools replace them when a later test borrows one.
 
 **The failure-table check.** `FailureTableCheck` is a small main class run by `exec-maven-plugin` in `verify`, after Failsafe.
 

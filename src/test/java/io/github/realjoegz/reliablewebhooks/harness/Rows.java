@@ -87,6 +87,22 @@ public final class Rows {
         .update();
   }
 
+  /**
+   * Moves the due time of a delivery into the future, so that no claim takes it. Ageing it by as
+   * much makes it due again.
+   */
+  public static void postponeDelivery(UUID deliveryId, Duration by) {
+    TestDatabase.jdbc()
+        .sql(
+            """
+            UPDATE delivery SET next_attempt_at = next_attempt_at + make_interval(secs => :seconds)
+            WHERE id = :id
+            """)
+        .param("seconds", by.toNanos() / 1e9)
+        .param("id", deliveryId)
+        .update();
+  }
+
   /** The delivery of an event that went to one endpoint. */
   public static UUID deliveryOf(UUID eventId) {
     return TestDatabase.jdbc()

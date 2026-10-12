@@ -154,7 +154,9 @@ class ClaimRaceIT {
             replicaId,
             System::nanoTime,
             Thread::sleep);
-    DeliveryPoller poller = new DeliveryPoller(deliveries, worker, meters, properties);
+    DeliveryPoller poller =
+        new DeliveryPoller(
+            deliveries, worker, meters, new PollerHeartbeat(System::nanoTime), properties);
     return new Replica(
         poller, Thread.ofPlatform().name("poller-of-" + replicaId).start(poller::run));
   }

@@ -1,10 +1,8 @@
 package io.github.realjoegz.reliablewebhooks.delivery;
 
+import io.github.realjoegz.reliablewebhooks.DatabaseFailures;
 import io.github.realjoegz.reliablewebhooks.delivery.DeliveryRepository.Claimed;
-import java.sql.SQLException;
-import java.sql.SQLTransientConnectionException;
 import java.time.Duration;
-import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 import org.slf4j.Logger;
@@ -25,16 +23,6 @@ final class FinalizeRetry {
   private static final Logger log = LoggerFactory.getLogger(FinalizeRetry.class);
 
   private static final Duration PAUSE = Duration.ofMillis(200);
-
-  private static final String CONNECTION_EXCEPTION_CLASS = "08";
-  private static final Set<String> TRANSIENT_STATES =
-      Set.of(
-          "57P01", // admin shutdown
-          "57P02", // crash shutdown
-          "57P03", // cannot connect now
-          "40P01", // deadlock detected
-          "55P03", // lock timeout
-          "57014"); // statement timeout
 
   /** How the retry waits. The tests wait on their own clock. */
   interface Pause {
@@ -74,7 +62,7 @@ final class FinalizeRetry {
         fields.about(delivery, log.atWarn()).log("finalize_lost_lease");
         return false;
       } catch (RuntimeException failure) {
-        if (!isTransient(failure)) {
+        if (!DatabaseFailures.isTransient(failure)) {
           meters.finalizeError();
           fields.about(delivery, log.atError()).setCause(failure).log("finalize_failed");
           return false;
@@ -95,24 +83,5 @@ final class FinalizeRetry {
       return false;
     }
     return nanoTime.getAsLong() - claimStartedNanos < cutoff.toNanos();
-  }
-
-  static boolean isTransient(Throwable failure) {
-    for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-      // HikariCP reports a borrow wait that ran out as a transient connection failure.
-      if (cause instanceof SQLTransientConnectionException) {
-        return true;
-      }
-      if (cause instanceof SQLException sql && isTransient(sql.getSQLState())) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // Class 08 is how the driver reports a connection that failed and a socket read that timed out.
-  private static boolean isTransient(String sqlState) {
-    return sqlState != null
-        && (sqlState.startsWith(CONNECTION_EXCEPTION_CLASS) || TRANSIENT_STATES.contains(sqlState));
   }
 }

@@ -21,6 +21,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -39,6 +40,7 @@ class DeliveryPollerTest {
   private static final WebhooksProperties PROPERTIES =
       new WebhooksProperties(null, null, "replica-1", null, SETTINGS, null);
   private static final Duration FAR_LONGER_THAN_A_TEST_WAITS = Duration.ofMinutes(1);
+  private static final Duration SEVENTY_SECONDS = Duration.ofSeconds(70);
 
   /** What a claim was called with. */
   private record Asked(Set<UUID> fullEndpoints, Set<UUID> fullTenants, int free, Duration lease) {}
@@ -48,8 +50,10 @@ class DeliveryPollerTest {
   private final Deliveries deliveries = new Deliveries();
   private final Attempts attempts = new Attempts();
   private final Waits waits = new Waits();
+  private final AtomicLong heartbeatNanos = new AtomicLong();
+  private final PollerHeartbeat heartbeat = new PollerHeartbeat(heartbeatNanos::get);
   private final DeliveryPoller poller =
-      new DeliveryPoller(deliveries, attempts, meters, PROPERTIES, waits);
+      new DeliveryPoller(deliveries, attempts, meters, heartbeat, PROPERTIES, waits);
   private final Thread loop = Thread.ofPlatform().unstarted(poller::run);
 
   /**
@@ -279,6 +283,36 @@ class DeliveryPollerTest {
 
     assertThat(registry.get("webhooks.claim.errors").counter().count()).isEqualTo(1);
     assertThat(waits.asked.getFirst()).isEqualTo(Duration.ofMillis(50));
+  }
+
+  // The clock of the heartbeat stands still unless the test moves it, so a heartbeat of age zero
+  // has been beaten since the test last moved the clock. The loop beats before it waits, and the
+  // wait of this test does not end by time, so no beat comes while the test moves the clock.
+  @Test
+  void everyIterationBeatsTheHeartbeat() {
+    loop.start();
+    await().until(() -> waits.asked.size() == 1);
+    heartbeatNanos.addAndGet(SEVENTY_SECONDS.toNanos());
+    assertThat(heartbeat.sinceLastIteration()).isEqualTo(SEVENTY_SECONDS);
+
+    waits.timeIsUp();
+    await().until(() -> waits.asked.size() == 2);
+
+    assertThat(deliveries.claims).hasSize(2);
+    assertThat(heartbeat.sinceLastIteration()).isZero();
+  }
+
+  // A database that is down fails every claim. The loop still loops, and its heartbeat says so.
+  @Test
+  void iterationWhoseClaimFailedBeatsTheHeartbeatToo() {
+    heartbeatNanos.addAndGet(SEVENTY_SECONDS.toNanos());
+    deliveries.failureOfTheNextClaim = new IllegalStateException("the database did not answer");
+    loop.start();
+
+    await().until(() -> waits.asked.size() == 1);
+
+    assertThat(registry.get("webhooks.claim.errors").counter().count()).isEqualTo(1);
+    assertThat(heartbeat.sinceLastIteration()).isZero();
   }
 
   // The claim wrote the attempt row for the holder that recorded nothing. The poller counts it.

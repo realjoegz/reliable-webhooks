@@ -1,10 +1,12 @@
 package io.github.realjoegz.reliablewebhooks;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.realjoegz.reliablewebhooks.WebhooksProperties.Database;
 import io.github.realjoegz.reliablewebhooks.harness.InProcessReplica;
+import io.github.realjoegz.reliablewebhooks.harness.ReplicaWorker;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -47,6 +49,7 @@ class DatabasePoolsIT {
   @Autowired WebhooksProperties properties;
   @Autowired Flyway flyway;
   @Autowired RestTestClient http;
+  @Autowired ReplicaWorker replicaWorker;
 
   @Test
   void apiPoolRunsWithItsTimeBounds() throws SQLException {
@@ -117,8 +120,15 @@ class DatabasePoolsIT {
 
   // With every connection of both pools taken, a health check that needed one would wait for the
   // borrow timeout and then report the service as down.
+  //
+  // The worker of the replica runs meanwhile. A replica whose poller does not loop is not live,
+  // and its health says so. The claims of this poller find no connection and fail, which keeps
+  // the loop looping and the replica live.
   @Test
   void healthEndpointBorrowsNoPooledConnection() throws SQLException {
+    replicaWorker.start();
+    await().untilAsserted(this::assertHealthIsUp);
+
     List<Connection> borrowed = new ArrayList<>();
     try {
       for (HikariDataSource pool : List.of(api, worker)) {
@@ -127,19 +137,23 @@ class DatabasePoolsIT {
         }
       }
 
-      http.get()
-          .uri("/actuator/health")
-          .exchange()
-          .expectStatus()
-          .isOk()
-          .expectBody()
-          .jsonPath("$.status")
-          .isEqualTo("UP");
+      assertHealthIsUp();
     } finally {
       for (Connection connection : borrowed) {
         connection.close();
       }
     }
+  }
+
+  private void assertHealthIsUp() {
+    http.get()
+        .uri("/actuator/health")
+        .exchange()
+        .expectStatus()
+        .isOk()
+        .expectBody()
+        .jsonPath("$.status")
+        .isEqualTo("UP");
   }
 
   private static Bounds boundsOf(HikariDataSource pool) throws SQLException {
