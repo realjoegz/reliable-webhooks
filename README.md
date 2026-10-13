@@ -87,6 +87,7 @@ Measured on one laptop. [docs/performance.md](docs/performance.md) has the metho
 
 - **Kills are placed, not timed.** A test runs the packaged jar as a process and kills it at a point that it can see: the replica waits for a lock the test holds, the test's receiver holds the request, or the database shows the commit.
 - **Real PostgreSQL.** A replica under test runs against PostgreSQL 18 in a container, with the retry, breaker, lease and timeout settings that ship.
+- **Time is aged in the data, not in the clock.** A test that needs a lease, a retry wait or the 72 hours to pass subtracts that interval from the time columns of the row. The service and `now()` run unchanged.
 - **The failure-table check.** A linked test that is renamed, disabled, skipped or failing fails the build. Old test reports are deleted first, so an earlier run cannot count.
 
 ## Deploying
