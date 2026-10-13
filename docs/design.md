@@ -1153,7 +1153,7 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
 
 **Tenant suspension** is the patch statement of section 5 with `status` alone. It writes the tenant row and no delivery rows.
 
-**Container image.** The `Dockerfile` builds the jar with the Maven wrapper on a JDK 21 image and unpacks it into the layers of Spring Boot, so the libraries are a layer that a change to the service does not rebuild. The image that runs is `gcr.io/distroless/java21-debian13`: a JRE on glibc, without a shell or a package manager. Both base images are pinned by digest.
+**Container image.** The `Dockerfile` builds the jar with the Maven wrapper on a JDK 21 image and unpacks it into the layers of Spring Boot, so the libraries are a layer that a change to the service does not rebuild. The image that runs is `gcr.io/distroless/java21-debian13`: a JRE on glibc, without a shell or a package manager. Both base images are pinned by digest, and the wrapper holds the Maven that it downloads to a SHA-256 checksum.
 
 - The process of the container is the JVM, started with `-XX:+ExitOnOutOfMemoryError`, which the startup invariants demand. The SIGTERM of a stop reaches it and starts the drain above. The CI job of the local stack stops a replica and requires the exit code 143.
 - It runs as the user 65532 and not as root.
