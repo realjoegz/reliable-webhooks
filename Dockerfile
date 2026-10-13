@@ -1,4 +1,7 @@
-FROM eclipse-temurin:21-jdk-alpine@sha256:0bfc69a4758a86710e5c474032d28400a8bd00874766f9e8b1642ac2fd293159 AS build
+# The jar and its unpacked libraries are the same for every architecture. This stage therefore
+# runs on the architecture of the machine that builds, also when the image is built for another
+# one with --platform, and Maven never runs under emulation.
+FROM --platform=$BUILDPLATFORM eclipse-temurin:21-jdk-alpine@sha256:0bfc69a4758a86710e5c474032d28400a8bd00874766f9e8b1642ac2fd293159 AS build
 WORKDIR /build
 COPY mvnw pom.xml ./
 COPY .mvn .mvn

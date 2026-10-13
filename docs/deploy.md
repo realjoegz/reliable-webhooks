@@ -314,7 +314,7 @@ The Secret holds the password as it is when the command runs. RDS rotates that p
   - A connection that is open outlasts a rotation, and a new one is refused with the old password. The pools of a replica replace a connection when it is 30 minutes old, which is the default of HikariCP that the service leaves in place.
   - About half an hour after a rotation the pools are therefore empty, and no call of a replica gets a connection inside its borrow wait. A route answers that with `503 database_busy` (section 5), and nothing is claimed or delivered.
   - Neither probe fails, because neither asks the database ([Probes](#probes)), so nothing restarts a replica, and a restart alone would not help. The replicas work again once the Secret has the new password and they have been restarted.
-- **The architecture of the image.** The nodes are x86_64. An image that is built on another architecture needs `docker build --platform linux/amd64`. CI builds the image on x86_64.
+- **The architecture of the image.** The nodes are x86_64. An image that is built on another architecture needs `docker build --platform linux/amd64`. The stage of the `Dockerfile` that runs Maven stays on the architecture of the machine that builds, and only the stage that the image is made of is taken for the platform that was asked for. CI builds the image on x86_64, so no job builds it for another architecture than that of its runner.
 
 ### What CI checks of it
 
