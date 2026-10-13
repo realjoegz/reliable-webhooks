@@ -8,10 +8,15 @@ import java.util.UUID;
 import org.apache.hc.client5.http.DnsResolver;
 
 /**
- * The resolver of the outbound client. The addresses it returns are the addresses the client
- * connects to, and they come from {@link DnsLookups}, which checks every one of them against the
+ * The resolver of the outbound client. The address it returns is the address the client connects
+ * to, and it comes from {@link DnsLookups}, which checks every address of the answer against the
  * address policy. A host is therefore judged by the addresses of the lookup that the connection
  * uses, not by those of an earlier one.
+ *
+ * <p>The client is given one address, the first of the answer. Given several, it tries them one
+ * after the other, each with its own connect timeout and its own TLS handshake, and the abort at
+ * the attempt deadline ends only the one that is in progress. With one address the abort ends the
+ * attempt. An attempt therefore does not fail over to another address of its host.
  */
 final class SsrfGuardDnsResolver implements DnsResolver {
 
@@ -56,7 +61,7 @@ final class SsrfGuardDnsResolver implements DnsResolver {
       throw new IllegalStateException("A lookup outside WebhookHttpClient.send");
     }
     return switch (lookups.lookup(tenantId, host)) {
-      case Resolved resolved -> resolved.addresses().toArray(InetAddress[]::new);
+      case Resolved resolved -> new InetAddress[] {resolved.addresses().getFirst()};
       case Refusal refusal -> throw new Refused(host, refusal);
     };
   }

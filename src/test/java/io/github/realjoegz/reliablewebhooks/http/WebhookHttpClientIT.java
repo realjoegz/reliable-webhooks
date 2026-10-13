@@ -29,6 +29,8 @@ import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
@@ -37,6 +39,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Stream;
@@ -49,7 +52,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * The client against a receiver on the loopback address, which its address policy lets through
- * here. The deadline of the client is the one that ships, apart from the two tests that run into
+ * here. The deadline of the client is the one that ships, apart from the three tests that run into
  * it: theirs is short, so that they do not take fifteen seconds each. The test that runs into the
  * wait for a lookup has a short wait for the same reason.
  *
@@ -62,6 +65,7 @@ class WebhookHttpClientIT {
   private static final byte[] BODY = "{\"id\":\"1\"}".getBytes(StandardCharsets.UTF_8);
   private static final Duration DEADLINE = Duration.ofSeconds(15);
   private static final Duration SHORT_DEADLINE = Duration.ofMillis(500);
+  private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(3);
   private static final int CONNECTIONS = 4;
   private static final int LOOKUP_SLOTS_OF_A_TENANT = 4;
   private static final int KIB = 1024;
@@ -346,6 +350,28 @@ class WebhookHttpClientIT {
     assertThat(took).isBetween(SHORT_DEADLINE, SHORT_DEADLINE.plusSeconds(5));
   }
 
+  // The host has two addresses, and the listener behind them takes a connection and then says
+  // nothing, so the TLS handshake of the client waits for a byte that never comes. The deadline
+  // ends that wait. A client that held both addresses would then go on to the second one, where
+  // nothing bounds it but the timeout of the handshake, three seconds after the deadline. This
+  // one was given one address: the attempt ends at the deadline, and the listener saw one
+  // connection.
+  @Test
+  void hostWithTwoAddressesIsConnectedAtOneOfThemAndCutAtTheDeadline() throws Exception {
+    dns.answer("silent.example", "127.0.0.1", "127.0.0.1");
+    try (SilentListener silent = SilentListener.start()) {
+      URI https = URI.create("https://silent.example:%d/hook".formatted(silent.port()));
+
+      long start = System.nanoTime();
+      Outcome outcome = impatient.send(TENANT, ATTEMPT, https, Map.of(), BODY).outcome();
+      Duration took = Duration.ofNanos(System.nanoTime() - start);
+
+      assertThat(outcome).isEqualTo(new Failed(Reason.DEADLINE, null));
+      assertThat(took).isBetween(SHORT_DEADLINE, HANDSHAKE_TIMEOUT);
+      assertThat(silent.acceptedConnections()).isEqualTo(1);
+    }
+  }
+
   // The address literal of the URL goes through the same lookup as a name. This client has no
   // allowance, so the lookup is refused and the receiver sees no connection.
   @Test
@@ -557,5 +583,52 @@ class WebhookHttpClientIT {
       namesAndValues.add("value");
     }
     return namesAndValues.toArray(String[]::new);
+  }
+
+  /**
+   * Listens on the loopback address, takes every connection and keeps it open without reading from
+   * it or writing to it.
+   */
+  private static final class SilentListener implements AutoCloseable {
+
+    private final ServerSocket server;
+    private final List<Socket> connections = new CopyOnWriteArrayList<>();
+
+    private SilentListener(ServerSocket server) {
+      this.server = server;
+    }
+
+    static SilentListener start() throws IOException {
+      SilentListener listener =
+          new SilentListener(new ServerSocket(0, 0, InetAddress.getByName("127.0.0.1")));
+      Thread.ofVirtual().start(listener::accept);
+      return listener;
+    }
+
+    int port() {
+      return server.getLocalPort();
+    }
+
+    int acceptedConnections() {
+      return connections.size();
+    }
+
+    @Override
+    public void close() throws IOException {
+      server.close();
+      for (Socket connection : connections) {
+        connection.close();
+      }
+    }
+
+    private void accept() {
+      while (true) {
+        try {
+          connections.add(server.accept());
+        } catch (IOException closed) {
+          return;
+        }
+      }
+    }
   }
 }

@@ -36,7 +36,10 @@ public class DnsLookups implements AutoCloseable {
 
   public sealed interface Answer permits Resolved, Refusal {}
 
-  /** Every address of the host, and the policy allows each of them. */
+  /**
+   * Every address of the host, in the order of the answer, and the policy allows each of them. A
+   * connection is made to the first.
+   */
   public record Resolved(List<InetAddress> addresses) implements Answer {}
 
   public enum Refusal implements Answer {

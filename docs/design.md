@@ -17,7 +17,7 @@ What the service guarantees, how it keeps each guarantee, and what it does not d
 11. [Security](#11-security): [authentication](#111-authentication) (11.1), [tenant scoping](#112-tenant-scoping) (11.2), [signatures](#113-signatures) (11.3), [SSRF and the outbound client](#114-ssrf-and-the-outbound-client) (11.4), [limits](#115-limits) (11.5), [telemetry hygiene](#116-telemetry-hygiene) (11.6), [untrusted trace context](#117-untrusted-trace-context) (11.7)
 12. [Rate limiting, tenant isolation and database time bounds](#12-rate-limiting-tenant-isolation-and-database-time-bounds)
 13. [Failure table](#13-failure-table): 31 failures, each with the tests that prove what happens
-14. [Limitations](#14-limitations): 35 of them
+14. [Limitations](#14-limitations): 36 of them
 15. [Operations](#15-operations): startup invariants, liveness, shutdown, background jobs, the image, the local stack, the load tests, the Helm chart, migrations and the Terraform module
 16. [Test strategy and harness](#16-test-strategy-and-harness): the rules, the harness, how each proof is forced, and the failure-table check
 17. [Rejected alternatives](#17-rejected-alternatives)
@@ -447,7 +447,7 @@ Timing rules:
 
 | Rule | Value | Why | Proven by |
 |---|---|---|---|
-| Attempt deadline | 15 s, hard | Covers DNS (2 s wait), connect (3 s), TLS, request and the whole response. A watchdog aborts the request at the deadline, so a drip-fed response cannot outlive it. | `SlowEndpointIsolationIT#drippingResponseIsCutAtDeadline` |
+| Attempt deadline | 15 s, hard | Covers DNS (2 s wait), connect (3 s), TLS, request and the whole response. A watchdog aborts the request at the deadline, so a drip-fed response cannot outlive it. The client connects to one address of the host, so the abort leaves it no other address to go on to (section 11.4). | `SlowEndpointIsolationIT#drippingResponseIsCutAtDeadline`, `WebhookHttpClientIT#hostWithTwoAddressesIsConnectedAtOneOfThemAndCutAtTheDeadline` |
 | Lease | 60 s | `StartupInvariants` requires lease >= deadline + 30 s. | `StartupInvariantsTest` |
 | Start cutoff | 35 s after the claim call began | A worker that could not finish inside its lease does not send. The row stays leased and is reclaimed. `StartupInvariants` requires start cutoff + deadline <= finalize cutoff, and < 60 s, the probe slot of section 9. | `DeliveryWorkerTest#doesNotSendAfterStartCutoff` (injected monotonic time source), `StartupInvariantsTest` |
 | Finalize retry | Until 55 s after the claim call began, transient errors only | Covers a database restart; after that the row is left for reclaim. `StartupInvariants` requires finalize cutoff < lease. | `DatabaseRestartIT` (one request, one `success` row across the restart), `FinalizeRetryIT`, `FinalizeRetryTest`, `DatabaseFailuresTest`, `StartupInvariantsTest` |
@@ -745,7 +745,8 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
   - No automatic retries: the library default would re-send on 429 and 503, which would be a second request for one attempt row.
   - No compression: no `Accept-Encoding` is sent, so a compressed response is never inflated.
 - **Bounded response.** The status line and each header line are limited to 8 KiB, counted with the two bytes that end a line, and a response to 100 headers. Exceeding either fails the attempt as `response_too_large`. The body is read through a bounded stream. At 64 KiB the connection is aborted, not drained.
-- **Connect-time check.** `SsrfGuardDnsResolver` is the client's `DnsResolver`. The addresses it returns are the addresses the socket connects to, so there is no gap between check and use, and DNS rebinding is covered. If any resolved address is blocked, the whole lookup is rejected. Reused keep-alive connections were validated when they were opened.
+- **Connect-time check.** `SsrfGuardDnsResolver` is the client's `DnsResolver`. It checks every address of the answer and returns the first, which is the address the socket connects to, so there is no gap between check and use, and DNS rebinding is covered. If any resolved address is blocked, the whole lookup is rejected. Reused keep-alive connections were validated when they were opened.
+  - The client gets one address because of the attempt deadline. Given several, it tries them one after the other, each with its own connect timeout and its own TLS handshake, and the abort at the deadline ends only the one in progress. With one address the abort ends the attempt (limitation 36).
 - **Address policy.** An explicit CIDR list, not JDK predicates.
   - IPv4 deny: 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4.
   - IPv6: default deny outside 2000::/3. Inside it, deny 2001::/23 (Teredo and protocol assignments), 2001:db8::/32 and 2002::/16 (6to4).
@@ -996,6 +997,7 @@ RETURNING b.tokens;
 33. **One old signing secret is kept.** A second rotation inside the 24 h of the first ends that overlap early, and so does the repeat of a rotation whose response was lost. A subscriber that still checks with the secret from before the first rotation rejects every request from then on. The deliveries that it rejects are retried on the schedule until it has a secret that is signed with.
 34. **The scrape is open to whoever reaches the port.** `/actuator/prometheus` takes no key and is served on the port of the API. It holds no tenant, endpoint or delivery, but it does show the state of the queue and the rate of failures. Keeping it from the public belongs to the ingress.
 35. **A delivery can wait up to a second for its claim while the replicas have little to do.** A poller that finds nothing due waits before it claims again, and the wait grows to 1 s (section 7). Attempts that end one after the other, each followed by a claim that finds nothing new, take the wait there within milliseconds. A delivery that becomes due then waits until the poller of one replica wakes. [performance.md](performance.md) has the times that this gave.
+36. **An attempt connects to one address of its host.** The client is given the first address of the lookup, in the order in which the resolver returned them, and does not go on to another when that one fails (section 11.4). A host whose first address is down while another one answers fails the attempt, and the delivery is retried on the schedule.
 
 ## 15. Operations
 
