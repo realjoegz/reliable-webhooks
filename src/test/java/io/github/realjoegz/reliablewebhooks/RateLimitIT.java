@@ -656,6 +656,7 @@ class RateLimitIT {
     assertThat(problem.get("status").asInt()).isEqualTo(429);
     assertThat(problem.get("title").asString()).isNotBlank();
     assertThat(problem.get("detail").asString()).isNotBlank();
+    assertThat(problem.get("instance").asString()).isEqualTo(answer.getUrl().getPath());
   }
 
   /** How often the api pool of the replica has handed out a connection. */

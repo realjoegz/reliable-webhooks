@@ -32,6 +32,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.client.RestTestClient;
@@ -187,6 +188,22 @@ class EventApiIT {
         .exchange()
         .expectStatus()
         .isUnauthorized();
+  }
+
+  @Test
+  void methodThatTheRouteDoesNotTakeIsRefused() {
+    TestTenant tenant = TestTenant.create(http, "wrong-method");
+
+    http.delete()
+        .uri("/v1/events")
+        .headers(headers -> headers.setBearerAuth(tenant.apiKey()))
+        .exchange()
+        .expectStatus()
+        .isEqualTo(HttpStatus.METHOD_NOT_ALLOWED)
+        .expectHeader()
+        .valueEquals(HttpHeaders.ALLOW, "POST")
+        .expectHeader()
+        .contentType(MediaType.APPLICATION_PROBLEM_JSON);
   }
 
   @Test

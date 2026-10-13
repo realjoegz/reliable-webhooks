@@ -15,7 +15,7 @@ import javax.crypto.spec.SecretKeySpec;
 
 /**
  * The smallest subscriber: one file without a build, started with {@code java Subscriber.java
- * <port>}. It checks every request with the reference verifier of the README, prints what it
+ * <port>}. It checks every request with the reference verifier of docs/api.md, prints what it
  * received and answers 200. A request that is not genuine is answered with 401, and of such a
  * request only the headers are printed.
  *

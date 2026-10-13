@@ -18,7 +18,8 @@ import org.w3c.dom.NodeList;
 import org.xml.sax.SAXException;
 
 /**
- * Fails the build unless every test that a failure table links to ran and passed in this build.
+ * Fails the build unless every test that a table of the documents links to ran and passed in this
+ * build.
  *
  * <p>A checked table is a Markdown table with a {@code Test} column. Each of its rows must link at
  * least one test in that column, as {@code Class#method}, {@code #method} (the class named before
@@ -53,11 +54,13 @@ public final class FailureTableCheck {
         violations(
             List.of(
                 new TableFile(project.resolve("README.md"), 1),
-                new TableFile(project.resolve("docs/failure-table.md"), 2)),
+                new TableFile(project.resolve("docs/failure-table.md"), 2),
+                new TableFile(project.resolve("docs/behaviour.md"), 4)),
             List.of(build.resolve("surefire-reports"), build.resolve("failsafe-reports")));
     if (!violations.isEmpty()) {
       throw new IllegalStateException(
-          "The failure tables are not proven by this build:\n  " + String.join("\n  ", violations));
+          "The tables that link tests are not proven by this build:\n  "
+              + String.join("\n  ", violations));
     }
   }
 

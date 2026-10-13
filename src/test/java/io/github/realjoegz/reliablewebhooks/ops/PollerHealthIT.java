@@ -22,6 +22,9 @@ import org.springframework.test.web.servlet.client.RestTestClient;
 @InProcessReplica
 class PollerHealthIT {
 
+  private static final String HEALTH = "/actuator/health";
+  private static final String LIVENESS = HEALTH + "/liveness";
+  private static final String READINESS = HEALTH + "/readiness";
   private static final String STUCK = "replica-with-a-stuck-poller";
   private static final Duration SIXTY_SECONDS = Duration.ofSeconds(60);
 
@@ -34,22 +37,23 @@ class PollerHealthIT {
   // A second replica starts as the application does, with a heartbeat whose clock stands still
   // unless the test moves it. The test locks the delivery table, and the poller of that replica
   // is seen waiting in its claim: its loop does not come by its heartbeat while it waits there.
-  // Then the test lets 60 seconds pass on the clock. The liveness probe now answers down, and the
-  // readiness probe, which does not ask the poller, still answers up. When the test lets go of
-  // the table, the claim ends, the loop beats, and the replica is live again.
+  // Then the test lets 60 seconds pass on the clock. The liveness probe now answers down, and so
+  // does the health of the replica as a whole, which asks every indicator. The readiness probe,
+  // which does not ask the poller, still answers up. When the test lets go of the table, the
+  // claim ends, the loop beats, and the replica is live again.
   //
   // The gauge of the poller in a scrape of that replica is the time that the probe went by: the
   // 60 seconds while the probe answers down, and none once the loop has beaten.
   //
   // The claim waits for as long as the lock timeout of the worker pool allows, which is 5 s. The
-  // test has that long to ask the two probes and to scrape.
+  // test has that long to ask for the health of the replica three times and to scrape it.
   @Test
   void livenessProbeIsDownWhileThePollerDoesNotLoop() throws Exception {
     AtomicLong nanoTime = new AtomicLong();
     PollerHeartbeat heartbeat = new PollerHeartbeat(nanoTime::get);
     try (ConfigurableApplicationContext replica = SelfStartedReplica.start(STUCK, heartbeat)) {
       RestTestClient http = SelfStartedReplica.clientOf(replica);
-      expect(http, "liveness", HttpStatus.OK, "UP");
+      expect(http, LIVENESS, HttpStatus.OK, "UP");
 
       try (Connection blocker = TestDatabase.connection();
           Statement lock = blocker.createStatement()) {
@@ -57,14 +61,15 @@ class PollerHealthIT {
         PgWait.untilBlocked(CLAIM, STUCK);
         nanoTime.addAndGet(SIXTY_SECONDS.toNanos());
 
-        expect(http, "liveness", HttpStatus.SERVICE_UNAVAILABLE, "DOWN");
-        expect(http, "readiness", HttpStatus.OK, "UP");
+        expect(http, LIVENESS, HttpStatus.SERVICE_UNAVAILABLE, "DOWN");
+        expect(http, HEALTH, HttpStatus.SERVICE_UNAVAILABLE, "DOWN");
+        expect(http, READINESS, HttpStatus.OK, "UP");
         assertThat(secondsOnTheGaugeOfThePoller(http)).isEqualTo(SIXTY_SECONDS.toSeconds());
 
         blocker.rollback();
       }
 
-      await().untilAsserted(() -> expect(http, "liveness", HttpStatus.OK, "UP"));
+      await().untilAsserted(() -> expect(http, LIVENESS, HttpStatus.OK, "UP"));
       assertThat(secondsOnTheGaugeOfThePoller(http)).isZero();
     }
   }
@@ -84,9 +89,9 @@ class PollerHealthIT {
     return Double.parseDouble(gauge.group(1));
   }
 
-  private static void expect(RestTestClient http, String probe, HttpStatus status, String health) {
+  private static void expect(RestTestClient http, String path, HttpStatus status, String health) {
     http.get()
-        .uri("/actuator/health/" + probe)
+        .uri(path)
         .exchange()
         .expectStatus()
         .isEqualTo(status)

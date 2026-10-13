@@ -1,5 +1,27 @@
 # reliable-webhooks: design
 
+What the service guarantees, how it keeps each guarantee, and what it does not do. Tests compare the schema and most of the statements in this document with the code, and [behaviour.md](behaviour.md#how-the-documents-are-held-to-the-code) lists them. Code comments and tests cite the sections by number.
+
+## Contents
+
+1. [Guarantees](#1-guarantees): G1 to G7, and what is not guaranteed
+2. [Architecture and stack](#2-architecture-and-stack): the packages and the six house rules
+3. [Kill table](#3-kill-table): the six points at which a replica is killed, K1 to K6
+4. [Data model](#4-data-model): the schema, the state machine, and what leased, abandoned and held mean
+5. [API](#5-api): the routes, the problem types, the admin routes and suspension
+6. [Ingest: idempotency and transactional-outbox fan-out](#6-ingest-idempotency-and-transactional-outbox-fan-out)
+7. [Delivery worker: claim, lease, send, finalize](#7-delivery-worker-claim-lease-send-finalize): the six steps of an attempt and the timing rules
+8. [Retry schedule, dead letter, replay](#8-retry-schedule-dead-letter-replay)
+9. [Circuit breaker](#9-circuit-breaker): the gate, the probe and how they meet the attempt budget
+10. [Observability](#10-observability): metrics, traces and logs
+11. [Security](#11-security): [authentication](#111-authentication) (11.1), [tenant scoping](#112-tenant-scoping) (11.2), [signatures](#113-signatures) (11.3), [SSRF and the outbound client](#114-ssrf-and-the-outbound-client) (11.4), [limits](#115-limits) (11.5), [telemetry hygiene](#116-telemetry-hygiene) (11.6), [untrusted trace context](#117-untrusted-trace-context) (11.7)
+12. [Rate limiting, tenant isolation and database time bounds](#12-rate-limiting-tenant-isolation-and-database-time-bounds)
+13. [Failure table](#13-failure-table): 31 failures, each with the tests that prove what happens
+14. [Limitations](#14-limitations): 35 of them
+15. [Operations](#15-operations): startup invariants, liveness, shutdown, background jobs, the image, the local stack, the load tests, the Helm chart, migrations and the Terraform module
+16. [Test strategy and harness](#16-test-strategy-and-harness): the rules, the harness, how each proof is forced, and the failure-table check
+17. [Rejected alternatives](#17-rejected-alternatives)
+
 ## 1. Guarantees
 
 | # | Guarantee | Enforced by |
@@ -58,7 +80,7 @@ House rules, each checked by a test or a startup invariant:
 
 ## 3. Kill table
 
-Each row is a SIGKILL of a real replica process, landed deterministically with the lock-block or receiver-hold technique of section 16.
+Each row is a SIGKILL of a real replica process, landed at a chosen point and never by timing (section 16).
 
 | # | SIGKILL lands | State left | Recovery | Visible effect | Test |
 |---|---|---|---|---|---|
@@ -184,6 +206,8 @@ Three derived terms, each defined once:
 Every writer other than the claim sets `lease_token = NULL`: finalize, release, expiry, cancel and replay. A `dead` or `cancelled` row therefore never carries a stale token into its next run.
 
 ## 5. API
+
+[api.md](api.md) is the reference for callers: every route with its request, its response and its status codes. This section says what the routes are for.
 
 Tenant routes take `Authorization: Bearer <api key>`. A request body is JSON in UTF-8 (section 11.5). Errors are RFC 9457 problem documents. An id that belongs to another tenant returns 404.
 
@@ -665,8 +689,10 @@ Spring Boot adds meters of its own to the scrape, for the JVM, the connection po
 
 ## 11. Security
 
-**11.1 Authentication.**
+### 11.1 Authentication
+
 - `ApiKeyFilter` decides by the first path segment, read the way Spring MVC matches it (decoded, without path parameters). `admin` takes the admin token, `actuator` is open, and every other path takes an API key. A route added later is therefore authenticated without being listed, and a path spelled `/%61dmin/tenants` cannot reach an admin route with an API key.
+- Under `/actuator` a replica serves its health, its meters and an index that links the two, and nothing else. `ApiKeyAuthIT#actuatorIndexNeedsNoKeyAndLinksHealthAndTheScrapeOnly` reads the index.
 - A missing, malformed or unknown credential gets the same `401` with `WWW-Authenticate: Bearer`.
 - On a path that takes a credential, no body is read before the credential is checked. `ApiKeyFilter` goes by the path and the `Authorization` header, and the filter of Spring Boot that would read a form ahead of it is turned off (section 11.5). The actuator endpoints take no credential, and a JSON body that is sent to one is read, up to the limit on a request body (section 11.5).
 - API keys are `rwh_` plus 32 random bytes in base64url, shown once. Anything of another form is rejected without a lookup.
@@ -676,14 +702,17 @@ Spring Boot adds meters of its own to the scrape, for the JVM, the connection po
 - A suspended tenant is rejected with 403.
 - `/admin/**` requires a static token from the environment, compared in constant time. `StartupInvariants` refuses to start without one of at least 32 characters.
 
-**11.2 Tenant scoping.**
+### 11.2 Tenant scoping
+
 - Every statement behind a tenant route carries `tenant_id = :t`. A mutating route whose first statement matches no row answers 404 and runs nothing else. The charge of a single replay comes before that statement and writes the bucket of the caller only. A bulk replay resolves its endpoint first and charges nothing for an id that it does not find.
 - `SqlTenantScopeTest` scans the repository SQL constants and fails on a tenant-table statement without it. The exemption list holds worker and job statements only, by class.
   - A tenant table is every table but `tenant`, whose rows are addressed by their own id.
   - An `INSERT` that only supplies values is not checked. It creates a row and can neither read nor change a row of another tenant.
 - `TenantIsolationIT#mutatingRoutesLeaveForeignTenantUntouched` calls every mutating route (patch, delete, rotate, single and bulk replay) with a foreign id. It snapshots the foreign tenant's endpoint, delivery, circuit and bucket rows before the call and asserts they are identical after it, in addition to the 404. The single replay with a foreign id is charged all the same, and its unit comes out of the bucket of the caller. Read routes are checked for the 404.
 
-**11.3 Signatures.** The format follows Standard Webhooks.
+### 11.3 Signatures
+
+The format follows Standard Webhooks.
 
 | Header | Value |
 |---|---|
@@ -692,7 +721,7 @@ Spring Boot adds meters of its own to the scrape, for the JVM, the connection po
 | `webhook-signature` | `v1,<base64 HMAC-SHA256(secret, "{id}.{timestamp}.{body}")>` |
 
 - The timestamp is inside the MAC input, and the body is the stored bytes.
-- The README ships a reference verifier that rejects a timestamp more than 5 minutes away from the time of the check, whether it is older or lies ahead. Because the timestamp comes from Postgres, a replica with a wrong wall clock cannot get deliveries rejected.
+- [api.md](api.md) quotes a reference verifier that rejects a timestamp more than 5 minutes away from the time of the check, whether it is older or lies ahead. Because the timestamp comes from Postgres, a replica with a wrong wall clock cannot get deliveries rejected.
 - After rotation both signatures are sent, space separated, for 24 h, the one of the new secret first. Then the old secret is ignored and later purged. The database clock decides when the overlap ends: the load of an attempt (section 7) returns the old secret only while `prev_secret_expires_at > now()`.
 - A rotation is one autocommit statement:
 
@@ -707,7 +736,8 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
 - A signing secret is `whsec_` plus 32 random bytes in base64, shown once. The 32 bytes are the MAC key.
 - Secrets are encrypted at rest with AES-256-GCM under a key from the environment, with a one-byte key-version prefix. The key is 32 bytes, given in base64. A stored value is the version byte, a random 96-bit nonce, then the ciphertext with its tag.
 
-**11.4 SSRF and the outbound client.**
+### 11.4 SSRF and the outbound client
+
 - `WebhookHttpClient` is the only class that builds an HTTP client; an `ArchitectureTest` rule enforces it.
 - Its constructor requires a `DnsLookups`, and a `DnsLookups` cannot be built without an `AddressPolicy`. There is no default, so an unguarded client cannot be constructed.
 - **Stateless client.** One client serves all tenants, so it must carry nothing from one request to the next. It is built with cookie management, automatic retries, auth caching, content compression and redirect handling all disabled, without proxy support and without system properties.
@@ -737,7 +767,7 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
   - The tenant id reaches the resolver through the one `ThreadLocal` in the codebase, set and cleared in `WebhookHttpClient.send`.
 - **Local allowance.** `webhooks.ssrf.allow-cidrs` and plain `http` (`webhooks.ssrf.allow-http`) exist for tests and docker compose. `StartupInvariants` refuses to start with either set unless the `unsafe-local` profile is active, and the allowlist size is exported as a gauge. An allowed range lets its addresses through at registration and at connect. With `http` allowed, an `http` URL must name its port, which has to be 443 or 1024 to 65535 like any other.
 
-**11.5 Limits.**
+### 11.5 Limits
 
 | Limit | Value |
 |---|---|
@@ -789,14 +819,17 @@ INSERT INTO endpoint_circuit (endpoint_id) VALUES (:id);
 
 Each of the two create transactions, this one and the one of a tenant (section 5), is all or nothing. `EndpointApiIT#failedCircuitInsertLeavesNoEndpoint` and `AdminApiIT#failedBucketInsertLeavesNoTenant` fail the second insert behind a table lock of the test and find no row of the first.
 
-**11.6 Telemetry hygiene.** The redaction list of section 10 applies to logs, spans and metrics. Three tests assert it with a subscriber URL that carries a marker in its path and query:
+### 11.6 Telemetry hygiene
+
+The redaction list of section 10 applies to logs, spans and metrics. Three tests assert it with a subscriber URL that carries a marker in its path and query:
 - `LogFormatIT#subscriberUrlIsReducedToHost`
 - `TracingIT#attemptSpanCarriesHostOnly`
 - `MetricsIT#noMeterHasHostOrUrlLabel`, which scans the whole scrape for the marker, the receiver host and the ids.
 
 The first of them reads every line written by a replica that runs as a process of its own (section 16). It looks in those lines for the rest of the list as well: the API key, the admin token, the signing secret, the signatures of the requests and the payload of the event.
 
-**11.7 Untrusted trace context.**
+### 11.7 Untrusted trace context
+
 - `UntrustedTraceContextFilter` runs before the tracing filter on public routes, which are all the routes of a replica. It strips the W3C headers `traceparent`, `tracestate` and `baggage`, and the B3 headers: `b3`, and `x-b3-traceid`, `x-b3-spanid`, `x-b3-parentspanid`, `x-b3-sampled` and `x-b3-flags`.
 - It keeps the `traceparent` only if it is version 00, 55 characters, lowercase hex with non-zero ids, and hands that to `IngestService` as a span link. A request with more than one `traceparent` has none that is kept.
 - Spring Boot reads the W3C headers and both forms of B3 unless `management.tracing.propagation.type` tells it to read fewer. The filter strips them all and does not go by that setting, so no value of it lets the context of a caller reach the tracing filter.
@@ -865,7 +898,7 @@ RETURNING b.tokens;
 
 ## 13. Failure table
 
-The checked copy of this table lives in `docs/failure-table.md`, where a row appears only once the test that proves it exists. The README shows the headline rows. `FailureTableCheck` (section 16) fails the build unless every test linked from a table in either file ran and passed in the same build. A row keeps its number, and number 29 is not in use.
+`docs/failure-table.md` has the same rows and is the copy that the build checks. `FailureTableCopiesTest` holds the two to each other: this table in all but its last column, and the kill table of section 3 in full. `docs/failure-table.md` says at more length how each test forces its failure, and what each proof does and does not cover. The README shows ten of the rows, cut to their main claims. `FailureTableCheck` (section 16) fails the build unless every test linked from a table in either of those two files ran and passed in the same build. A row keeps its number, and number 29 is not in use.
 
 | # | Failure | Proven behaviour | Test | Forced by |
 |---|---|---|---|---|
@@ -874,13 +907,13 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 | 3 | Worker killed after claim, before send | Zero requests from the dead replica; delivered by a replica started after the kill; attempt 1 `unknown` | `WorkerKillIT#killedAfterClaimBeforeSend` | Test `ACCESS EXCLUSIVE` lock on `event` blocks the load of an ordinary closed-circuit delivery |
 | 4 | Replica killed during ingest | Nothing or everything; retry with the same key yields one event | `IngestKillIT#killedBeforeCommit`, `#killedAfterCommitBeforeResponse` | Test lock on the endpoint row blocks fan-out |
 | 5 | Duplicate submit | One event; same id returned; different body gets 422 | `IdempotencyIT#sameKeyReturnsSameEvent`, `#concurrentSameKeyCreatesOneEvent`, `#sameKeyDifferentBodyIsRejected` | Request 1 blocked in its transaction; request 2 seen waiting on the unique index |
-| 6 | Two replicas race for one delivery | One claimer gets it; the other skips without waiting | `ClaimRaceIT#secondClaimerSkipsLockedRow`, `#fourReplicasDeliverEachEventOnce` | Two open transactions; then 4 pollers over 2,000 deliveries |
-| 7 | Lease expires while the first replica is still sending | Both may send; only the lease holder's result is recorded | `LeaseFenceIT#lateFinalizeAfterReclaimChangesNothing`, `#repeatedFinalizeIsNoOp` | Lease aged between claim and finalize |
+| 6 | Two claimers race for one delivery | One claimer gets it; the other skips it without waiting; four pollers on one database deliver each of 2,000 deliveries once | `ClaimRaceIT#secondClaimerSkipsLockedRow`, `#fourReplicasDeliverEachEventOnce` | Two open transactions; then 4 pollers over 2,000 deliveries |
+| 7 | Lease expires while its holder is still sending | The delivery is claimed again and both requests are sent; only the result of the lease holder is recorded | `LeaseFenceIT#lateFinalizeAfterReclaimChangesNothing`, `#repeatedFinalizeIsNoOp` | Lease aged between claim and finalize |
 | 8 | Database restart | No delivery lost; the delivery in flight across the restart is recorded once from one request; ingest answers 503 and the same key succeeds afterwards; replicas stay up | `DatabaseRestartIT#inFlightAndQueuedSurviveRestart`, `DatabaseFailuresTest`, `FinalizeRetryTest`, `ProblemsTest#failedConnectionIsDatabaseBusy` | Receiver holds the four requests of each of two replicas, with two more deliveries due and unclaimed; the container is stopped, the receiver released and an event refused; the container is started again on the host port that it had |
-| 9 | Endpoint down for hours | Circuit opens after 5 failures; held deliveries use no attempts; one probe fleet-wide per interval; probe backoff stays capped; recovery drains | `EndpointOutageIT#circuitOpensAndHolds`, `#oneProbeAdmittedAcrossConcurrentClaimers`, `#probeBackoffIsCappedAfterManyFailures`, `#recoveryDrainsHeldDeliveries`, `#probeSlotReopensAfterProberKilled` | Two connections on the gate; probe time aged; `probe_failures` set to 1000; a canary on a second endpoint witnesses that claims ran |
+| 9 | Endpoint down for hours | Circuit opens after 5 failures; held deliveries use no attempts; one probe per interval across concurrent claimers; probe backoff stays capped; recovery drains | `EndpointOutageIT#circuitOpensAndHolds`, `#oneProbeAdmittedAcrossConcurrentClaimers`, `#probeBackoffIsCappedAfterManyFailures`, `#recoveryDrainsHeldDeliveries`, `#probeSlotReopensAfterProberKilled` | Two connections on the gate; probe time aged; `probe_failures` set to 1000; a canary on a second endpoint witnesses that claims ran |
 | 10 | Endpoint down for good | A single delivery ends `dead (exhausted)` after 5 attempts and 7 probes; a backlog ends `dead (expired)` at 72 h; a delivery whose holder was killed expires with that attempt logged `unknown`; replay delivers and its run starts at attempt 1 | `EndpointOutageIT#hardDownEndpointWithDefaultBreakerSettings`, `#heldDeliveriesExpireAfterBudget`, `#expiredAfterHolderKilledReplaysCleanly`, `ExpiryIT#pendingPastBudgetBecomesDead` | Production breaker and retry settings; rows aged |
 | 11 | One event always rejected by a healthy endpoint | Twelve attempts, each wait inside its schedule window, then `dead (exhausted)`; replay delivers once | `DeadLetterReplayIT#exhaustedAfterTwelveAttempts`, `#replayedDeliveryIsDeliveredOnce`, `RetryScheduleTest` | Breaker at defaults; other deliveries succeed in between |
-| 12 | A delivery that kills its worker every time | Dead-lettered on the 13th claim without a send | `PoisonDeliveryIT#thirteenthClaimDeadLetters` | Twelve aged leases |
+| 12 | A delivery whose every claim ends without a record | Dead-lettered on the 13th claim without a send | `PoisonDeliveryIT#thirteenthClaimDeadLetters` | Twelve aged leases |
 | 13 | Slow endpoint starving others | At most 4 concurrent requests per replica to it; other endpoints complete meanwhile; a drip-fed response is cut at the deadline | `SlowEndpointIsolationIT#slowEndpointDoesNotDelayOthers`, `#drippingResponseIsCutAtDeadline` | Receiver holds every request to the slow endpoint until the test ends |
 | 14 | Subscriber DNS that never answers | Attempt fails inside the DNS budget; at most 4 stuck lookups per tenant; other tenants complete; the tenant's healthy endpoints lose no attempt and keep a closed circuit | `SlowEndpointIsolationIT#slowDnsDoesNotStarveOthers`, `#stuckDnsOfOneEndpointDoesNotFailSiblingEndpoints`, `SsrfIT#registrationDnsLookupIsBounded` | `StubDns` delegate that blocks until the test releases it |
 | 15 | One tenant's backlog starving another tenant | Held case: tenant A never exceeds 16 in flight per replica and tenant B completes meanwhile. Fast case: with a deep backlog on A's instantly answering endpoint, B's request arrives before A's 200th of 2,000 | `TenantIsolationIT#backlogOfOneTenantDoesNotStarveAnother`, `#deepBacklogOnFastEndpointDoesNotStarveAnother` | Held case: A has 5 endpoints with 4 deliveries each. The receiver holds the 4 requests of each of four endpoints, and the deliveries for the fifth stay due and unclaimed, so the tenant cap binds where no endpoint cap does. Fast case: 2,000 aged due rows for A, one newer row for B; ordering read from the receiver's request log |
@@ -910,7 +943,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
    - With the plan that the claim is written for, every claim does one index probe per eligible endpoint and locks one head row per endpoint with due work.
    - Nothing makes PostgreSQL choose that plan. The pending deliveries have two partial indexes, `delivery_head` and `delivery_expiry`. Both look empty to the planner while the statistics of the table are from a time when next to nothing was pending, which is the usual state of a queue that keeps up. It has then been seen to choose `delivery_expiry`, which is ordered by another column. Each probe reads every pending delivery of every endpoint and sorts those of its own endpoint, so a claim costs as much as the queue is deep, once for each eligible endpoint, and a backlog is drained slowly until the table is analysed again. [performance.md](performance.md) has such a drain, with the plan of the claim before and after.
    - With that plan the backlog of one tenant is paid for by every tenant. The index holds the pending deliveries of all of them, held ones among them, and a replica makes one claim for all tenants, so each of their deliveries waits for a claim that reads the whole queue. The `worker` pool ends a statement after 10 s (section 12). A claim that would take longer fails, and a replica then claims nothing, for any tenant, for as long as the claim is that slow. The drain in performance.md has one tenant with one endpoint and 50,000 pending deliveries, so no run shows what another tenant waits, and none came near those 10 s.
-   - At tens of thousands of endpoints the claim becomes the bottleneck. The scaling path is a ready-endpoint table and time partitions.
+   - The service has no table of the endpoints with due work, which would let a claim read those alone, and the queue table has no time partitions.
    - The queue table needs aggressive autovacuum.
    - Retention is batched deletes.
 5. **Bulkheads are per replica.** Fleet-wide concurrency to one endpoint is at most 4 times the replica count; it is not an exact number.
@@ -984,7 +1017,7 @@ The checked copy of this table lives in `docs/failure-table.md`, where a row app
 - No JVM proxy properties.
 - SSRF allowlist empty and `http` disabled unless the `unsafe-local` profile is active.
 
-**Liveness.** The `poller` health indicator (`PollerHealth`) belongs to the liveness group, next to the liveness state of Spring Boot. It reports down when the poller loop has not finished an iteration for 60 s, which it reads from `PollerHeartbeat` on the monotonic clock of the replica. A failed claim also finishes an iteration, so a database outage does not restart pods. Only a poller that stopped looping does. A heartbeat that was never beaten counts from the start of the replica. `PollerHealth` also registers the gauge of section 10, on the heartbeat that it reads. `PollerHeartbeatTest` covers the rule and the gauge with an injected time source, and `DeliveryPollerTest` that the loop beats after a claim that failed. `PollerHealthIT` asks the probes of a replica whose poller is seen waiting in its claim, behind a table lock of the test, after the test has moved the clock of its heartbeat by 60 s: the liveness probe answers down and the readiness probe up, and the liveness probe answers up again once the claim has ended. A scrape of that replica shows the gauge at those 60 s while the probe answers down, and at 0 once it answers up again.
+**Liveness.** The `poller` health indicator (`PollerHealth`) belongs to the liveness group, next to the liveness state of Spring Boot. It reports down when the poller loop has not finished an iteration for 60 s, which it reads from `PollerHeartbeat` on the monotonic clock of the replica. A failed claim also finishes an iteration, so a database outage does not restart pods. Only a poller that stopped looping does. A heartbeat that was never beaten counts from the start of the replica. `PollerHealth` also registers the gauge of section 10, on the heartbeat that it reads. `PollerHeartbeatTest` covers the rule and the gauge with an injected time source, and `DeliveryPollerTest` that the loop beats after a claim that failed. `PollerHealthIT` asks the probes of a replica whose poller is seen waiting in its claim, behind a table lock of the test, after the test has moved the clock of its heartbeat by 60 s: the liveness probe answers down, and so does `/actuator/health`, which asks every indicator of the replica. The readiness probe answers up, and the liveness probe answers up again once the claim has ended. A scrape of that replica shows the gauge at those 60 s while the probe answers down, and at 0 once it answers up again.
 
 The database health indicator is off. The health endpoint takes no key, so it must not borrow pooled connections.
 
@@ -1231,7 +1264,7 @@ Harness:
 | `PgWait` | `untilBlocked(sqlFragment, replica)` polls `pg_stat_activity` for a backend of that replica waiting on a lock in a statement containing the fragment, or for a given number of such backends. The lock timeout of the replica's pool ends that wait, so the test has that long to act. `endBlocked(sqlFragment, replica)` ends those backends, as a database that shuts down ends a session, and returns how many they were. `untilGone(replica)` waits until its backends have left, which is where a replica that was killed ends up. `untilNoTransaction(replica)` waits until none of its backends is in a transaction. It is for a replica whose connections went silent: nothing closes them, so its backends do not leave. |
 | `StubDns` | The resolver behind `DnsLookups` in a replica inside the test JVM, in place of the system resolver: scripted answers per call, or block until released. A name that no test scripted does not resolve. |
 | `TcpProxy` | In-process TCP forwarder between one replica and Postgres. `blackhole()` keeps every existing connection open and relays nothing more on it, ever; new connections are accepted and ignored. `heal()` lets new connections relay again. |
-| `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use, with room for 300 connections: a replica holds 32, and besides the replicas inside the test JVM a test runs up to two as processes. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. `stop()` and `start()` stop the container and start it again. The container is created with a host port that was free at that moment, because Docker gives a container that starts again another port unless its port was named. |
+| `TestDatabase` | One Testcontainers PostgreSQL per test JVM, started on first use, with room for 300 connections: a replica holds 32, and besides the replicas inside the test JVM a test runs up to two as processes. The server runs with `fsync` off, as Testcontainers starts it. A stopped container leaves its data with the operating system, which keeps running, so the restart of row 8 is no test of a database whose machine went down. Hands its JDBC URL and credentials to replicas. Gives a test its own `JdbcClient` outside the pools of the service, and a connection with autocommit off for a transaction the test holds open. `stop()` and `start()` stop the container and start it again. The container is created with a host port that was free at that moment, because Docker gives a container that starts again another port unless its port was named. |
 | `ReplicaSettings` | The settings a replica under test needs beyond the shipped configuration: the `TestDatabase` connection with the replica id as `application_name`, an admin token and a secret-encryption key. |
 | `InProcessReplica` | Annotation for a test class that runs against a replica inside the test JVM on a random port, with those settings and the shipped configuration. All such classes share one application context, and so one pair of pools. The worker, the jobs and the queue gauges of the replica are left to the tests, and the queue is emptied before each test. |
 | `UnsafeLocalReplica` | An `InProcessReplica` with the `unsafe-local` profile and its allowance: plain `http` and the loopback address, where `FaultReceiver` listens. The classes with this annotation share a second application context. |
@@ -1315,13 +1348,14 @@ How each proof is forced.
 **The failure-table check.** `FailureTableCheck` is a small main class run by `exec-maven-plugin` in `verify`, after Failsafe.
 
 - The build deletes `target/surefire-reports` and `target/failsafe-reports` in `initialize`. Reports from an earlier build can therefore never satisfy the check, with or without `clean`.
-- It parses the kill table and the failure table in `docs/failure-table.md` and the headline table in `README.md`. A table is checked when its header has a `Test` column. Each file must contain a fixed number of checked tables, one in `README.md` and two in `docs/failure-table.md`, so renaming the column of any table cannot switch its check off. Matching rules:
+- It parses the kill table and the failure table in `docs/failure-table.md`, the headline table in `README.md` and the four tables in `docs/behaviour.md` that link tests. A table is checked when its header has a `Test` column, and the links of a row are read from that column alone. Each file must contain a fixed number of checked tables, one in `README.md`, two in `docs/failure-table.md` and four in `docs/behaviour.md`, so renaming the column of any table cannot switch its check off. Matching rules:
   - `Class#method` must match at least one `testcase` of that class named `method`, `method[...]` or `method(...)`. Every match must have passed.
   - `#method` inherits the class named before it in the same cell.
   - A bare `Class` means every `testcase` of that class: at least one, all passed.
   - Passed means no `skipped`, `failure`, `error`, `flakyFailure` or `rerunFailure` child. The POM does not enable reruns.
 - It fails on a row with no link, on a missing method, and on a linked test that did not run. That covers `@Disabled`, an excluded tag, `-DskipITs` and a renamed method with one rule.
 - `FailureTableCheckTest` feeds it one fixture report per rule above.
+- It does not parse this document. `FailureTableCopiesTest` compares the kill table of section 3 and the failure table of section 13 with the two tables of `docs/failure-table.md`, the kill table in full and the failure table in all but its last column. A test that one of them links is therefore a test that the check has looked for.
 - The default `mvn verify` runs every tag. `process` and `dbrestart` exist only so a developer can exclude them locally, and then the check fails by design.
 - `-DfailureTable.skip=true` skips the check, so that a single test can be run locally. CI never sets it.
 
@@ -1329,22 +1363,22 @@ How each proof is forced.
 
 | Decision | Rejected | Why |
 |---|---|---|
-| Postgres as queue, `SKIP LOCKED` claim | Kafka, SQS, Redis | Fixed constraint, and one store means no dual write between "event saved" and "message queued". |
+| Postgres as queue, `SKIP LOCKED` claim | Kafka, SQS, Redis | One store means no dual write between "event saved" and "message queued". |
 | Deliveries written in the ingest transaction | Async fan-out relay over an outbox table | A relay adds a second claimer and a window where an event has no deliveries. Fan-out is at most 50 rows. |
 | Lease is `next_attempt_at` | `in_flight` state plus a reaper job | The reaper is one more component that can die. A timestamp cannot. |
 | Lease token as fence | Trusting lease time alone | A stalled replica cannot know its lease expired. The token makes a late write harmless. |
 | Polling with idle backoff | `LISTEN/NOTIFY` | Needs a dedicated connection per replica and still needs polling for missed notifications. |
 | Attempts counted at claim | Counted at finalize | A delivery that kills its worker would retry forever. |
 | Any non-2xx is retried | 4xx as permanent failure | A subscriber deploy bug returning 404 for ten minutes would destroy events. |
-| Endpoint-first claim: one head row per eligible endpoint | A window of the oldest due rows, reduced to one per endpoint | The window is filled by whichever endpoint has the oldest backlog, so one fast endpoint with a deep backlog starved every other tenant. |
+| Endpoint-first claim: one head row per eligible endpoint | A window of the oldest due rows, reduced to one per endpoint | The window is filled by whichever endpoint has the oldest backlog, so one fast endpoint with a deep backlog starves every other tenant. |
 | The same | A larger window | Any single endpoint can still fill it. |
 | The same | Repeating the windowed claim with already-picked endpoints excluded | Fair, but every repeat scans past the excluded backlog, and it needs a per-tenant pending cap to bound that scan. |
-| The same | A per-endpoint queue-head table | A second row to keep consistent in ingest, finalize and replay. It is the scaling path, not the starting point. |
+| The same | A per-endpoint queue-head table | A second row to keep consistent in ingest, finalize and replay. That is worth its price only where the claim is the bottleneck (limitation 4). |
 | One row per endpoint per claim | Claim a batch, then release the overshoot | Releasing causes a claim-and-release loop on deep backlogs and adds a release race. |
 | Breaker state in Postgres | Resilience4j, or a per-replica breaker | In-memory state cannot hold deliveries fleet-wide or admit one probe across replicas, and is lost on restart. The price is that one replica's faulty view becomes everyone's (limitation 25). |
 | No replica self-quarantine | Stop claiming when the last N attempts across several endpoints all failed to connect | It cannot tell "my egress is broken" from "these endpoints are down" without a known-good probe target, and a false positive takes a healthy replica out. |
 | Probe slot as a pushed timestamp | `half_open` state | A state needs someone to leave it; a killed prober would wedge the circuit. |
-| DNS `busy` releases the row | Record it as a failed attempt | It is this replica's admission decision. Recording it burned attempts and opened circuits on the tenant's healthy endpoints. The price is the claim-and-release loop of limitation 29. |
+| DNS `busy` releases the row | Record it as a failed attempt | It is this replica's admission decision. Recording it would burn attempts and open circuits on the tenant's healthy endpoints. The price is the claim-and-release loop of limitation 29. |
 | Token bucket row in Postgres | In-memory limiter per replica | The limit becomes N times the configured value and resets on restart. |
 | Bucket charged outside the transaction | Charged inside the ingest transaction | Holds the bucket lock across the transaction and serialises the tenant fleet-wide. |
 | Charge is deliveries plus 4 KiB blocks | A second byte bucket per tenant | Two rows and two statements per ingest for one decision. |

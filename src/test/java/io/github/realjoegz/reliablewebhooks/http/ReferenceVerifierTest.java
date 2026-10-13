@@ -182,11 +182,11 @@ class ReferenceVerifierTest {
   }
 
   @Test
-  void readmeQuotesTheVerifier() throws IOException {
+  void apiDocumentQuotesTheVerifier() throws IOException {
     String source = Files.readString(SOURCE);
     String quoted = source.substring(source.indexOf("public final class ReferenceVerifier"));
 
-    assertThat(Files.readString(Path.of("README.md"))).contains("```java\n" + quoted + "```\n");
+    assertThat(Files.readString(Path.of("docs/api.md"))).contains("```java\n" + quoted + "```\n");
   }
 
   // The example subscriber is one file outside the build, so it cannot call the verifier. It has

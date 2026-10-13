@@ -110,6 +110,35 @@ class FailureTableCheckTest {
         .containsExactly("table.md:3: the row links no test");
   }
 
+  // The first row has code spans around its link that are no links. The second names a test in
+  // every column but the one that is read.
+  @Test
+  void linksAreReadFromTheTestColumnOnly() throws Exception {
+    Path file = directory.resolve("columns.md");
+    Files.writeString(
+        file,
+        """
+        | # | Failure | Test | Forced by |
+        |---|---|---|---|
+        | 1 | attempt logged `unknown` | `MethodNamesIT#plain` | `StubDns` |
+        | 2 | `WholeClassTest` | to be written | `MethodNamesIT#plain` |
+        """);
+
+    assertThat(FailureTableCheck.violations(List.of(new TableFile(file, 1)), List.of(reports)))
+        .containsExactly("columns.md:4: the row links no test");
+  }
+
+  @Test
+  void escapedPipeDoesNotEndACell() throws Exception {
+    assertThat(violationsOf("| 1 | a cell with `a\\|b` in it | `MethodNamesIT#plain` |")).isEmpty();
+  }
+
+  @Test
+  void rowThatEndsBeforeTheTestColumnFails() throws Exception {
+    assertThat(violationsOf("| 1 | cut short |"))
+        .containsExactly("table.md:3: the row links no test");
+  }
+
   @Test
   void methodThatDoesNotExistFails() throws Exception {
     assertThat(violationsOf("| 1 | renamed | `MethodNamesIT#renamed` |"))
@@ -137,6 +166,13 @@ class FailureTableCheckTest {
   void codeSpanThatIsNotALinkFails() throws Exception {
     assertThat(violationsOf("| 1 | prose | `mvn verify` |"))
         .containsExactly("table.md:3: `mvn verify` is not Class#method, #method or Class");
+  }
+
+  // Read as a link, the empty span would name the class before it a second time and pass.
+  @Test
+  void emptyCodeSpanIsNotALink() throws Exception {
+    assertThat(violationsOf("| 1 | empty | `WholeClassTest`, `` |"))
+        .containsExactly("table.md:3: `` is not Class#method, #method or Class");
   }
 
   @Test
@@ -217,7 +253,7 @@ class FailureTableCheckTest {
   }
 
   @Test
-  void mainChecksReadmeAndFailureTableAgainstBothReportDirectories() throws Exception {
+  void mainChecksTheThreeDocumentsAgainstBothReportDirectories() throws Exception {
     Path project = directory.resolve("project");
     Path build = project.resolve("target");
     Files.createDirectories(project.resolve("docs"));
@@ -243,16 +279,38 @@ class FailureTableCheckTest {
         |---|---|---|
         | 1 | read from the Surefire reports | `WholeClassTest` |
         """);
+    Path behaviour = project.resolve("docs/behaviour.md");
+    Files.writeString(
+        behaviour,
+        """
+        | Guarantee | Test |
+        |---|---|
+        | G1 | `MethodNamesIT#plain` |
+
+        | Area | Test |
+        |---|---|
+        | Ingest | `WholeClassTest` |
+
+        | What the tests show | Test |
+        |---|---|
+        | shown | `MethodNamesIT#plain` |
+
+        | What is compared | Test |
+        |---|---|
+        | compared | `WholeClassTest` |
+        """);
     String[] arguments = {project.toString(), build.toString()};
 
     assertThatCode(() -> FailureTableCheck.main(arguments)).doesNotThrowAnyException();
 
     Files.writeString(readme, "| 2 | not proven | `ExcludedTest` |\n", APPEND);
     Files.writeString(failureTable, "| 2 | not proven | `ExcludedIT#method` |\n", APPEND);
+    Files.writeString(behaviour, "| not proven | `MethodNamesIT#renamed` |\n", APPEND);
     assertThatThrownBy(() -> FailureTableCheck.main(arguments))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("README.md:4: ExcludedTest did not run")
-        .hasMessageContaining("failure-table.md:8: ExcludedIT#method did not run");
+        .hasMessageContaining("failure-table.md:8: ExcludedIT#method did not run")
+        .hasMessageContaining("behaviour.md:16: MethodNamesIT#renamed did not run");
   }
 
   private static void copyReport(String name, Path reportDirectory) throws IOException {

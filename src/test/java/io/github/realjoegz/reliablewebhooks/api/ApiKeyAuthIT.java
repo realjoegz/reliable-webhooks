@@ -207,6 +207,23 @@ class ApiKeyAuthIT {
                     .isEqualTo("UP"));
   }
 
+  // Under this path a replica serves its health, its meters and this index of the two. The index
+  // names the health twice, the second time for the paths below it.
+  @Test
+  void actuatorIndexNeedsNoKeyAndLinksHealthAndTheScrapeOnly() {
+    Map<String, Map<String, Object>> index =
+        http.get()
+            .uri("/actuator")
+            .exchange()
+            .expectStatus()
+            .isOk()
+            .expectBody(new ParameterizedTypeReference<Map<String, Map<String, Object>>>() {})
+            .returnResult()
+            .getResponseBody();
+
+    assertThat(index.get("_links")).containsOnlyKeys("self", "health", "health-path", "prometheus");
+  }
+
   // Every rejected credential gets this one answer, so the answer cannot tell which check failed.
   private static void expectUnauthorized(RestTestClient.ResponseSpec response) {
     response

@@ -11,9 +11,9 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * How a subscriber checks that a request comes from this service. The README quotes this class, the
- * example subscriber carries a copy of its method, and the tests run it against requests that the
- * service sent.
+ * How a subscriber checks that a request comes from this service. docs/api.md quotes this class,
+ * the example subscriber carries a copy of its method, and the tests run it against requests that
+ * the service sent.
  */
 public final class ReferenceVerifier {
 
