@@ -144,7 +144,7 @@ The time of a delivery from its creation, which is the start of the transaction 
 
 Limitation 6 of the design says that one endpoint is drained at one delivery per claim round trip per replica, at most 4 at a time. The sink answers a request of this scenario in 0.000295 s and 0.000292 s on average, so four at a time are never open, and what a replica can do for one endpoint is one delivery for each claim.
 
-The drain, in the deliveries that the two replicas together made in each five seconds, and how many a second that is. The five seconds are counted from the first recorded 2xx, so the first row is full and the last row of a run is not: the drain of the first run lasted 62.0 s and that of the second 59.8 s. The rate of such a row is its deliveries over five seconds all the same.
+The drain, in the deliveries that the two replicas together made in each five seconds, and how many a second that is. The five seconds are counted from the first recorded 2xx, so the first row is full and the last row of a run is not: the drain of the first run lasted 62.0 s and that of the second 59.8 s. The rate of such a row is its deliveries over five seconds all the same. In the two results the comment above this query says that the first five seconds are not full either. They are: the statement there is the one of `loadtest/queries/endpoint-ceiling.sql`, and it counts from the first recorded 2xx.
 
 | Five seconds of the drain | [Run of 07:35](../loadtest/results/endpoint-ceiling-20261013T073522Z.txt) | Deliveries a second | [Run of 07:52](../loadtest/results/endpoint-ceiling-20261013T075253Z.txt) | Deliveries a second |
 |---|---|---|---|---|
