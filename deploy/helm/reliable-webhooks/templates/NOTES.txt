@@ -17,5 +17,6 @@ The replicas of {{ $name }} are starting. One of them migrates the database if i
      --header "Authorization: Bearer $(kubectl --namespace {{ $namespace }} get secret {{ .Values.secret.name }} --output jsonpath='{.data.admin-token}' | base64 --decode)" \
      --json '{"name": "first-tenant"}'
 
-The chart has no Ingress. Whatever publishes the Service has to keep /actuator from the public,
-because the scrape and the health probes take no key. docs/deploy.md has the rest.
+The chart has no Ingress. A replica serves plain HTTP, so whatever publishes the Service has to
+end TLS. It also has to keep /actuator from the public, because the scrape and the health probes
+take no key. docs/deploy.md has the rest.

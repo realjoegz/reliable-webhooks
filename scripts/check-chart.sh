@@ -17,7 +17,7 @@ values=deploy/kind/values.yaml
 documented=(
   --set image.repository=registry.example.com/reliable-webhooks
   --set-string image.tag=1
-  --set database.url=jdbc:postgresql://db.example.com:5432/webhooks
+  --set 'database.url=jdbc:postgresql://db.example.com:5432/webhooks?sslmode=require'
   --set database.username=webhooks
   --set secret.name=reliable-webhooks-credentials
 )

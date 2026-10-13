@@ -108,9 +108,9 @@ run "example_is_planned" {
   }
 
   # The schema of the chart takes a URL that begins with jdbc:postgresql:// and carries no
-  # password.
+  # password. The parameter of this one tells the driver to connect over TLS or not at all.
   assert {
-    condition     = output.database_url == "jdbc:postgresql://reliable-webhooks.abcdefghijkl.eu-west-1.rds.amazonaws.com:5432/webhooks"
+    condition     = output.database_url == "jdbc:postgresql://reliable-webhooks.abcdefghijkl.eu-west-1.rds.amazonaws.com:5432/webhooks?sslmode=require"
     error_message = "The URL of the database is ${output.database_url}."
   }
 

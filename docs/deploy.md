@@ -19,6 +19,11 @@ docker push registry.example.com/reliable-webhooks:1
 - A replica refuses to start unless the database runs at `read committed` and does not have `synchronous_commit` off (section 15).
 - A replica holds 32 connections, 16 in each of its two pools, and Flyway opens its own while a replica starts. In a rollout an old replica keeps its connections until it has drained, and the rollout does not wait for that before it starts the next new replica. The database can therefore see twice the replicas, and needs room for 32 connections times twice their largest number, and a few on top.
 - The URL can carry parameters of the PostgreSQL driver. It cannot remove a time bound of the pools (section 12), and the chart refuses a URL with a `password` parameter, because the password comes from the Secret.
+- The URL decides whether the connection is encrypted (limitation 38). The service sets nothing about TLS, so the driver, pgjdbc 42.7, does what its documentation says:
+  - Without `sslmode` it asks the server for TLS and goes on without it when the server offers none.
+  - With `sslmode=require` it refuses such a server. It does not check the certificate of the server.
+  - With `sslmode=verify-full` it checks the certificate and the host name against a root certificate that it reads from a file. The image has no such file, and the chart has no value that mounts one.
+  - No test connects to a database over TLS. The databases of the tests, of `compose.yaml` and of the smoke test offer none, which is why their URLs carry no `sslmode`.
 
 **A Secret** in the namespace of the release, with three keys:
 
@@ -47,12 +52,12 @@ helm install reliable-webhooks deploy/helm/reliable-webhooks \
   --namespace webhooks \
   --set image.repository=registry.example.com/reliable-webhooks \
   --set-string image.tag=1 \
-  --set database.url=jdbc:postgresql://db.example.com:5432/webhooks \
+  --set 'database.url=jdbc:postgresql://db.example.com:5432/webhooks?sslmode=require' \
   --set database.username=webhooks \
   --set secret.name=reliable-webhooks-credentials
 ```
 
-The chart does not render until these five are set, and `scripts/check-chart.sh` renders it with these five and nothing else. The tag is given with `--set-string` because it is a number here: `--set` would hand the chart a number, and the chart takes a tag as a string only. The notes that Helm prints after the install say how to wait for the replicas and how to create the first tenant. `helm upgrade` with the same values and another `image.tag` rolls a new image out.
+The chart does not render until these five are set, and `scripts/check-chart.sh` renders it with these five and nothing else. The URL is in quotes because a shell reads its `?` as a pattern. The tag is given with `--set-string` because it is a number here: `--set` would hand the chart a number, and the chart takes a tag as a string only. The notes that Helm prints after the install say how to wait for the replicas and how to create the first tenant. `helm upgrade` with the same values and another `image.tag` rolls a new image out.
 
 ## Values
 
@@ -161,7 +166,7 @@ A replica samples a tenth of its traces. A further entry, `MANAGEMENT_TRACING_SA
 
 ## What the chart leaves to the cluster
 
-- **Publishing the API.** The chart has no Ingress. `/actuator` is served on the port of the API, and the scrape and the health probes take no key. Whatever publishes the Service has to keep that path from the public (limitation 34), and it is also where unauthenticated floods are stopped (limitation 9). The `/admin` routes are for the operator and take one static token (limitation 18). Nothing needs them outside the cluster.
+- **Publishing the API.** The chart has no Ingress. A replica serves plain HTTP on port 8080, and every credential of the API is a bearer token, so whatever publishes the Service also has to end TLS (limitation 38). `/actuator` is served on the port of the API, and the scrape and the health probes take no key. Whatever publishes the Service has to keep that path from the public (limitation 34), and it is also where unauthenticated floods are stopped (limitation 9). The `/admin` routes are for the operator and take one static token (limitation 18). Nothing needs them outside the cluster.
 - **The network.** The chart has no NetworkPolicy. A replica needs the database, and the subscribers wherever they are. It refuses addresses that are not public by itself (section 11.4), and the `unsafe-local` profile that lifts this is for tests: a replica that is started without the profile and with one of its allowances does not start (section 15).
 - **The database**, its backups and its failover (limitation 3).
 
@@ -229,6 +234,7 @@ It calls three community modules, each at a fixed version, with the AWS provider
   - **The user.** The master user of the instance is `webhooks`, and it is the user that the service connects as, because that user has to own the schema ([What the chart needs](#what-the-chart-needs)). The module creates no other user. RDS creates the password and keeps it in Secrets Manager. It is in no variable, in no output and not in the state.
   - **The parameter group** sets `default_transaction_isolation` to `read committed` and `synchronous_commit` to `on`. These are the two settings of the database that a replica checks when it starts (section 15).
   - **The security group** admits TCP port 5432 from the security group of the nodes and from nothing else. A pod has the security group of its node, so this is what lets the replicas in.
+  - **TLS.** The URL that the module hands to the chart says `sslmode=require`, so a replica connects over TLS or not at all, and it does not check the certificate of the instance ([What the chart needs](#what-the-chart-needs)). By the documentation of RDS, PostgreSQL 15 and later refuses a connection without TLS unless `rds.force_ssl` is turned off, and the parameter group leaves that setting alone.
 - **Tags.** The provider puts `Deployment`, with the name of the deployment, `ManagedBy` and the tags of `tags` on every resource that it creates and that can carry tags. The instances, volumes and network interfaces of the nodes get them from the launch template of the node group.
 
 It creates no registry for the image, no ingress and no load balancer, nothing that adds nodes, and neither the Secret nor the release of the chart. The role of the nodes may pull from a registry of ECR in the same account. Publishing the API stays what [What the chart leaves to the cluster](#what-the-chart-leaves-to-the-cluster) says it is.
@@ -292,7 +298,7 @@ helm install reliable-webhooks ../../deploy/helm/reliable-webhooks \
   --set secret.name=reliable-webhooks-credentials
 ```
 
-These commands have not been run, because the module has not been applied. One thing about them is checked. The test of the CI job plans `database_url` as `jdbc:postgresql://`, the endpoint of the instance with its port, and `/webhooks`, without a user and without a password, which is the form that the schema of the chart takes.
+These commands have not been run, because the module has not been applied. One thing about them is checked. The test of the CI job plans `database_url` as `jdbc:postgresql://`, the endpoint of the instance with its port, `/webhooks` and `?sslmode=require`, without a user and without a password, which is the form that the schema of the chart takes.
 
 The Secret holds the password as it is when the command runs. RDS rotates that password, and a release that is installed this way stops working about half an hour after the first rotation ([What to check before it is applied](#what-to-check-before-it-is-applied)).
 

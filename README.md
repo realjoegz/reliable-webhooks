@@ -72,7 +72,7 @@ sequenceDiagram
 - **No check that a tenant owns an endpoint, and no storage quota.** At the default rate a tenant can store about 16 GiB of event bodies a day.
 - **No cloud deployment.** The service has run on one laptop and in CI.
 
-[Section 14](docs/design.md#14-limitations) lists all 37.
+[Section 14](docs/design.md#14-limitations) lists all 38.
 
 ## Performance
 

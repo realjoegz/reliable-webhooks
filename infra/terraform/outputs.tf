@@ -5,7 +5,7 @@ output "cluster_name" {
 
 output "database_url" {
   description = "The value `database.url` of the Helm chart."
-  value       = "jdbc:postgresql://${module.rds.db_instance_endpoint}/${local.database_name}"
+  value       = "jdbc:postgresql://${module.rds.db_instance_endpoint}/${local.database_name}?sslmode=require"
 }
 
 output "database_username" {
