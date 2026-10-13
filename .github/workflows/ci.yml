@@ -55,7 +55,8 @@ jobs:
       # The JVM is the process of the container, so a stop sends it the SIGTERM that starts the
       # drain. It leaves 143 when it ended by itself, and 137 when it was killed after the 30 s
       # that a stop allows it.
-      - run: |
+      - name: Stop a replica and require the exit code 143
+        run: |
           docker compose stop replica-2
           container=$(docker compose ps --all --quiet replica-2)
           exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container")
@@ -80,7 +81,8 @@ jobs:
 
       # No action installs kubeconform. This is the archive of its release for the runner, held
       # to the checksum that the release lists for it.
-      - run: |
+      - name: Install kubeconform 0.8.0
+        run: |
           curl --silent --show-error --fail --location \
             --output "$RUNNER_TEMP/kubeconform.tar.gz" \
             https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
@@ -143,7 +145,8 @@ jobs:
       # declared two module calls below main.tf, so the rules refuse an instance class that
       # RDS does not have only if they follow the values that far. tflint ends with 2 when it
       # has found an issue and nothing else went wrong.
-      - run: |
+      - name: Require that tflint refuses an instance class that RDS does not have
+        run: |
           status=0
           tflint --only aws_db_instance_invalid_type --var database_instance_class=db.t4g.none || status=$?
           test "$status" = 2
