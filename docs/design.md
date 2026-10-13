@@ -313,7 +313,7 @@ Each replica runs one `DeliveryPoller` thread and up to 64 attempts on virtual t
 
 The poller loop:
 - It claims, hands each returned row to a virtual thread, and claims again at once if the claim returned a row and a permit is free.
-- An empty claim starts an idle wait of 50 ms that doubles to 1 s (`ClaimerBackoff`). A finished attempt ends the wait. The wait doubles with every claim that brings no row, also with one that was made early because an attempt had finished, and only a claim that brings a row starts it over (limitation 35).
+- An empty claim starts an idle wait of 50 ms that doubles to 1 s (`PollerBackoff`). A finished attempt ends the wait. The wait doubles with every claim that brings no row, also with one that was made early because an attempt had finished, and only a claim that brings a row starts it over (limitation 35).
 - Every iteration, successful or failed, updates the heartbeat that liveness reads (section 15).
 
 **Step 1: claim.** One transaction on the `worker` pool. The statement picks endpoints first and deliveries second.

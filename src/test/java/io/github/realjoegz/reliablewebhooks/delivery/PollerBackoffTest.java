@@ -7,9 +7,9 @@ import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
-class ClaimerBackoffTest {
+class PollerBackoffTest {
 
-  private final ClaimerBackoff backoff = new ClaimerBackoff();
+  private final PollerBackoff backoff = new PollerBackoff();
 
   @Test
   void waitDoublesFromFiftyMillisecondsAndStaysAtOneSecond() {

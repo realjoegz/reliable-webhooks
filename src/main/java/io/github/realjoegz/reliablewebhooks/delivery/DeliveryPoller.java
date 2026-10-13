@@ -42,7 +42,7 @@ public class DeliveryPoller {
   private final Semaphore attemptFinished = new Semaphore(0);
 
   private final Bulkhead bulkhead = new Bulkhead();
-  private final ClaimerBackoff backoff = new ClaimerBackoff();
+  private final PollerBackoff backoff = new PollerBackoff();
   private final ThreadFactory attempts = Thread.ofVirtual().name("delivery-attempt-", 0).factory();
   private volatile boolean stopped;
 

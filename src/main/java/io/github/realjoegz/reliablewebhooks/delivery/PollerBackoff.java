@@ -7,7 +7,7 @@ import java.time.Duration;
  * first time, twice as long each time after that, and never more than 1 s. A claim that brought a
  * row starts it over.
  */
-final class ClaimerBackoff {
+final class PollerBackoff {
 
   private static final Duration FIRST = Duration.ofMillis(50);
   private static final Duration LONGEST = Duration.ofSeconds(1);
