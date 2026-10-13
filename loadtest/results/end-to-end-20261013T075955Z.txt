@@ -1,0 +1,255 @@
+Scenario  end-to-end
+Date      2026-10-13T07:59:55Z
+Commit    b735e65b8346edf9e865c266af407b107d3917f7
+Command   loadtest/run.sh end-to-end
+Machine   Apple M4, 10 cores, 16 GiB of memory, macOS 26.6.2
+Docker    29.5.2 on colima: 6 CPUs, 7.7 GiB of memory, Ubuntu 24.04.4 LTS, kernel 6.8.0-117-generic
+
+--- PostgreSQL ---
+
+-- The server, and the settings that the numbers of a run depend on most. compose.yaml changes
+-- none of them, so they are what the image sets.
+SELECT version();
+                                            version                                            
+-----------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+(1 row)
+
+SELECT name, setting, unit
+FROM pg_settings
+WHERE name IN ('autovacuum', 'autovacuum_naptime', 'checkpoint_timeout', 'effective_cache_size',
+               'fsync', 'full_page_writes', 'max_connections', 'max_wal_size', 'min_wal_size',
+               'shared_buffers', 'synchronous_commit', 'wal_sync_method', 'work_mem')
+ORDER BY name;
+         name         |  setting  | unit 
+----------------------+-----------+------
+ autovacuum           | on        | 
+ autovacuum_naptime   | 60        | s
+ checkpoint_timeout   | 300       | s
+ effective_cache_size | 524288    | 8kB
+ fsync                | on        | 
+ full_page_writes     | on        | 
+ max_connections      | 100       | 
+ max_wal_size         | 1024      | MB
+ min_wal_size         | 80        | MB
+ shared_buffers       | 16384     | 8kB
+ synchronous_commit   | on        | 
+ wal_sync_method      | fdatasync | 
+ work_mem             | 4096      | kB
+(13 rows)
+
+-- What a flush of the WAL costs on the volume of the database, by pg_test_fsync.
+Compare file sync methods using one 8kB write:
+(in "wal_sync_method" preference order, except fdatasync is Linux's default)
+        open_datasync                     13469.314 ops/sec      74 usecs/op
+        fdatasync                         16349.101 ops/sec      61 usecs/op
+        fsync                              8123.456 ops/sec     123 usecs/op
+        fsync_writethrough                              n/a
+        open_sync                          3765.915 ops/sec     266 usecs/op
+
+--- k6 ---
+
+
+  █ THRESHOLDS 
+
+    dropped_iterations{scenario:steady}
+    ✓ 'count==0' count=0
+
+    http_req_failed{scenario:steady}
+    ✗ 'rate==0' rate=0.40%
+
+
+  █ TOTAL RESULTS 
+
+    HTTP
+    http_req_duration..............: med=1.45ms p(90)=10.45ms p(99)=354.29ms max=1.4s  count=150141
+      { expected_response:true }...: med=1.46ms p(90)=10.49ms p(99)=355.1ms  max=1.4s  count=149540
+    http_req_failed................: 0.40%  601 out of 150141
+      { scenario:steady }..........: 0.40%  601 out of 150001
+    http_reqs......................: 150141 502.803504/s
+
+    EXECUTION
+    dropped_iterations.............: 0      0/s
+      { scenario:steady }..........: 0      0/s
+    iteration_duration.............: med=1.56ms p(90)=10.85ms p(99)=356.18ms max=1.51s count=150001
+    iterations.....................: 150001 502.334661/s
+    vus............................: 2      min=0             max=271
+    vus_max........................: 500    min=500           max=500
+
+    NETWORK
+    data_received..................: 26 MB  86 kB/s
+    data_sent......................: 179 MB 600 kB/s
+
+
+
+--- Database ---
+
+-- What became of the events of the scenario and of their deliveries, how many of the deliveries
+-- were made after the last event was accepted, and how long after it the last one was.
+WITH last_event AS (
+  SELECT max(created_at) AS created_at FROM event WHERE created_at >= :'started'
+)
+SELECT (SELECT count(*) FROM event WHERE created_at >= :'started') AS events,
+       count(*) AS deliveries,
+       count(*) FILTER (WHERE d.state = 'succeeded') AS succeeded,
+       count(*) FILTER (WHERE d.state <> 'succeeded') AS not_succeeded,
+       count(*) FILTER (WHERE d.attempts > 1) AS claimed_more_than_once,
+       count(*) FILTER (WHERE d.completed_at > last_event.created_at) AS made_after_the_last_event,
+       round(extract(epoch FROM max(d.completed_at) - max(last_event.created_at)), 1)
+         AS seconds_from_it_to_the_last_delivery
+FROM delivery d
+CROSS JOIN last_event
+WHERE d.created_at >= :'started';
+ events | deliveries | succeeded | not_succeeded | claimed_more_than_once | made_after_the_last_event | seconds_from_it_to_the_last_delivery 
+--------+------------+-----------+---------------+------------------------+---------------------------+--------------------------------------
+ 149400 |     149400 |    149400 |             0 |                      0 |                         4 |                                  0.0
+(1 row)
+
+-- The attempts that were recorded for those deliveries.
+SELECT a.outcome, a.http_status, a.error, count(*) AS attempts
+FROM delivery_attempt a
+JOIN delivery d ON d.id = a.delivery_id
+WHERE d.created_at >= :'started'
+GROUP BY a.outcome, a.http_status, a.error
+ORDER BY a.outcome, a.http_status, a.error;
+ outcome | http_status | error | attempts 
+---------+-------------+-------+----------
+ success |         200 |       |   149400
+(1 row)
+
+-- Deliveries a second, from the creation of the first delivery to the last recorded 2xx.
+SELECT count(*) AS succeeded,
+       round(extract(epoch FROM max(completed_at) - min(created_at)), 1) AS seconds,
+       round(count(*) / extract(epoch FROM max(completed_at) - min(created_at)), 1) AS per_second
+FROM delivery
+WHERE created_at >= :'started' AND state = 'succeeded';
+ succeeded | seconds | per_second 
+-----------+---------+------------
+    149400 |   298.3 |      500.9
+(1 row)
+
+-- How long a delivery took from its creation, which is the start of the transaction that
+-- accepted its event, to the start of the transaction that recorded its 2xx. Both are times of
+-- the clock of the database, so the shortest is below zero where that clock was set back
+-- between the two.
+SELECT round(min(seconds), 3) AS min_seconds,
+       round(percentile_cont(0.5) WITHIN GROUP (ORDER BY seconds)::numeric, 3) AS p50_seconds,
+       round(percentile_cont(0.9) WITHIN GROUP (ORDER BY seconds)::numeric, 3) AS p90_seconds,
+       round(percentile_cont(0.99) WITHIN GROUP (ORDER BY seconds)::numeric, 3) AS p99_seconds,
+       round(percentile_cont(0.999) WITHIN GROUP (ORDER BY seconds)::numeric, 3) AS p999_seconds,
+       round(max(seconds), 3) AS max_seconds,
+       round(avg(seconds), 3) AS mean_seconds
+FROM (
+  SELECT extract(epoch FROM completed_at - created_at) AS seconds
+  FROM delivery
+  WHERE created_at >= :'started' AND state = 'succeeded'
+) took;
+ min_seconds | p50_seconds | p90_seconds | p99_seconds | p999_seconds | max_seconds | mean_seconds 
+-------------+-------------+-------------+-------------+--------------+-------------+--------------
+      -0.124 |       0.016 |       0.099 |       0.272 |        0.788 |       0.970 |        0.041
+(1 row)
+
+-- The same times in the buckets of webhooks_delivery_end_to_end_seconds, and how many of them
+-- are below zero.
+SELECT count(*) FILTER (WHERE completed_at < created_at) AS below_0,
+       count(*) FILTER (WHERE completed_at - created_at <= interval '1 second') AS le_1,
+       count(*) FILTER (WHERE completed_at - created_at <= interval '5 seconds') AS le_5,
+       count(*) FILTER (WHERE completed_at - created_at <= interval '15 seconds') AS le_15,
+       count(*) FILTER (WHERE completed_at - created_at <= interval '60 seconds') AS le_60,
+       count(*) AS all_deliveries
+FROM delivery
+WHERE created_at >= :'started' AND state = 'succeeded';
+ below_0 |  le_1  |  le_5  | le_15  | le_60  | all_deliveries 
+---------+--------+--------+--------+--------+----------------
+      37 | 149400 | 149400 | 149400 | 149400 |         149400
+(1 row)
+
+-- Those times for the deliveries that were created in each half minute of the scenario. The
+-- time of day is that of the database, as in its log.
+SELECT to_char(date_bin('30 seconds', d.created_at, first.created_at), 'HH24:MI:SS')
+         AS created_from,
+       count(*) AS deliveries,
+       round(percentile_cont(0.5) WITHIN GROUP (
+         ORDER BY extract(epoch FROM d.completed_at - d.created_at))::numeric, 3) AS p50_seconds,
+       round(percentile_cont(0.99) WITHIN GROUP (
+         ORDER BY extract(epoch FROM d.completed_at - d.created_at))::numeric, 3) AS p99_seconds,
+       round(max(extract(epoch FROM d.completed_at - d.created_at)), 3) AS max_seconds
+FROM delivery d
+CROSS JOIN (SELECT min(created_at) AS created_at FROM delivery WHERE created_at >= :'started') first
+WHERE d.created_at >= :'started' AND d.state = 'succeeded'
+GROUP BY created_from
+ORDER BY created_from;
+ created_from | deliveries | p50_seconds | p99_seconds | max_seconds 
+--------------+------------+-------------+-------------+-------------
+ 08:05:15     |      15139 |       0.044 |       0.779 |       0.970
+ 08:05:45     |      15117 |       0.043 |       0.190 |       0.223
+ 08:06:15     |      15096 |       0.034 |       0.184 |       0.539
+ 08:06:45     |      15138 |       0.040 |       0.198 |       0.361
+ 08:07:15     |      15124 |       0.008 |       0.189 |       0.283
+ 08:07:45     |      14870 |       0.008 |       0.094 |       0.570
+ 08:08:15     |      14946 |       0.026 |       0.372 |       0.560
+ 08:08:45     |      15124 |       0.031 |       0.312 |       0.481
+ 08:09:15     |      14657 |       0.012 |       0.199 |       0.805
+ 08:09:45     |      14189 |       0.008 |       0.052 |       0.192
+(10 rows)
+
+--- PostgreSQL log ---
+
+WAL segments that the database had when the scenario began: 63
+Its checkpoints and its vacuums of the delivery table from then on:
+2026-10-13 08:06:23.264 UTC [1525] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 08:08:26.848 UTC [1935] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 08:09:02.488 UTC [65] LOG:  checkpoint starting: wal
+
+--- Meters ---
+
+     replica-1      replica-2           both  increase during the scenario
+        299096         299048         598144  hikaricp_connections_acquire_seconds_count{pool="api"}
+       547.385        566.413       1113.798  hikaricp_connections_acquire_seconds_sum{pool="api"}
+        181956         172930         354886  hikaricp_connections_acquire_seconds_count{pool="worker"}
+       158.339        187.428        345.767  hikaricp_connections_acquire_seconds_sum{pool="worker"}
+            20              0             20  http_server_requests_seconds_count{error="none",exception="none",method="PATCH",outcome="SUCCESS",status="204",uri="/admin/tenants/{id}"}
+           270            331            601  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="CLIENT_ERROR",status="429",uri="UNKNOWN"}
+            20              0             20  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="201",uri="/admin/tenants"}
+           100              0            100  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="201",uri="/v1/endpoints"}
+         74689          74711         149400  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="202",uri="/v1/events"}
+           157            119            276  jvm_gc_pause_seconds_count{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+         1.069          0.943          2.012  jvm_gc_pause_seconds_sum{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+  106680000000   105430000000   212110000000  process_cpu_time_ns_total
+         29029          26987          56016  webhooks_claim_rows_count
+         76446          72954         149400  webhooks_claim_rows_sum
+         29029          26987          56016  webhooks_claim_seconds_count
+       111.923        105.020        216.944  webhooks_claim_seconds_sum
+         76349          72902         149251  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.05"}
+         76438          72951         149389  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.1"}
+         76440          72954         149394  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.25"}
+         76446          72954         149400  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.5"}
+         76446          72954         149400  webhooks_delivery_attempt_seconds_count{outcome="success"}
+        73.936         82.694        156.630  webhooks_delivery_attempt_seconds_sum{outcome="success"}
+         76446          72954         149400  webhooks_delivery_attempts_total{outcome="success",reason="http_2xx"}
+         76441          72941         149382  webhooks_delivery_end_to_end_seconds_bucket{le="1.0"}
+         76441          72941         149382  webhooks_delivery_end_to_end_seconds_count
+      2814.773       3044.801       5859.574  webhooks_delivery_end_to_end_seconds_sum
+         76446          72954         149400  webhooks_delivery_terminal_total{reason="delivered",state="succeeded"}
+           153             74            227  webhooks_dns_lookups_total{result="ok"}
+         74689          74711         149400  webhooks_ingest_requests_total{result="accepted"}
+             1              1              2  http_server_requests_seconds_count{error="none",exception="none",method="GET",outcome="SUCCESS",status="200",uri="/actuator/prometheus"}
+
+         value  of both replicas together
+      0.001862  mean of hikaricp_connections_acquire_seconds{pool="api"}
+      0.000974  mean of hikaricp_connections_acquire_seconds{pool="worker"}
+      0.007290  mean of jvm_gc_pause_seconds{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+      2.667095  mean of webhooks_claim_rows
+      0.003873  mean of webhooks_claim_seconds
+      0.999003  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.05"}
+      0.999926  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.1"}
+      0.999960  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.25"}
+      1.000000  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.5"}
+      0.001048  mean of webhooks_delivery_attempt_seconds{outcome="success"}
+      1.000000  share of webhooks_delivery_end_to_end_seconds_bucket{le="1.0"}
+      0.039225  mean of webhooks_delivery_end_to_end_seconds
+
+--- Sink ---
+
+What the sink received during the scenario, and for how many webhook-ids more than once:
+{"requests": 149400, "webhook_ids": 149400, "received_more_than_once": 0}

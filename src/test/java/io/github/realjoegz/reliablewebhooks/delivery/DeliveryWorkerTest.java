@@ -329,6 +329,29 @@ class DeliveryWorkerTest {
     assertThat(endToEnd.totalTime(TimeUnit.MILLISECONDS)).isEqualTo(40_120);
   }
 
+  // The database clock was set back between the creation of the delivery and the load, which
+  // gave it an age of -200 ms. With a request of 120 ms the time since its creation comes out
+  // negative. The delivery is counted as delivered, and the timer, which records no negative
+  // time, does not hold it.
+  @Test
+  void deliveryWhoseTimeSinceItsCreationComesOutNegativeIsCountedAndIsNotInTheTimer() {
+    deliveries.loaded =
+        Optional.of(
+            new Loaded(
+                URL,
+                List.of(cipher.encrypt(KEY)),
+                BODY,
+                SIGNED_AT,
+                TRACE_CONTEXT,
+                Duration.ofMillis(-200)));
+    client.sendTakes = Duration.ofMillis(120);
+
+    worker.attempt(claimed(3), claimStarted);
+
+    assertThat(terminal("succeeded", "delivered")).isEqualTo(1);
+    assertThat(registry.get("webhooks.delivery.end.to.end").timer().count()).isZero();
+  }
+
   // No status ends a delivery for good: not a redirect, which is not followed, and not a 4xx.
   @ParameterizedTest
   @CsvSource({

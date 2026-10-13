@@ -1,0 +1,183 @@
+Scenario  kill
+Date      2026-10-13T06:34:50Z
+Commit    b735e65b8346edf9e865c266af407b107d3917f7
+Command   loadtest/run.sh kill
+Machine   Apple M4, 10 cores, 16 GiB of memory, macOS 26.6.2
+Docker    29.5.2 on colima: 6 CPUs, 7.7 GiB of memory, Ubuntu 24.04.4 LTS, kernel 6.8.0-117-generic
+
+--- PostgreSQL ---
+
+-- The server, and the settings that the numbers of a run depend on most. compose.yaml changes
+-- none of them, so they are what the image sets.
+SELECT version();
+                                            version                                            
+-----------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+(1 row)
+
+SELECT name, setting, unit
+FROM pg_settings
+WHERE name IN ('autovacuum', 'autovacuum_naptime', 'checkpoint_timeout', 'effective_cache_size',
+               'fsync', 'full_page_writes', 'max_connections', 'max_wal_size', 'min_wal_size',
+               'shared_buffers', 'synchronous_commit', 'wal_sync_method', 'work_mem')
+ORDER BY name;
+         name         |  setting  | unit 
+----------------------+-----------+------
+ autovacuum           | on        | 
+ autovacuum_naptime   | 60        | s
+ checkpoint_timeout   | 300       | s
+ effective_cache_size | 524288    | 8kB
+ fsync                | on        | 
+ full_page_writes     | on        | 
+ max_connections      | 100       | 
+ max_wal_size         | 1024      | MB
+ min_wal_size         | 80        | MB
+ shared_buffers       | 16384     | 8kB
+ synchronous_commit   | on        | 
+ wal_sync_method      | fdatasync | 
+ work_mem             | 4096      | kB
+(13 rows)
+
+-- What a flush of the WAL costs on the volume of the database, by pg_test_fsync.
+Compare file sync methods using one 8kB write:
+(in "wal_sync_method" preference order, except fdatasync is Linux's default)
+        open_datasync                     12101.551 ops/sec      83 usecs/op
+        fdatasync                         14589.170 ops/sec      69 usecs/op
+        fsync                              7353.154 ops/sec     136 usecs/op
+        fsync_writethrough                              n/a
+        open_sync                          8214.789 ops/sec     122 usecs/op
+
+--- k6 ---
+
+
+  █ THRESHOLDS 
+
+    dropped_iterations{scenario:kill}
+    ✓ 'count==0' count=0
+
+    events_given_up
+    ✓ 'count==0' count=0
+
+
+  █ TOTAL RESULTS 
+
+    CUSTOM
+    events_accepted................: 36001  300.015342/s
+    events_accepted_as_repeat......: 1      0.008334/s
+    events_given_up................: 0      0/s
+    requests_sent_again............: 212    1.766708/s
+
+    HTTP
+    http_req_duration..............: med=1.2ms  p(90)=5.99ms p(99)=102.88ms max=515.23ms count=36264
+      { expected_response:true }...: med=1.2ms  p(90)=6.01ms p(99)=102.98ms max=515.23ms count=36052
+    http_req_failed................: 0.58%  212 out of 36264
+    http_reqs......................: 36264  302.20706/s
+
+    EXECUTION
+    dropped_iterations.............: 0      0/s
+      { scenario:kill }............: 0      0/s
+    iteration_duration.............: med=1.32ms p(90)=6.5ms  p(99)=156.7ms  max=1.01s    count=36001
+    iterations.....................: 36001  300.015342/s
+    vus............................: 0      min=0            max=105
+    vus_max........................: 400    min=400          max=400
+
+    NETWORK
+    data_received..................: 6.1 MB 51 kB/s
+    data_sent......................: 43 MB  358 kB/s
+
+
+
+--- Database ---
+
+replica-2 was killed with SIGKILL at 2026-10-13 06:40:53.348726+00 on the clock of the database, and exited with 137.
+
+-- What became of the events of the scenario and of their deliveries, how many of the deliveries
+-- were made after the last event was accepted, and how long after it the last one was.
+WITH last_event AS (
+  SELECT max(created_at) AS created_at FROM event WHERE created_at >= :'started'
+)
+SELECT (SELECT count(*) FROM event WHERE created_at >= :'started') AS events,
+       count(*) AS deliveries,
+       count(*) FILTER (WHERE d.state = 'succeeded') AS succeeded,
+       count(*) FILTER (WHERE d.state <> 'succeeded') AS not_succeeded,
+       count(*) FILTER (WHERE d.attempts > 1) AS claimed_more_than_once,
+       count(*) FILTER (WHERE d.completed_at > last_event.created_at) AS made_after_the_last_event,
+       round(extract(epoch FROM max(d.completed_at) - max(last_event.created_at)), 1)
+         AS seconds_from_it_to_the_last_delivery
+FROM delivery d
+CROSS JOIN last_event
+WHERE d.created_at >= :'started';
+ events | deliveries | succeeded | not_succeeded | claimed_more_than_once | made_after_the_last_event | seconds_from_it_to_the_last_delivery 
+--------+------------+-----------+---------------+------------------------+---------------------------+--------------------------------------
+  36001 |     108003 |    108003 |             0 |                     39 |                        68 |                                  0.1
+(1 row)
+
+-- The attempts that were recorded for those deliveries.
+SELECT a.outcome, a.http_status, a.error, count(*) AS attempts
+FROM delivery_attempt a
+JOIN delivery d ON d.id = a.delivery_id
+WHERE d.created_at >= :'started'
+GROUP BY a.outcome, a.http_status, a.error
+ORDER BY a.outcome, a.http_status, a.error;
+ outcome | http_status |     error     | attempts 
+---------+-------------+---------------+----------
+ success |         200 |               |   108003
+ unknown |             | lease_expired |       39
+(2 rows)
+
+-- Every event of the scenario with the number of its deliveries that succeeded. loadtest/kill.js
+-- sends each event to the three endpoints of its tenant.
+SELECT count(*) AS events,
+       count(*) FILTER (WHERE deliveries = 3 AND succeeded = 3) AS events_with_all_three_succeeded
+FROM (
+  SELECT e.id,
+         count(d.id) AS deliveries,
+         count(d.id) FILTER (WHERE d.state = 'succeeded') AS succeeded
+  FROM event e
+  LEFT JOIN delivery d ON d.event_id = e.id
+  WHERE e.created_at >= :'started'
+  GROUP BY e.id
+) per_event;
+ events | events_with_all_three_succeeded 
+--------+---------------------------------
+  36001 |                           36001
+(1 row)
+
+-- The successful attempts by the replica that recorded them, before and after the kill.
+SELECT a.replica,
+       count(*) FILTER (WHERE d.completed_at <= :'killed') AS recorded_before_the_kill,
+       count(*) FILTER (WHERE d.completed_at > :'killed') AS recorded_after_the_kill
+FROM delivery_attempt a
+JOIN delivery d ON d.id = a.delivery_id
+WHERE d.created_at >= :'started' AND a.outcome = 'success'
+GROUP BY a.replica
+ORDER BY a.replica;
+  replica  | recorded_before_the_kill | recorded_after_the_kill 
+-----------+--------------------------+-------------------------
+ replica-1 |                    16343 |                   71640
+ replica-2 |                    20020 |                       0
+(2 rows)
+
+-- The deliveries that the killed replica held: a later claim logged their first attempt as
+-- unknown. How long after the kill each of them was recorded as succeeded.
+SELECT count(*) AS deliveries,
+       round(min(extract(epoch FROM d.completed_at - :'killed')), 1) AS first_seconds_after_it,
+       round(max(extract(epoch FROM d.completed_at - :'killed')), 1) AS last_seconds_after_it
+FROM delivery d
+WHERE d.created_at >= :'started'
+  AND EXISTS (SELECT 1 FROM delivery_attempt a WHERE a.delivery_id = d.id AND a.outcome = 'unknown');
+ deliveries | first_seconds_after_it | last_seconds_after_it 
+------------+------------------------+-----------------------
+         39 |                   59.6 |                  59.8
+(1 row)
+
+--- PostgreSQL log ---
+
+WAL segments that the database had when the scenario began: 63
+Its checkpoints and its vacuums of the delivery table from then on:
+2026-10-13 06:41:16.619 UTC [1768] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+
+--- Sink ---
+
+What the sink received during the scenario, and for how many webhook-ids more than once:
+{"requests": 108042, "webhook_ids": 108003, "received_more_than_once": 39}

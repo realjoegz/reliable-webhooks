@@ -26,7 +26,8 @@ secret:
 # setting of the service can be given this way, apart from the five that the chart sets itself.
 extraEnv: []
 
-# A starting point and not a measurement: the service has not been run under load.
+# A starting point and not a measurement: the load tests of docs/performance.md ran on one
+# laptop, with replicas that had no limit of their own.
 resources:
   requests:
     cpu: 500m

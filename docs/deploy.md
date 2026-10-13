@@ -65,7 +65,7 @@ The chart does not render until these five are set, and `scripts/check-chart.sh`
 | `secret.name` | none | The Secret above. |
 | `replicaCount` | `2` | The number of replicas, unless `autoscaling.enabled` is true. With two, the API is answered and deliveries are sent while one of them is gone. |
 | `extraEnv` | `[]` | Further environment variables of a replica. Every setting of the service can be given this way, as Spring Boot reads a setting from the environment. [Tracing](#tracing) is an example. |
-| `resources` | 500m and 1Gi requested, 2 CPUs and 1Gi as the limit | A starting point and not a measurement: the service has not been run under load. Memory is requested at its limit, so a replica is not placed on a node that cannot give it that much. The JVM takes a quarter of the memory limit as the most its heap may grow to, which is 256 MiB of the default. |
+| `resources` | 500m and 1Gi requested, 2 CPUs and 1Gi as the limit | A starting point and not a measurement: the load tests of [performance.md](performance.md) ran on one laptop, with replicas that had no limit of their own. Memory is requested at its limit, so a replica is not placed on a node that cannot give it that much. The JVM takes a quarter of the memory limit as the most its heap may grow to, which is 256 MiB of the default. |
 | `startupProbe.periodSeconds`, `startupProbe.failureThreshold` | `2`, `150` | How long a replica may take to start: the two multiplied, which is 5 minutes. |
 | `preStopSleepSeconds` | `5` | How long a replica that is being removed goes on as before, ahead of its SIGTERM. |
 | `terminationGracePeriodSeconds` | `35` | How long a replica has from the beginning of its removal until it is killed. The chart does not render unless this leaves 30 s after the sleep. |
@@ -140,7 +140,7 @@ A replica migrates the database when it starts, with Flyway, before its pools op
 
 `replicaCount` sets the number of replicas. With `autoscaling.enabled` the chart leaves it to a HorizontalPodAutoscaler, which keeps the average CPU use of the replicas near `targetCPUUtilizationPercentage` of their request, between `minReplicas` and `maxReplicas`. It needs a metrics server in the cluster.
 
-- The autoscaler is off by default because its target is not a measured number: the service has not been run under load. CPU is a signal that needs nothing but a metrics server. The age of the oldest due delivery (`webhooks_oldest_due_age_seconds`, section 10) says more about a backlog, and scaling on it takes a metrics adapter that the chart does not assume.
+- The autoscaler is off by default because its target is not a measured number: the load tests of [performance.md](performance.md) ran two replicas on one laptop and none on a cluster. CPU is a signal that needs nothing but a metrics server. The age of the oldest due delivery (`webhooks_oldest_due_age_seconds`, section 10) says more about a backlog, and scaling on it takes a metrics adapter that the chart does not assume.
 - Every replica is 32 more connections to the database.
 - What the design bounds for each replica grows with their number: 4 requests in flight to one endpoint and 16 for one tenant (section 7), and 8 open requests of one tenant (section 12). The rate limit of a tenant does not grow. It is one bucket in the database for all replicas.
 - A replica that the autoscaler removes is stopped like any other.

@@ -1,0 +1,306 @@
+Scenario  ingest
+Date      2026-10-13T06:42:25Z
+Commit    b735e65b8346edf9e865c266af407b107d3917f7
+Command   loadtest/run.sh ingest
+Machine   Apple M4, 10 cores, 16 GiB of memory, macOS 26.6.2
+Docker    29.5.2 on colima: 6 CPUs, 7.7 GiB of memory, Ubuntu 24.04.4 LTS, kernel 6.8.0-117-generic
+
+--- PostgreSQL ---
+
+-- The server, and the settings that the numbers of a run depend on most. compose.yaml changes
+-- none of them, so they are what the image sets.
+SELECT version();
+                                            version                                            
+-----------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+(1 row)
+
+SELECT name, setting, unit
+FROM pg_settings
+WHERE name IN ('autovacuum', 'autovacuum_naptime', 'checkpoint_timeout', 'effective_cache_size',
+               'fsync', 'full_page_writes', 'max_connections', 'max_wal_size', 'min_wal_size',
+               'shared_buffers', 'synchronous_commit', 'wal_sync_method', 'work_mem')
+ORDER BY name;
+         name         |  setting  | unit 
+----------------------+-----------+------
+ autovacuum           | on        | 
+ autovacuum_naptime   | 60        | s
+ checkpoint_timeout   | 300       | s
+ effective_cache_size | 524288    | 8kB
+ fsync                | on        | 
+ full_page_writes     | on        | 
+ max_connections      | 100       | 
+ max_wal_size         | 1024      | MB
+ min_wal_size         | 80        | MB
+ shared_buffers       | 16384     | 8kB
+ synchronous_commit   | on        | 
+ wal_sync_method      | fdatasync | 
+ work_mem             | 4096      | kB
+(13 rows)
+
+-- What a flush of the WAL costs on the volume of the database, by pg_test_fsync.
+Compare file sync methods using one 8kB write:
+(in "wal_sync_method" preference order, except fdatasync is Linux's default)
+        open_datasync                     15718.384 ops/sec      64 usecs/op
+        fdatasync                         11245.855 ops/sec      89 usecs/op
+        fsync                               963.705 ops/sec    1038 usecs/op
+        fsync_writethrough                              n/a
+        open_sync                           299.480 ops/sec    3339 usecs/op
+
+--- k6 ---
+
+
+  █ THRESHOLDS 
+
+    dropped_iterations{scenario:rate_0250}
+    ✓ 'count==0' count=0
+
+    dropped_iterations{scenario:rate_0500}
+    ✗ 'count==0' count=404
+
+    dropped_iterations{scenario:rate_0750}
+    ✓ 'count==0' count=0
+
+    dropped_iterations{scenario:rate_1000}
+    ✗ 'count==0' count=239
+
+    dropped_iterations{scenario:rate_1250}
+    ✓ 'count==0' count=0
+
+    dropped_iterations{scenario:rate_1500}
+    ✗ 'count==0' count=118
+
+    http_req_duration{scenario:rate_0250}
+    ✓ 'p(99)<100' p(99)=16.41ms
+
+    http_req_duration{scenario:rate_0500}
+    ✗ 'p(99)<100' p(99)=517.26ms
+
+    http_req_duration{scenario:rate_0750}
+    ✗ 'p(99)<100' p(99)=609.46ms
+
+    http_req_duration{scenario:rate_1000}
+    ✗ 'p(99)<100' p(99)=652.91ms
+
+    http_req_duration{scenario:rate_1250}
+    ✗ 'p(99)<100' p(99)=477.1ms
+
+    http_req_duration{scenario:rate_1500}
+    ✗ 'p(99)<100' p(99)=603.68ms
+
+    http_req_failed{scenario:rate_0250}
+    ✓ 'rate==0' rate=0.00%
+
+    http_req_failed{scenario:rate_0500}
+    ✗ 'rate==0' rate=0.17%
+
+    http_req_failed{scenario:rate_0750}
+    ✗ 'rate==0' rate=1.79%
+
+    http_req_failed{scenario:rate_1000}
+    ✗ 'rate==0' rate=2.96%
+
+    http_req_failed{scenario:rate_1250}
+    ✗ 'rate==0' rate=5.40%
+
+    http_req_failed{scenario:rate_1500}
+    ✗ 'rate==0' rate=7.36%
+
+
+  █ TOTAL RESULTS 
+
+    HTTP
+    http_req_duration..............: med=5.22ms  p(90)=86.24ms  p(99)=566.96ms max=3.47s   count=629302
+      { expected_response:true }...: med=5.53ms  p(90)=89.51ms  p(99)=575.01ms max=3.47s   count=602679
+      { scenario:rate_0250 }.......: med=1.12ms  p(90)=3.95ms   p(99)=16.41ms  max=98.76ms count=30001 
+      { scenario:rate_0500 }.......: med=898.5µs p(90)=6ms      p(99)=517.26ms max=1.08s   count=59597 
+      { scenario:rate_0750 }.......: med=1.12ms  p(90)=17.56ms  p(99)=609.46ms max=1.55s   count=90000 
+      { scenario:rate_1000 }.......: med=2.59ms  p(90)=63.68ms  p(99)=652.91ms max=1.76s   count=119762
+      { scenario:rate_1250 }.......: med=11.52ms p(90)=96.58ms  p(99)=477.1ms  max=3.47s   count=150000
+      { scenario:rate_1500 }.......: med=12.95ms p(90)=152.79ms p(99)=603.68ms max=2.06s   count=179882
+    http_req_failed................: 4.23%  26623 out of 629302
+      { scenario:rate_0250 }.......: 0.00%  0 out of 30001
+      { scenario:rate_0500 }.......: 0.17%  103 out of 59597
+      { scenario:rate_0750 }.......: 1.79%  1618 out of 90000
+      { scenario:rate_1000 }.......: 2.96%  3549 out of 119762
+      { scenario:rate_1250 }.......: 5.40%  8103 out of 150000
+      { scenario:rate_1500 }.......: 7.36%  13250 out of 179882
+    http_reqs......................: 629302 876.023706/s
+
+    EXECUTION
+    dropped_iterations.............: 761    1.059355/s
+      { scenario:rate_0250 }.......: 0      0/s
+      { scenario:rate_0500 }.......: 404    0.562391/s
+      { scenario:rate_0750 }.......: 0      0/s
+      { scenario:rate_1000 }.......: 239    0.332701/s
+      { scenario:rate_1250 }.......: 0      0/s
+      { scenario:rate_1500 }.......: 118    0.164263/s
+    iteration_duration.............: med=5.44ms  p(90)=86.86ms  p(99)=566.3ms  max=2.06s   count=629242
+    iterations.....................: 629242 875.940183/s
+    vus............................: 224    min=0               max=685 
+    vus_max........................: 1375   min=1375            max=1375
+
+    NETWORK
+    data_received..................: 111 MB 154 kB/s
+    data_sent......................: 755 MB 1.1 MB/s
+
+
+
+--- Database ---
+
+-- What became of the events of the scenario and of their deliveries, how many of the deliveries
+-- were made after the last event was accepted, and how long after it the last one was.
+WITH last_event AS (
+  SELECT max(created_at) AS created_at FROM event WHERE created_at >= :'started'
+)
+SELECT (SELECT count(*) FROM event WHERE created_at >= :'started') AS events,
+       count(*) AS deliveries,
+       count(*) FILTER (WHERE d.state = 'succeeded') AS succeeded,
+       count(*) FILTER (WHERE d.state <> 'succeeded') AS not_succeeded,
+       count(*) FILTER (WHERE d.attempts > 1) AS claimed_more_than_once,
+       count(*) FILTER (WHERE d.completed_at > last_event.created_at) AS made_after_the_last_event,
+       round(extract(epoch FROM max(d.completed_at) - max(last_event.created_at)), 1)
+         AS seconds_from_it_to_the_last_delivery
+FROM delivery d
+CROSS JOIN last_event
+WHERE d.created_at >= :'started';
+ events | deliveries | succeeded | not_succeeded | claimed_more_than_once | made_after_the_last_event | seconds_from_it_to_the_last_delivery 
+--------+------------+-----------+---------------+------------------------+---------------------------+--------------------------------------
+ 602619 |     602619 |    602619 |             0 |                      6 |                     96430 |                                 30.8
+(1 row)
+
+-- The attempts that were recorded for those deliveries.
+SELECT a.outcome, a.http_status, a.error, count(*) AS attempts
+FROM delivery_attempt a
+JOIN delivery d ON d.id = a.delivery_id
+WHERE d.created_at >= :'started'
+GROUP BY a.outcome, a.http_status, a.error
+ORDER BY a.outcome, a.http_status, a.error;
+ outcome | http_status |  error  | attempts 
+---------+-------------+---------+----------
+ failure |             | connect |        6
+ success |         200 |         |   602619
+(2 rows)
+
+-- For each two minutes from the first event on, which is a step of loadtest/ingest.js: the
+-- deliveries that were created in it, and how long they took from their creation to the
+-- transaction that recorded their 2xx.
+SELECT floor(extract(epoch FROM d.created_at - first.created_at) / 120) + 1 AS step,
+       count(*) AS deliveries,
+       round(percentile_cont(0.5) WITHIN GROUP (
+         ORDER BY extract(epoch FROM d.completed_at - d.created_at))::numeric, 3) AS p50_seconds,
+       round(percentile_cont(0.99) WITHIN GROUP (
+         ORDER BY extract(epoch FROM d.completed_at - d.created_at))::numeric, 3) AS p99_seconds,
+       round(max(extract(epoch FROM d.completed_at - d.created_at)), 3) AS max_seconds
+FROM delivery d
+CROSS JOIN (SELECT min(created_at) AS created_at FROM delivery WHERE created_at >= :'started') first
+WHERE d.created_at >= :'started' AND d.state = 'succeeded'
+GROUP BY step
+ORDER BY step;
+ step | deliveries | p50_seconds | p99_seconds | max_seconds 
+------+------------+-------------+-------------+-------------
+    1 |      30113 |       0.064 |       0.550 |       0.804
+    2 |      59777 |       0.045 |       0.364 |       1.067
+    3 |      88818 |       0.041 |       0.397 |       9.056
+    4 |     116463 |       0.020 |       0.350 |       1.305
+    5 |     143150 |       0.074 |       8.127 |       9.063
+    6 |     164298 |      55.428 |      70.459 |      70.825
+(6 rows)
+
+--- PostgreSQL log ---
+
+WAL segments that the database had when the scenario began: 63
+Its checkpoints and its vacuums of the delivery table from then on:
+2026-10-13 06:49:53.959 UTC [1710] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 06:51:55.767 UTC [2116] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 06:52:14.864 UTC [66] LOG:  checkpoint starting: wal
+2026-10-13 06:52:58.834 UTC [2321] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 06:53:54.555 UTC [2524] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 06:53:58.913 UTC [66] LOG:  checkpoint complete: wrote 9862 buffers (60.2%), wrote 54 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled
+2026-10-13 06:54:11.552 UTC [66] LOG:  checkpoint starting: wal
+2026-10-13 06:55:01.303 UTC [2726] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 06:55:25.969 UTC [66] LOG:  checkpoint complete: wrote 9158 buffers (55.9%), wrote 49 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled
+2026-10-13 06:55:38.210 UTC [66] LOG:  checkpoint starting: wal
+2026-10-13 06:56:52.717 UTC [66] LOG:  checkpoint complete: wrote 6750 buffers (41.2%), wrote 62 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled
+2026-10-13 06:56:57.760 UTC [66] LOG:  checkpoint starting: wal
+2026-10-13 06:57:09.718 UTC [3124] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 06:57:51.061 UTC [66] LOG:  checkpoint complete: wrote 6458 buffers (39.4%), wrote 71 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled
+2026-10-13 06:58:01.220 UTC [66] LOG:  checkpoint starting: wal
+2026-10-13 06:59:04.989 UTC [66] LOG:  checkpoint complete: wrote 5340 buffers (32.6%), wrote 77 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled
+2026-10-13 06:59:10.332 UTC [66] LOG:  checkpoint starting: wal
+2026-10-13 06:59:11.396 UTC [3527] LOG:  automatic vacuum of table "webhooks.public.delivery": index scans: 1
+2026-10-13 07:00:01.055 UTC [66] LOG:  checkpoint complete: wrote 4693 buffers (28.6%), wrote 68 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled
+2026-10-13 07:00:10.356 UTC [66] LOG:  checkpoint starting: wal
+
+--- Meters ---
+
+     replica-1      replica-2           both  increase during the scenario
+       1211076        1209560        2420636  hikaricp_connections_acquire_seconds_count{pool="api"}
+      7776.872       7904.837      15681.709  hikaricp_connections_acquire_seconds_sum{pool="api"}
+        667388         685470        1352858  hikaricp_connections_acquire_seconds_count{pool="worker"}
+      1065.643       1089.781       2155.424  hikaricp_connections_acquire_seconds_sum{pool="worker"}
+            20              0             20  http_server_requests_seconds_count{error="none",exception="none",method="PATCH",outcome="SUCCESS",status="204",uri="/admin/tenants/{id}"}
+         11811          11893          23704  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="CLIENT_ERROR",status="429",uri="UNKNOWN"}
+            20              0             20  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="201",uri="/admin/tenants"}
+            20              0             20  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="201",uri="/v1/endpoints"}
+        301510         301109         602619  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="202",uri="/v1/events"}
+           506            499           1005  jvm_gc_pause_seconds_count{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+         5.010          5.088         10.098  jvm_gc_pause_seconds_sum{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+  380150000000   383140000000   763290000000  process_cpu_time_ns_total
+         71317          76117         147434  webhooks_claim_rows_count
+        297992         304633         602625  webhooks_claim_rows_sum
+         71317          76117         147434  webhooks_claim_seconds_count
+       356.104        362.328        718.432  webhooks_claim_seconds_sum
+             0              6              6  webhooks_delivery_attempt_seconds_bucket{outcome="failure",le="0.5"}
+             0              6              6  webhooks_delivery_attempt_seconds_count{outcome="failure"}
+             0          1.682          1.682  webhooks_delivery_attempt_seconds_sum{outcome="failure"}
+        296582         303231         599813  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.05"}
+        297567         304177         601744  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.1"}
+        297961         304494         602455  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.25"}
+        297992         304609         602601  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.5"}
+        297992         304609         602601  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="1.0"}
+        297992         304627         602619  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="2.5"}
+        297992         304627         602619  webhooks_delivery_attempt_seconds_count{outcome="success"}
+       492.560        530.139       1022.699  webhooks_delivery_attempt_seconds_sum{outcome="success"}
+             0              6              6  webhooks_delivery_attempts_total{outcome="failure",reason="connect"}
+        297992         304627         602619  webhooks_delivery_attempts_total{outcome="success",reason="http_2xx"}
+        204481         211125         415606  webhooks_delivery_end_to_end_seconds_bucket{le="1.0"}
+        217645         223868         441513  webhooks_delivery_end_to_end_seconds_bucket{le="5.0"}
+        226344         232718         459062  webhooks_delivery_end_to_end_seconds_bucket{le="15.0"}
+        263559         269526         533085  webhooks_delivery_end_to_end_seconds_bucket{le="60.0"}
+        297965         304591         602556  webhooks_delivery_end_to_end_seconds_bucket{le="300.0"}
+        297965         304591         602556  webhooks_delivery_end_to_end_seconds_count
+   4120994.005    4149303.400    8270297.405  webhooks_delivery_end_to_end_seconds_sum
+        297992         304627         602619  webhooks_delivery_terminal_total{reason="delivered",state="succeeded"}
+           287            217            504  webhooks_dns_lookups_total{result="ok"}
+        301510         301109         602619  webhooks_ingest_requests_total{result="accepted"}
+          1450           1469           2919  webhooks_ingest_requests_total{result="rate_limited"}
+             1              1              2  http_server_requests_seconds_count{error="none",exception="none",method="GET",outcome="SUCCESS",status="200",uri="/actuator/prometheus"}
+          1450           1469           2919  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="CLIENT_ERROR",status="429",uri="/v1/events"}
+
+         value  of both replicas together
+      0.006478  mean of hikaricp_connections_acquire_seconds{pool="api"}
+      0.001593  mean of hikaricp_connections_acquire_seconds{pool="worker"}
+      0.010048  mean of jvm_gc_pause_seconds{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+      4.087422  mean of webhooks_claim_rows
+      0.004873  mean of webhooks_claim_seconds
+      1.000000  share of webhooks_delivery_attempt_seconds_bucket{outcome="failure",le="0.5"}
+      0.280348  mean of webhooks_delivery_attempt_seconds{outcome="failure"}
+      0.995344  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.05"}
+      0.998548  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.1"}
+      0.999728  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.25"}
+      0.999970  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.5"}
+      0.999970  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="1.0"}
+      1.000000  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="2.5"}
+      0.001697  mean of webhooks_delivery_attempt_seconds{outcome="success"}
+      0.689738  share of webhooks_delivery_end_to_end_seconds_bucket{le="1.0"}
+      0.732734  share of webhooks_delivery_end_to_end_seconds_bucket{le="5.0"}
+      0.761858  share of webhooks_delivery_end_to_end_seconds_bucket{le="15.0"}
+      0.884706  share of webhooks_delivery_end_to_end_seconds_bucket{le="60.0"}
+      1.000000  share of webhooks_delivery_end_to_end_seconds_bucket{le="300.0"}
+     13.725359  mean of webhooks_delivery_end_to_end_seconds
+
+--- Sink ---
+
+What the sink received during the scenario, and for how many webhook-ids more than once:
+{"requests": 602619, "webhook_ids": 602619, "received_more_than_once": 0}

@@ -195,6 +195,7 @@
               <include>src/main/java/**/*.java</include>
               <include>src/test/java/**/*.java</include>
               <include>examples/**/*.java</include>
+              <include>loadtest/**/*.java</include>
             </includes>
             <googleJavaFormat>
               <version>${google-java-format.version}</version>

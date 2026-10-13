@@ -1,0 +1,61 @@
+# What the load tests change in the stack of compose.yaml. loadtest/run.sh starts the stack with
+# both files, and starts PostgreSQL, the two replicas and the sink of them and nothing else. Paths
+# are relative to the directory of compose.yaml, which is the first file.
+#
+# Needs Docker Compose 2.24 or later, for !reset.
+
+services:
+  # The server with the settings of the image, and one more line in its log for every vacuum and
+  # every analyze of autovacuum. A result shows the vacuums of the delivery table next to the
+  # checkpoints.
+  postgres:
+    command: [postgres, -c, log_autovacuum_min_duration=0]
+
+  # As a replica ships: it exports its spans nowhere and samples a tenth of its traces. The stack
+  # of compose.yaml samples every trace and sends its spans to Jaeger, which keeps them in
+  # memory.
+  #
+  # A replica writes its host name to the attempts that it records. With these names a result
+  # says which replica made a delivery.
+  replica-1:
+    hostname: replica-1
+    environment:
+      MANAGEMENT_OPENTELEMETRY_TRACING_EXPORT_OTLP_ENDPOINT: !reset null
+      MANAGEMENT_TRACING_SAMPLING_PROBABILITY: !reset null
+
+  replica-2:
+    hostname: replica-2
+    environment:
+      MANAGEMENT_OPENTELEMETRY_TRACING_EXPORT_OTLP_ENDPOINT: !reset null
+      MANAGEMENT_TRACING_SAMPLING_PROBABILITY: !reset null
+
+  # The subscriber of the load tests, on the image that the example subscriber runs on. The
+  # replicas reach it as sink:8082.
+  sink:
+    image: eclipse-temurin:21-jdk-alpine@sha256:0bfc69a4758a86710e5c474032d28400a8bd00874766f9e8b1642ac2fd293159
+    user: "65532:65532"
+    command: [java, /sink/Sink.java, "8082"]
+    volumes:
+      - ./loadtest/sink:/sink:ro
+    ports:
+      - "127.0.0.1::8082"
+    healthcheck:
+      test: [CMD, nc, -z, 127.0.0.1, "8082"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # The load generator, inside the network of the stack: its requests reach a replica as those
+  # of a producer in the same network would, and not through the port forwarding of the Docker
+  # host. It is started for one run by "docker compose run" and is not part of "docker compose
+  # up".
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: [load]
+    environment:
+      REPLICAS: http://replica-1:8080,http://replica-2:8080
+      SINK: http://sink:8082
+      # The admin token that compose.yaml gives the replicas. A development value.
+      ADMIN_TOKEN: admin-token-for-local-development-only
+    volumes:
+      - ./loadtest:/loadtest:ro

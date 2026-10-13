@@ -1,0 +1,402 @@
+Scenario  endpoint-ceiling
+Date      2026-10-13T07:35:22Z
+Commit    b735e65b8346edf9e865c266af407b107d3917f7
+Command   loadtest/run.sh endpoint-ceiling
+Machine   Apple M4, 10 cores, 16 GiB of memory, macOS 26.6.2
+Docker    29.5.2 on colima: 6 CPUs, 7.7 GiB of memory, Ubuntu 24.04.4 LTS, kernel 6.8.0-117-generic
+
+--- PostgreSQL ---
+
+-- The server, and the settings that the numbers of a run depend on most. compose.yaml changes
+-- none of them, so they are what the image sets.
+SELECT version();
+                                            version                                            
+-----------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+(1 row)
+
+SELECT name, setting, unit
+FROM pg_settings
+WHERE name IN ('autovacuum', 'autovacuum_naptime', 'checkpoint_timeout', 'effective_cache_size',
+               'fsync', 'full_page_writes', 'max_connections', 'max_wal_size', 'min_wal_size',
+               'shared_buffers', 'synchronous_commit', 'wal_sync_method', 'work_mem')
+ORDER BY name;
+         name         |  setting  | unit 
+----------------------+-----------+------
+ autovacuum           | on        | 
+ autovacuum_naptime   | 60        | s
+ checkpoint_timeout   | 300       | s
+ effective_cache_size | 524288    | 8kB
+ fsync                | on        | 
+ full_page_writes     | on        | 
+ max_connections      | 100       | 
+ max_wal_size         | 1024      | MB
+ min_wal_size         | 80        | MB
+ shared_buffers       | 16384     | 8kB
+ synchronous_commit   | on        | 
+ wal_sync_method      | fdatasync | 
+ work_mem             | 4096      | kB
+(13 rows)
+
+-- What a flush of the WAL costs on the volume of the database, by pg_test_fsync.
+Compare file sync methods using one 8kB write:
+(in "wal_sync_method" preference order, except fdatasync is Linux's default)
+        open_datasync                     19666.867 ops/sec      51 usecs/op
+        fdatasync                         16992.692 ops/sec      59 usecs/op
+        fsync                             10151.493 ops/sec      99 usecs/op
+        fsync_writethrough                              n/a
+        open_sync                         10697.369 ops/sec      93 usecs/op
+
+--- k6 ---
+
+
+  █ THRESHOLDS 
+
+    http_req_failed{scenario:backlog}
+    ✓ 'rate==0' rate=0.00%
+
+
+  █ TOTAL RESULTS 
+
+    HTTP
+    http_req_duration..............: med=5.14ms p(90)=11.39ms p(99)=22.69ms max=79.03ms count=50005
+      { expected_response:true }...: med=5.14ms p(90)=11.39ms p(99)=22.69ms max=79.03ms count=50005
+    http_req_failed................: 0.00%  0 out of 50005
+      { scenario:backlog }.........: 0.00%  0 out of 50000
+    http_reqs......................: 50005  1893.563661/s
+
+    EXECUTION
+    iteration_duration.............: med=5.22ms p(90)=11.48ms p(99)=22.8ms  max=79.16ms count=50000
+    iterations.....................: 50000  1893.374324/s
+    vus............................: 12     min=12         max=12
+    vus_max........................: 12     min=12         max=12
+
+    NETWORK
+    data_received..................: 8.5 MB 322 kB/s
+    data_sent......................: 60 MB  2.3 MB/s
+
+
+
+--- Database ---
+
+-- What became of the events of the scenario and of their deliveries, how many of the deliveries
+-- were made after the last event was accepted, and how long after it the last one was.
+WITH last_event AS (
+  SELECT max(created_at) AS created_at FROM event WHERE created_at >= :'started'
+)
+SELECT (SELECT count(*) FROM event WHERE created_at >= :'started') AS events,
+       count(*) AS deliveries,
+       count(*) FILTER (WHERE d.state = 'succeeded') AS succeeded,
+       count(*) FILTER (WHERE d.state <> 'succeeded') AS not_succeeded,
+       count(*) FILTER (WHERE d.attempts > 1) AS claimed_more_than_once,
+       count(*) FILTER (WHERE d.completed_at > last_event.created_at) AS made_after_the_last_event,
+       round(extract(epoch FROM max(d.completed_at) - max(last_event.created_at)), 1)
+         AS seconds_from_it_to_the_last_delivery
+FROM delivery d
+CROSS JOIN last_event
+WHERE d.created_at >= :'started';
+ events | deliveries | succeeded | not_succeeded | claimed_more_than_once | made_after_the_last_event | seconds_from_it_to_the_last_delivery 
+--------+------------+-----------+---------------+------------------------+---------------------------+--------------------------------------
+  50000 |      50000 |     50000 |             0 |                      7 |                     50000 |                                 66.4
+(1 row)
+
+-- The attempts that were recorded for those deliveries.
+SELECT a.outcome, a.http_status, a.error, count(*) AS attempts
+FROM delivery_attempt a
+JOIN delivery d ON d.id = a.delivery_id
+WHERE d.created_at >= :'started'
+GROUP BY a.outcome, a.http_status, a.error
+ORDER BY a.outcome, a.http_status, a.error;
+ outcome | http_status | error | attempts 
+---------+-------------+-------+----------
+ failure |         503 |       |        7
+ success |         200 |       |    50000
+(2 rows)
+
+-- The drain of the backlog, from the first recorded 2xx to the last: the deliveries that each
+-- replica made, and both together.
+WITH made AS (
+  SELECT d.completed_at, a.replica
+  FROM delivery d
+  JOIN delivery_attempt a ON a.delivery_id = d.id AND a.outcome = 'success'
+  WHERE d.created_at >= :'started'
+), drain AS (
+  SELECT extract(epoch FROM max(completed_at) - min(completed_at)) AS seconds FROM made
+)
+SELECT coalesce(made.replica, 'both') AS replica,
+       count(*) AS deliveries,
+       round(drain.seconds, 1) AS seconds,
+       round(count(*) / drain.seconds, 1) AS per_second
+FROM made
+CROSS JOIN drain
+GROUP BY GROUPING SETS ((made.replica, drain.seconds), (drain.seconds))
+ORDER BY made.replica;
+  replica  | deliveries | seconds | per_second 
+-----------+------------+---------+------------
+ replica-1 |      24953 |    62.0 |      402.2
+ replica-2 |      25047 |    62.0 |      403.7
+ both      |      50000 |    62.0 |      805.9
+(3 rows)
+
+-- The deliveries that were made in each five seconds of the drain, by each replica and by
+-- both, and how many a second that is for both. The first and the last five seconds are not
+-- full. The time of day is that of the database, as in its log.
+SELECT to_char(date_bin('5 seconds', d.completed_at, first.completed_at), 'HH24:MI:SS')
+         AS made_from,
+       count(*) FILTER (WHERE a.replica = 'replica-1') AS replica_1,
+       count(*) FILTER (WHERE a.replica = 'replica-2') AS replica_2,
+       count(*) AS both,
+       round(count(*) / 5.0, 1) AS both_per_second
+FROM delivery d
+JOIN delivery_attempt a ON a.delivery_id = d.id AND a.outcome = 'success'
+CROSS JOIN (
+  SELECT min(completed_at) AS completed_at FROM delivery WHERE created_at >= :'started'
+) first
+WHERE d.created_at >= :'started'
+GROUP BY made_from
+ORDER BY made_from;
+ made_from | replica_1 | replica_2 | both  | both_per_second 
+-----------+-----------+-----------+-------+-----------------
+ 07:41:11  |       328 |       328 |   656 |           131.2
+ 07:41:16  |       281 |       282 |   563 |           112.6
+ 07:41:21  |       288 |       286 |   574 |           114.8
+ 07:41:26  |       278 |       278 |   556 |           111.2
+ 07:41:31  |       275 |       275 |   550 |           110.0
+ 07:41:36  |       288 |       288 |   576 |           115.2
+ 07:41:41  |       316 |       316 |   632 |           126.4
+ 07:41:46  |       489 |       513 |  1002 |           200.4
+ 07:41:51  |      4025 |      4030 |  8055 |          1611.0
+ 07:41:56  |      6057 |      6089 | 12146 |          2429.2
+ 07:42:01  |      4932 |      4989 |  9921 |          1984.2
+ 07:42:06  |      5087 |      5069 | 10156 |          2031.2
+ 07:42:11  |      2309 |      2304 |  4613 |           922.6
+(13 rows)
+
+--- Claim ---
+
+What loadtest/queries/claim-plan.sql answered once the drain of the backlog had begun:
+
+ pending | last_autoanalyze | last_analyze |   now    
+---------+------------------+--------------+----------
+   49911 | 07:39:53         | 07:40:38     | 07:41:12
+(1 row)
+
+                                                                                 QUERY PLAN                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on delivery d  (cost=9.11..17.15 rows=1 width=188) (actual time=16.874..16.880 rows=1.00 loops=1)
+   Buffers: shared hit=50002
+   CTE eligible
+     ->  Hash Join  (cost=2.61..4.04 rows=1 width=39) (actual time=0.036..0.039 rows=1.00 loops=1)
+           Hash Cond: (c.endpoint_id = e.id)
+           Buffers: shared hit=3
+           ->  Seq Scan on endpoint_circuit c  (cost=0.00..1.35 rows=20 width=23) (actual time=0.004..0.005 rows=21.00 loops=1)
+                 Filter: ((state = 'closed'::text) OR (next_probe_at <= now()))
+                 Buffers: shared hit=1
+           ->  Hash  (cost=2.60..2.60 rows=1 width=32) (actual time=0.024..0.026 rows=1.00 loops=1)
+                 Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                 Buffers: shared hit=2
+                 ->  Hash Join  (cost=1.26..2.60 rows=1 width=32) (actual time=0.022..0.024 rows=1.00 loops=1)
+                       Hash Cond: (t.id = e.tenant_id)
+                       Buffers: shared hit=2
+                       ->  Seq Scan on tenant t  (cost=0.00..1.25 rows=20 width=16) (actual time=0.002..0.004 rows=21.00 loops=1)
+                             Filter: (status = 'active'::text)
+                             Buffers: shared hit=1
+                       ->  Hash  (cost=1.25..1.25 rows=1 width=32) (actual time=0.009..0.010 rows=1.00 loops=1)
+                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                             Buffers: shared hit=1
+                             ->  Seq Scan on endpoint e  (cost=0.00..1.25 rows=1 width=32) (actual time=0.004..0.005 rows=1.00 loops=1)
+                                   Filter: ((id <> ALL ('{}'::uuid[])) AND (tenant_id <> ALL ('{}'::uuid[])) AND (status = 'active'::text))
+                                   Rows Removed by Filter: 20
+                                   Buffers: shared hit=1
+   CTE head
+     ->  Nested Loop  (cost=4.53..4.58 rows=1 width=89) (actual time=16.589..16.592 rows=1.00 loops=1)
+           Buffers: shared hit=49959
+           ->  CTE Scan on eligible g  (cost=0.00..0.02 rows=1 width=64) (actual time=0.037..0.038 rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 17kB
+                 Buffers: shared hit=3
+           ->  Subquery Scan on h  (cost=4.53..4.55 rows=1 width=25) (actual time=16.550..16.551 rows=1.00 loops=1)
+                 Buffers: shared hit=49956
+                 ->  Limit  (cost=4.53..4.54 rows=1 width=31) (actual time=16.549..16.550 rows=1.00 loops=1)
+                       Buffers: shared hit=49956
+                       ->  LockRows  (cost=4.53..4.54 rows=1 width=31) (actual time=16.549..16.549 rows=1.00 loops=1)
+                             Buffers: shared hit=49956
+                             ->  Sort  (cost=4.53..4.53 rows=1 width=31) (actual time=16.427..16.427 rows=3.00 loops=1)
+                                   Sort Key: d_1.next_attempt_at
+                                   Sort Method: quicksort  Memory: 3705kB
+                                   Buffers: shared hit=49947
+                                   ->  Index Scan using delivery_expiry on delivery d_1  (cost=0.25..4.52 rows=1 width=31) (actual time=0.009..11.593 rows=49907.00 loops=1)
+                                         Filter: ((endpoint_id = g.endpoint_id) AND (state = 'pending'::text) AND (next_attempt_at <= now()))
+                                         Index Searches: 1
+                                         Buffers: shared hit=49947
+   ->  Nested Loop  (cost=0.48..8.53 rows=1 width=188) (actual time=16.686..16.688 rows=1.00 loops=1)
+         Buffers: shared hit=49972
+         ->  Subquery Scan on p  (cost=0.06..0.08 rows=1 width=170) (actual time=16.655..16.656 rows=1.00 loops=1)
+               Buffers: shared hit=49968
+               ->  Limit  (cost=0.06..0.07 rows=1 width=97) (actual time=16.638..16.639 rows=1.00 loops=1)
+                     Buffers: shared hit=49968
+                     ->  Sort  (cost=0.06..0.07 rows=1 width=97) (actual time=16.637..16.638 rows=1.00 loops=1)
+                           Sort Key: (row_number() OVER w1), head.next_attempt_at
+                           Sort Method: quicksort  Memory: 25kB
+                           Buffers: shared hit=49968
+                           ->  WindowAgg  (cost=0.03..0.05 rows=1 width=97) (actual time=16.616..16.617 rows=1.00 loops=1)
+                                 Window: w1 AS (PARTITION BY head.tenant_id ORDER BY head.next_attempt_at ROWS UNBOUNDED PRECEDING)
+                                 Run Condition: (row_number() OVER w1 <= 4)
+                                 Storage: Memory  Maximum Storage: 17kB
+                                 Buffers: shared hit=49962
+                                 ->  Sort  (cost=0.03..0.04 rows=1 width=89) (actual time=16.604..16.605 rows=1.00 loops=1)
+                                       Sort Key: head.tenant_id, head.next_attempt_at
+                                       Sort Method: quicksort  Memory: 25kB
+                                       Buffers: shared hit=49962
+                                       ->  CTE Scan on head  (cost=0.00..0.02 rows=1 width=89) (actual time=16.590..16.594 rows=1.00 loops=1)
+                                             Storage: Memory  Maximum Storage: 17kB
+                                             Buffers: shared hit=49959
+         ->  Index Scan using delivery_pkey on delivery d  (cost=0.42..8.44 rows=1 width=26) (actual time=0.014..0.014 rows=1.00 loops=1)
+               Index Cond: (id = p.id)
+               Index Searches: 1
+               Buffers: shared hit=4
+ Planning:
+   Buffers: shared hit=224 read=12
+ Planning Time: 1.188 ms
+ Execution Time: 17.216 ms
+(75 rows)
+
+And once the backlog was drained:
+
+ pending | last_autoanalyze | last_analyze |   now    
+---------+------------------+--------------+----------
+       0 | 07:41:51         | 07:40:38     | 07:42:14
+(1 row)
+
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on delivery d  (cost=8.48..16.53 rows=1 width=188) (actual time=0.888..0.891 rows=0.00 loops=1)
+   Buffers: shared hit=278 read=3 written=3
+   CTE eligible
+     ->  Hash Join  (cost=2.61..4.04 rows=1 width=39) (actual time=0.031..0.034 rows=1.00 loops=1)
+           Hash Cond: (c.endpoint_id = e.id)
+           Buffers: shared hit=3
+           ->  Seq Scan on endpoint_circuit c  (cost=0.00..1.35 rows=20 width=23) (actual time=0.004..0.005 rows=21.00 loops=1)
+                 Filter: ((state = 'closed'::text) OR (next_probe_at <= now()))
+                 Buffers: shared hit=1
+           ->  Hash  (cost=2.60..2.60 rows=1 width=32) (actual time=0.019..0.021 rows=1.00 loops=1)
+                 Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                 Buffers: shared hit=2
+                 ->  Hash Join  (cost=1.26..2.60 rows=1 width=32) (actual time=0.017..0.019 rows=1.00 loops=1)
+                       Hash Cond: (t.id = e.tenant_id)
+                       Buffers: shared hit=2
+                       ->  Seq Scan on tenant t  (cost=0.00..1.25 rows=20 width=16) (actual time=0.002..0.003 rows=21.00 loops=1)
+                             Filter: (status = 'active'::text)
+                             Buffers: shared hit=1
+                       ->  Hash  (cost=1.25..1.25 rows=1 width=32) (actual time=0.007..0.008 rows=1.00 loops=1)
+                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                             Buffers: shared hit=1
+                             ->  Seq Scan on endpoint e  (cost=0.00..1.25 rows=1 width=32) (actual time=0.002..0.004 rows=1.00 loops=1)
+                                   Filter: ((id <> ALL ('{}'::uuid[])) AND (tenant_id <> ALL ('{}'::uuid[])) AND (status = 'active'::text))
+                                   Rows Removed by Filter: 20
+                                   Buffers: shared hit=1
+   CTE head
+     ->  Nested Loop  (cost=0.42..3.95 rows=1 width=89) (actual time=0.856..0.856 rows=0.00 loops=1)
+           Buffers: shared hit=269 read=3 written=3
+           ->  CTE Scan on eligible g  (cost=0.00..0.02 rows=1 width=64) (actual time=0.032..0.032 rows=1.00 loops=1)
+                 Storage: Memory  Maximum Storage: 17kB
+                 Buffers: shared hit=3
+           ->  Subquery Scan on h  (cost=0.42..3.92 rows=1 width=25) (actual time=0.823..0.823 rows=0.00 loops=1)
+                 Buffers: shared hit=266 read=3 written=3
+                 ->  Limit  (cost=0.42..3.91 rows=1 width=31) (actual time=0.822..0.823 rows=0.00 loops=1)
+                       Buffers: shared hit=266 read=3 written=3
+                       ->  LockRows  (cost=0.42..7526.26 rows=2152 width=31) (actual time=0.822..0.822 rows=0.00 loops=1)
+                             Buffers: shared hit=266 read=3 written=3
+                             ->  Index Scan using delivery_head on delivery d_1  (cost=0.42..7504.74 rows=2152 width=31) (actual time=0.821..0.821 rows=0.00 loops=1)
+                                   Index Cond: ((endpoint_id = g.endpoint_id) AND (next_attempt_at <= now()))
+                                   Filter: (state = 'pending'::text)
+                                   Index Searches: 1
+                                   Buffers: shared hit=266 read=3 written=3
+   ->  Nested Loop  (cost=0.48..8.53 rows=1 width=188) (actual time=0.887..0.887 rows=0.00 loops=1)
+         Buffers: shared hit=278 read=3 written=3
+         ->  Subquery Scan on p  (cost=0.06..0.08 rows=1 width=170) (actual time=0.887..0.887 rows=0.00 loops=1)
+               Buffers: shared hit=278 read=3 written=3
+               ->  Limit  (cost=0.06..0.07 rows=1 width=97) (actual time=0.886..0.886 rows=0.00 loops=1)
+                     Buffers: shared hit=278 read=3 written=3
+                     ->  Sort  (cost=0.06..0.07 rows=1 width=97) (actual time=0.886..0.886 rows=0.00 loops=1)
+                           Sort Key: (row_number() OVER w1), head.next_attempt_at
+                           Sort Method: quicksort  Memory: 25kB
+                           Buffers: shared hit=278 read=3 written=3
+                           ->  WindowAgg  (cost=0.03..0.05 rows=1 width=97) (actual time=0.868..0.868 rows=0.00 loops=1)
+                                 Window: w1 AS (PARTITION BY head.tenant_id ORDER BY head.next_attempt_at ROWS UNBOUNDED PRECEDING)
+                                 Run Condition: (row_number() OVER w1 <= 4)
+                                 Buffers: shared hit=272 read=3 written=3
+                                 ->  Sort  (cost=0.03..0.04 rows=1 width=89) (actual time=0.867..0.867 rows=0.00 loops=1)
+                                       Sort Key: head.tenant_id, head.next_attempt_at
+                                       Sort Method: quicksort  Memory: 25kB
+                                       Buffers: shared hit=272 read=3 written=3
+                                       ->  CTE Scan on head  (cost=0.00..0.02 rows=1 width=89) (actual time=0.857..0.857 rows=0.00 loops=1)
+                                             Storage: Memory  Maximum Storage: 17kB
+                                             Buffers: shared hit=269 read=3 written=3
+         ->  Index Scan using delivery_pkey on delivery d  (cost=0.42..8.44 rows=1 width=26) (never executed)
+               Index Cond: (id = p.id)
+               Index Searches: 0
+ Planning:
+   Buffers: shared hit=222 read=14 written=13
+ Planning Time: 1.320 ms
+ Execution Time: 1.114 ms
+(70 rows)
+
+--- PostgreSQL log ---
+
+WAL segments that the database had when the scenario began: 63
+Its checkpoints and its vacuums of the delivery table from then on:
+
+--- Meters ---
+
+     replica-1      replica-2           both  increase during the scenario
+        100244          99766         200010  hikaricp_connections_acquire_seconds_count{pool="api"}
+         0.067          0.114          0.180  hikaricp_connections_acquire_seconds_sum{pool="api"}
+         75723          76008         151731  hikaricp_connections_acquire_seconds_count{pool="worker"}
+         0.133          0.088          0.221  hikaricp_connections_acquire_seconds_sum{pool="worker"}
+             1              0              1  http_server_requests_seconds_count{error="none",exception="none",method="PATCH",outcome="SUCCESS",status="204",uri="/admin/tenants/{id}"}
+             1              0              1  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="201",uri="/admin/tenants"}
+             1              0              1  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="201",uri="/v1/endpoints"}
+         25060          24940          50000  http_server_requests_seconds_count{error="none",exception="none",method="POST",outcome="SUCCESS",status="202",uri="/v1/events"}
+            64             49            113  jvm_gc_pause_seconds_count{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+         0.142          0.139          0.281  jvm_gc_pause_seconds_sum{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+   34640000000    33730000000    68370000000  process_cpu_time_ns_total
+         25793          25901          51694  webhooks_claim_rows_count
+         24960          25048          50008  webhooks_claim_rows_sum
+         25793          25901          51694  webhooks_claim_seconds_count
+        62.102         62.080        124.182  webhooks_claim_seconds_sum
+             7              0              7  webhooks_delivery_attempt_seconds_bucket{outcome="failure",le="0.05"}
+             7              0              7  webhooks_delivery_attempt_seconds_count{outcome="failure"}
+         0.018              0          0.018  webhooks_delivery_attempt_seconds_sum{outcome="failure"}
+         24953          25047          50000  webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.05"}
+         24953          25047          50000  webhooks_delivery_attempt_seconds_count{outcome="success"}
+         7.403          7.353         14.756  webhooks_delivery_attempt_seconds_sum{outcome="success"}
+             7              0              7  webhooks_delivery_attempts_total{outcome="failure",reason="http_5xx"}
+         24953          25047          50000  webhooks_delivery_attempts_total{outcome="success",reason="http_2xx"}
+          1886           1885           3771  webhooks_delivery_end_to_end_seconds_bucket{le="60.0"}
+         24953          25047          50000  webhooks_delivery_end_to_end_seconds_bucket{le="300.0"}
+         24953          25047          50000  webhooks_delivery_end_to_end_seconds_count
+   1614505.689    1620649.816    3235155.505  webhooks_delivery_end_to_end_seconds_sum
+             0              1              1  webhooks_delivery_released_total{reason="gate_lost"}
+         24953          25047          50000  webhooks_delivery_terminal_total{reason="delivered",state="succeeded"}
+             4              4              8  webhooks_dns_lookups_total{result="ok"}
+         25060          24940          50000  webhooks_ingest_requests_total{result="accepted"}
+             1              1              2  http_server_requests_seconds_count{error="none",exception="none",method="GET",outcome="SUCCESS",status="200",uri="/actuator/prometheus"}
+
+         value  of both replicas together
+      0.000001  mean of hikaricp_connections_acquire_seconds{pool="api"}
+      0.000001  mean of hikaricp_connections_acquire_seconds{pool="worker"}
+      0.002487  mean of jvm_gc_pause_seconds{action="end of minor GC",cause="G1 Evacuation Pause",gc="G1 Young Generation"}
+      0.967385  mean of webhooks_claim_rows
+      0.002402  mean of webhooks_claim_seconds
+      1.000000  share of webhooks_delivery_attempt_seconds_bucket{outcome="failure",le="0.05"}
+      0.002516  mean of webhooks_delivery_attempt_seconds{outcome="failure"}
+      1.000000  share of webhooks_delivery_attempt_seconds_bucket{outcome="success",le="0.05"}
+      0.000295  mean of webhooks_delivery_attempt_seconds{outcome="success"}
+      0.075420  share of webhooks_delivery_end_to_end_seconds_bucket{le="60.0"}
+      1.000000  share of webhooks_delivery_end_to_end_seconds_bucket{le="300.0"}
+     64.703110  mean of webhooks_delivery_end_to_end_seconds
+
+--- Sink ---
+
+What the sink received during the scenario, and for how many webhook-ids more than once:
+{"requests": 50007, "webhook_ids": 50000, "received_more_than_once": 7}

@@ -238,6 +238,29 @@ class RateLimitIT {
     assertThat(tenant.eventRows()).isEqualTo(9);
   }
 
+  // The last refill of a bucket can lie ahead of the clock of a charge: a charge that began later
+  // wrote it while this one waited for the row, or the clock of the database was set back. The
+  // time since the refill is then negative, and the statement takes tokens away for it.
+  //
+  // The tenant gets one unit a second, and its bucket holds 9 of 10. With the last refill an hour
+  // ahead, an event of one unit is refused and told to come back after a second, and the bucket
+  // still holds 9. With the refill back where it was, the event is accepted.
+  @Test
+  void chargeBehindTheLastRefillIsRefusedAlthoughTheBucketHoldsEnough() {
+    TestTenant tenant = TestTenant.create(http, "refill-ahead");
+    tenant.patch(http, Map.of("rate_per_sec", 1, "burst", 10));
+    assertThat(send(http, tenant, ORDER_CREATED).getStatus()).isEqualTo(HttpStatus.ACCEPTED);
+    assertThat(Rows.bucketTokens(tenant.id())).isEqualTo(9);
+
+    Rows.postponeRefill(tenant.id(), Duration.ofHours(1));
+    assertRefused(send(http, tenant, ORDER_CREATED), "rate_limited", "1");
+    assertThat(Rows.bucketTokens(tenant.id())).isEqualTo(9);
+
+    Rows.ageBucket(tenant.id(), Duration.ofHours(1));
+    assertThat(send(http, tenant, ORDER_CREATED).getStatus()).isEqualTo(HttpStatus.ACCEPTED);
+    assertThat(tenant.eventRows()).isEqualTo(2);
+  }
+
   // Three endpoints take order.created, one takes order.paid and none takes order.shipped. An
   // event costs one unit for each endpoint that it goes to, and one unit when it goes to none.
   //

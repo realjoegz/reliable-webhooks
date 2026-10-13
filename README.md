@@ -8,9 +8,9 @@ What it does today:
 - **It does not lose a delivery when a replica dies.** Each replica claims due deliveries from the one database, sends each as a signed `POST` and records the attempt and the next state of the delivery in one transaction. A claim is a lease of 60 seconds under a random token. A replica that is killed leaves a lease that runs out, and another replica takes the delivery over. A subscriber can get a delivery twice and knows it by the `webhook-id`, which is the same on every request for it.
 - **It retries, and keeps what it could not deliver.** A failed attempt is followed by the next one on a backoff schedule. After twelve failed attempts, or after 72 hours, a delivery is `dead`. A `dead` delivery is kept for 30 days and can be replayed.
 - **It keeps running when the database does not.** While the database restarts, a replica answers an event with `503` and goes on. A result that it could not record is recorded if the database is back within 55 seconds of the claim. After that the result is given up, and the delivery is sent again once its lease has run out.
-- **It keeps endpoints and tenants apart, and connects to public addresses only.** A slow endpoint, a host whose lookup never answers, a tenant with a deep backlog or a tenant that floods the API does not keep another tenant waiting.
+- **It keeps endpoints and tenants apart, and connects to public addresses only.** A slow endpoint, a host whose lookup never answers or a tenant that floods the API does not keep another tenant waiting. A tenant with a deep backlog does not take the place of another tenant: a claim takes one delivery for each endpoint and gives every tenant its first before any tenant gets a second. Its backlog can still make every claim slower, for all tenants, until PostgreSQL has analysed the queue ([Performance](#performance)).
 
-Every feature of the service that the design describes is built, and [Current state](#current-state) lists them. What remains lies outside the service: a deployment that lasts, which the repository describes for AWS and has not made, and load testing. The design is in [docs/design.md](docs/design.md).
+Every feature of the service that the design describes is built, and [Current state](#current-state) lists them. It has been run under load on one laptop, and [Performance](#performance) has those numbers. What remains lies outside the service: a deployment that lasts, which the repository describes for AWS and has not made. The design is in [docs/design.md](docs/design.md).
 
 ## Failure table
 
@@ -90,7 +90,7 @@ Built and tested:
 - **Log fields.** The line that records an attempt carries the ids of its tenant, event, delivery and endpoint, the number of the attempt, its outcome and reason, the state that it left the delivery in, the replica, and the trace id and span id of the span of that attempt. A line that is logged while a route handles a request carries the trace id and span id of the request, the replica and, on a tenant route, the tenant. Of a subscriber URL, a line and a span hold the host and nothing else. A marker in the path and the query of such a URL is in no line that a replica wrote, in no span that it exported and in no scrape, and no line holds the API key, the admin token, the signing secret, a signature or the payload. This is row 32.
 - **The failure-table check.** The build deletes the old test reports, runs the tests and then fails unless every test linked from a failure table ran and passed.
 
-Not done, and outside the service: a deployment that lasts and load tests. There is a container image, a stack for one machine ([Run it locally](#run-it-locally)), a Helm chart that CI installs on a kind cluster and a Terraform module for the cluster and the database of a deployment on AWS ([Run it on Kubernetes](#run-it-on-kubernetes)). The module has never been applied, so the service has run on no cloud, and it has not been run under load.
+Not done, and outside the service: a deployment that lasts. There is a container image, a stack for one machine ([Run it locally](#run-it-locally)), a Helm chart that CI installs on a kind cluster and a Terraform module for the cluster and the database of a deployment on AWS ([Run it on Kubernetes](#run-it-on-kubernetes)). The module has never been applied, so the service has run on no cloud. Under load it has run on that stack for one machine and nowhere else ([Performance](#performance)).
 
 ## Guarantees
 
@@ -115,7 +115,7 @@ A guarantee counts as delivered only once the tests that prove it are listed in 
 - **G3 is delivered.** Row 5 proves it, including two concurrent requests with one key. Retention deletes an event only once it is 30 days old and has no delivery left, and its key is free from then on. `RetentionIT` shows both: an event a minute younger keeps its key.
 - **G4 is delivered.** Every request for a delivery carries the same `webhook-id`, also after a kill (rows 1 and 2), after a lease that ran out (row 7) and after a replay (row 11). One attempt is one request, also when the answer is a 503 (row 28). A second request is sent only for an attempt whose outcome was never recorded: the replica was killed in the middle of the request or before it had committed the result (rows 1 and 2), or its lease ran out while it was still sending (row 7). Such an attempt is in the log as `unknown`.
 - **G5 is delivered.** Row 7 proves it: a result that arrives after another claim has taken the delivery over changes no column of the delivery and adds no attempt row, and neither does a result that is recorded a second time.
-- **G6 is delivered.** Rows 13 to 15 prove it for delivery. One slow endpoint keeps neither the other endpoints of its tenant nor another tenant waiting. One host whose lookup never answers and one tenant with a backlog, whether its requests are held or answered at once, keep no other tenant waiting. Inside one tenant, deliveries do wait: while its four lookups are stuck, a delivery for an endpoint whose host resolves is given back without an attempt, and while it has 16 attempts held, its other deliveries stay unclaimed. The caps for an endpoint, for a tenant and for the lookups of a tenant hold. `ClaimIT` shows that a claim takes one row for an endpoint and gives every tenant its first row before any tenant gets a second. Row 16 proves it for the API: a tenant may have 8 requests open on a replica, so its routes hold at most 8 of the 16 connections of the `api` pool, and another tenant is served meanwhile.
+- **G6 is delivered.** Rows 13 to 15 prove it for delivery. One slow endpoint keeps neither the other endpoints of its tenant nor another tenant waiting. One host whose lookup never answers keeps no other tenant waiting. One tenant with a backlog, whether its requests are held or answered at once, does not take the place of another tenant in a claim: the delivery of the other tenant is made while the backlog is there, and before the 200th of 2,000 deliveries of a backlog that is answered at once. What a claim costs is not part of that proof. With statistics from before a backlog, PostgreSQL has read the whole backlog for every claim, and every tenant waits for such a claim (limitation 4 of the design, [docs/performance.md](docs/performance.md)). Inside one tenant, deliveries do wait: while its four lookups are stuck, a delivery for an endpoint whose host resolves is given back without an attempt, and while it has 16 attempts held, its other deliveries stay unclaimed. The caps for an endpoint, for a tenant and for the lookups of a tenant hold. `ClaimIT` shows that a claim takes one row for an endpoint and gives every tenant its first row before any tenant gets a second. Row 16 proves it for the API: a tenant may have 8 requests open on a replica, so its routes hold at most 8 of the 16 connections of the `api` pool, and another tenant is served meanwhile.
 - **G7 is delivered.** Row 18 proves it for registration and for delivery.
 
 ## How it works
@@ -134,6 +134,14 @@ producer --POST /v1/events--> [replica: api] --one tx--> event + delivery rows (
 - Every replica runs a poller that claims due deliveries with `FOR UPDATE SKIP LOCKED`. A claim is a lease with a random token. If the replica dies, the lease runs out and another replica takes the delivery.
 - A worker sends the signed request and records the outcome in one transaction. Only the holder of the current lease token can record anything.
 - Failed deliveries are retried on a backoff schedule and end as `dead`, and so does a delivery that is still pending after 72 hours. A `dead` delivery can be replayed. A circuit breaker per endpoint, kept in Postgres, holds the deliveries to an endpoint that is down.
+
+## Performance
+
+Measured on one laptop, where the database, two replicas, the subscriber and the load generator share 6 CPUs, so these are floor numbers for comparing scenarios and not the capacity of a deployment. [docs/performance.md](docs/performance.md) has the method, both runs of each scenario and what limits each number.
+
+- **Ingest.** The 99th percentile of `POST /v1/events` stayed under 100 ms without an error up to 250 events a second in both runs. At 500 a second it was 46.77 ms with one request refused in one run, and 517.26 ms in the other.
+- **Delivery.** At 500 events a second over 100 endpoints, half of the deliveries were recorded as made within 0.016 s, and 99 in 100 within 0.194 s in one run and 0.272 s in the other. One endpoint with a backlog got 1984.2 to 2429.2 deliveries a second from two replicas, and 108.8 to 131.2 until PostgreSQL had analysed the queue.
+- **Kill.** With one of two replicas killed under 900 deliveries a second, all 36001 accepted events were delivered to each of their three endpoints in both runs, and the subscriber received 39 and 12 requests twice.
 
 ## Run it locally
 
@@ -268,6 +276,7 @@ A subscriber also has to expect the same delivery more than once. Every attempt 
 - [docs/design.md](docs/design.md): the design, with the SQL, the failure analysis and the limitations.
 - [docs/failure-table.md](docs/failure-table.md): the kill table and the full failure table, as far as tests prove them.
 - [docs/deploy.md](docs/deploy.md): the Helm chart, its values, what a rollout and a rollback mean for the database, and the Terraform module for AWS.
+- [docs/performance.md](docs/performance.md): the load tests, the numbers of their runs on one laptop and what limits each of them.
 
 ## License
 

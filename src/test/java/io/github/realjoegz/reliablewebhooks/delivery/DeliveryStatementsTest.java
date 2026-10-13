@@ -21,6 +21,8 @@ import org.junit.jupiter.params.provider.MethodSource;
  * <p>The design writes the columns that a replay sets once, for the replay of one delivery, and
  * names them for the replay of many. The code has them once as well, and both statements are made
  * of that one text.
+ *
+ * <p>The load tests have a copy of the claim as well, which they ask the database to explain.
  */
 class DeliveryStatementsTest {
 
@@ -38,6 +40,23 @@ class DeliveryStatementsTest {
   void gateTakesTheProbeSlotThatTheStartupInvariantsRead() {
     assertThat(CircuitBreaker.GATE)
         .contains("now() + interval '%d seconds'".formatted(CircuitBreaker.PROBE_SLOT.toSeconds()));
+  }
+
+  // The copy has the parameters of the claim written in: no endpoint and no tenant is full, 64
+  // attempts are free and the lease is 60 s. Apart from that it has to be the claim of the code
+  // without its comments, or a result would show the plan of a statement that no replica runs.
+  @Test
+  void claimThatTheLoadTestsExplainIsTheClaimOfTheCode() throws IOException {
+    String explained = Files.readString(Path.of("loadtest/queries/claim-plan.sql"));
+    String claim =
+        DeliveryRepository.CLAIM
+            .replaceAll("--.*", "")
+            .replace(":full_endpoints", "'{}'::uuid[]")
+            .replace(":full_tenants", "'{}'::uuid[]")
+            .replace(":free", "64")
+            .replace(":lease", "interval '60 seconds'");
+
+    assertThat(withoutLayout(explained)).contains(withoutLayout(claim));
   }
 
   static Stream<Arguments> statements() {

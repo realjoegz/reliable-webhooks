@@ -275,6 +275,15 @@ public final class Rows {
         .update();
   }
 
+  /**
+   * Moves the last refill of the bucket of a tenant into the future, where a charge that began
+   * later or a database clock that was set back leaves it for the next charge. Ageing the bucket by
+   * as much puts it back.
+   */
+  public static void postponeRefill(UUID tenantId, Duration by) {
+    ageBucket(tenantId, by.negated());
+  }
+
   /** Moves the creation of an event into the past. Its deliveries keep their times. */
   public static void ageEvent(UUID eventId, Duration by) {
     TestDatabase.jdbc()
