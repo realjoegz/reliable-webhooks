@@ -1,0 +1,211 @@
+# Deploying on Kubernetes
+
+The chart in `deploy/helm/reliable-webhooks` installs the replicas of the service: a Deployment, a Service, a ServiceAccount and a PodDisruptionBudget, and on request a HorizontalPodAutoscaler and a ServiceMonitor. It installs no database, no Secret and no ingress.
+
+CI installs the chart with Helm 4.3 on a kind cluster of Kubernetes 1.37 and runs the API through its Service ([The smoke test](#the-smoke-test)). It has been installed on no other version and on no other kind of cluster. Section numbers refer to [design.md](design.md).
+
+## What the chart needs
+
+**An image.** No image of the service is published. Build it from the `Dockerfile` of the repository and push it to a registry that the cluster pulls from:
+
+```
+docker build --tag registry.example.com/reliable-webhooks:1 .
+docker push registry.example.com/reliable-webhooks:1
+```
+
+**A PostgreSQL database.** The tests run against PostgreSQL 18. The chart is given a JDBC URL and a user name, and a deployment that is meant to last points them at a managed database. The PostgreSQL in `deploy/kind` is for the smoke test only: one pod whose data is gone with it.
+
+- The user owns the schema. The first replica that starts creates the tables ([Database migrations](#database-migrations)).
+- A replica refuses to start unless the database runs at `read committed` and does not have `synchronous_commit` off (section 15).
+- A replica holds 32 connections, 16 in each of its two pools, and Flyway opens its own while a replica starts. In a rollout an old replica keeps its connections until it has drained, and the rollout does not wait for that before it starts the next new replica. The database can therefore see twice the replicas, and needs room for 32 connections times twice their largest number, and a few on top.
+- The URL can carry parameters of the PostgreSQL driver. It cannot remove a time bound of the pools (section 12), and the chart refuses a URL with a `password` parameter, because the password comes from the Secret.
+
+**A Secret** in the namespace of the release, with three keys:
+
+| Key | What it is |
+|---|---|
+| `database-password` | The password of the database user |
+| `admin-token` | The token of the `/admin` routes, at least 32 characters |
+| `secret-encryption-key` | The key that the signing secrets are encrypted with in the database: 32 bytes in base64 |
+
+```
+kubectl create namespace webhooks
+kubectl --namespace webhooks create secret generic reliable-webhooks-credentials \
+  --from-literal=database-password='the password of the database user' \
+  --from-literal=admin-token="$(openssl rand -hex 32)" \
+  --from-literal=secret-encryption-key="$(openssl rand -base64 32)"
+```
+
+- The chart reads none of the three from values, and `extraEnv` cannot name their variables. `scripts/check-chart.sh` holds the chart to both.
+- A replica reads the Secret when it starts. A changed Secret reaches the replicas with the next rollout, which `kubectl rollout restart` starts.
+- The service cannot change the encryption key of a database that is in use (limitation 18). A replica with another key cannot read the signing secrets that are stored, so the key has to be kept for as long as the database is.
+
+## Installing
+
+```
+helm install reliable-webhooks deploy/helm/reliable-webhooks \
+  --namespace webhooks \
+  --set image.repository=registry.example.com/reliable-webhooks \
+  --set-string image.tag=1 \
+  --set database.url=jdbc:postgresql://db.example.com:5432/webhooks \
+  --set database.username=webhooks \
+  --set secret.name=reliable-webhooks-credentials
+```
+
+The chart does not render until these five are set, and `scripts/check-chart.sh` renders it with these five and nothing else. The tag is given with `--set-string` because it is a number here: `--set` would hand the chart a number, and the chart takes a tag as a string only. The notes that Helm prints after the install say how to wait for the replicas and how to create the first tenant. `helm upgrade` with the same values and another `image.tag` rolls a new image out.
+
+## Values
+
+| Value | Default | What it is for |
+|---|---|---|
+| `image.repository`, `image.tag` | none | The image of the service. A tag that is a number is given with `--set-string`, or in quotes in a file of values. |
+| `image.pullPolicy` | `IfNotPresent` | |
+| `database.url` | none | The JDBC URL of the database, which starts with `jdbc:postgresql://`. |
+| `database.username` | none | The database user. |
+| `secret.name` | none | The Secret above. |
+| `replicaCount` | `2` | The number of replicas, unless `autoscaling.enabled` is true. With two, the API is answered and deliveries are sent while one of them is gone. |
+| `extraEnv` | `[]` | Further environment variables of a replica. Every setting of the service can be given this way, as Spring Boot reads a setting from the environment. [Tracing](#tracing) is an example. |
+| `resources` | 500m and 1Gi requested, 2 CPUs and 1Gi as the limit | A starting point and not a measurement: the service has not been run under load. Memory is requested at its limit, so a replica is not placed on a node that cannot give it that much. The JVM takes a quarter of the memory limit as the most its heap may grow to, which is 256 MiB of the default. |
+| `startupProbe.periodSeconds`, `startupProbe.failureThreshold` | `2`, `150` | How long a replica may take to start: the two multiplied, which is 5 minutes. |
+| `preStopSleepSeconds` | `5` | How long a replica that is being removed goes on as before, ahead of its SIGTERM. |
+| `terminationGracePeriodSeconds` | `35` | How long a replica has from the beginning of its removal until it is killed. The chart does not render unless this leaves 30 s after the sleep. |
+| `service.type`, `service.port`, `service.nodePort` | `ClusterIP`, `8080`, none | The Service of the API, of the type `ClusterIP` or `NodePort`. A node port is the whole port of the API on every node, with `/admin` and `/actuator` ([What the chart leaves to the cluster](#what-the-chart-leaves-to-the-cluster)). |
+| `podDisruptionBudget.maxUnavailable` | `1` | How many replicas a drain of nodes may take away at a time. |
+| `autoscaling.enabled` | `false` | [Scaling](#scaling). |
+| `autoscaling.minReplicas`, `.maxReplicas`, `.targetCPUUtilizationPercentage` | `2`, `4`, `70` | |
+| `serviceMonitor.enabled`, `serviceMonitor.labels` | `false`, `{}` | A ServiceMonitor for a cluster with the Prometheus Operator, with the labels that its Prometheus selects one by. It names `/actuator/prometheus` on the port of the API, which takes no key (section 10). |
+
+`values.schema.json` checks the values before anything is rendered: a value that the chart does not know is refused, and so is a value of the wrong type or outside its range.
+
+Not values, because nothing about them depends on the cluster:
+
+- **The security context.** A replica runs as the user 65532 of the image and not as root, with a read-only root filesystem, without privilege escalation, with every capability dropped and with the default seccomp profile of the runtime. `/tmp` is a volume of the pod, because Tomcat keeps a working directory there (section 15). The namespace of the smoke test enforces the `restricted` Pod Security Standard, so the API server would refuse a replica there that may run as root, may escalate its privileges, keeps a capability or has no seccomp profile. The standard does not ask for the read-only root filesystem. The smoke test reads it from the replicas that it has started.
+- **No token for the API of Kubernetes.** The replicas have a ServiceAccount of their own, and its token is not mounted. The service does not call that API. The smoke test requires that nothing is mounted in a replica but `/tmp`.
+- **The rollout.** One new replica is started at a time, and an old one is stopped only once the new one is Ready (`maxSurge: 1`, `maxUnavailable: 0`). A replica that fails a startup invariant (section 15), cannot reach the database or cannot migrate it never becomes Ready, so such a release stops at its first replica and the old replicas keep running. No test rolls a release out: the smoke test installs one release and upgrades none. The two settings are rendered and held against the schema of a Deployment, and no rollout has been run on a cluster.
+
+## Probes
+
+All three ask the health endpoint of the replica, which takes no key (section 11.1) and borrows no database connection (section 15).
+
+| Probe | Asks | When it fails |
+|---|---|---|
+| Startup | `/actuator/health/liveness`, every 2 s | After 150 failures in a row the replica is restarted. Until the probe has passed once, the other two do not run. |
+| Liveness | `/actuator/health/liveness`, every 10 s | After 3 failures in a row the replica is restarted. |
+| Readiness | `/actuator/health/readiness`, every 10 s | After 3 failures in a row the replica is taken out of the Service until the probe passes again. |
+
+- **Liveness is the poller.** The liveness group of the service holds the `poller` indicator, which is down when the loop of the poller has finished no iteration for 60 s (section 15). A replica in that state still answers requests and delivers nothing, and a restart is what helps. A database that is down does not fail the probe: a claim that fails ends its iteration like any other. Replicas are therefore not restarted during a database outage, which a restart would not end. `PollerHealthIT` shows a replica whose poller is stuck failing the liveness probe and passing the readiness probe, and `DeliveryPollerTest` that the loop goes on after a claim that failed.
+- **Readiness is not the database either.** It is the readiness state of Spring Boot and nothing else. A replica is ready from the end of its start to its SIGTERM. During a database outage the replicas stay in the Service and answer `503 database_busy` themselves (section 5), and they serve again without a restart once the database is back (row 8 of the failure table).
+- **The startup probe is there for the migrations.** The web server of a replica listens only after Flyway has migrated the database, so nothing answers a probe while a migration runs. Without the startup probe, the liveness probe would restart a replica in the middle of a long migration.
+
+## Stopping a replica
+
+Kubernetes removes a replica in a rollout, when it scales down, when a node is drained and when a pod is deleted. Each time:
+
+1. The pod is marked as terminating, and Kubernetes begins to take it out of the Service. At the same moment the preStop hook starts: `preStopSleepSeconds` of sleep, during which the replica works as before. It answers the requests that still reach it, and it claims and sends deliveries. The hook is the sleep action of Kubernetes, which is on by default from Kubernetes 1.30, and the chart does not render for an earlier version (`kubeVersion`). It needs no binary in the image, which has no `sleep`.
+2. The replica gets its SIGTERM and drains (section 15): the poller stops claiming, the attempts in flight finish and record their results, the web server finishes the requests that are open, and the process ends by itself with exit code 143. An attempt is cut at 15 s, the drain waits at most 20 s for the attempts, and the design asks for at least 30 s of grace. `kubectl` shows a pod whose container ended with 143 as `Error` for the moment before the pod is gone.
+3. A replica that is still running when `terminationGracePeriodSeconds` are over is killed. The seconds count from step 1, so the sleep is part of them. The default of 35 is the sleep and the 30 s.
+
+A replica that is killed in step 3 loses nothing. That is a SIGKILL during the drain, which is K4 or K5 of the kill table: the delivery that was in flight is sent again after its lease has run out, with the same `webhook-id`.
+
+What is tested and what is not:
+
+- `GracefulShutdownIT` (row 20 of the failure table) proves the drain of a replica as a process, and the job `local-stack` of the CI workflow requires the exit code 143 from a container of the image.
+- The smoke test deletes a replica that has nothing in flight, and the cluster goes on as section [The smoke test](#the-smoke-test) says.
+- No test sends requests while a replica is being removed. That the sleep keeps a request from reaching a replica that has stopped listening is what the hook is for, and nothing in this repository measures it. A request that is refused that way stores nothing, and the producer sends it again with the same `Idempotency-Key` (section 6).
+
+## Database migrations
+
+A replica migrates the database when it starts, with Flyway, before its pools open and before its web server listens. Nothing else runs migrations: there is no job and no hook of Helm. The repository has one migration, `V1__schema.sql`, so no test applies a second one to a database that is in use. What follows is how Flyway 12.4 behaves with the settings that the service leaves at their defaults, and what the smoke test shows of it.
+
+**Several replicas start at once.** Flyway takes an advisory lock in PostgreSQL before it creates its history table and before it applies a migration, and holds it in a transaction until that step is done.
+
+- The replica that gets the lock migrates. A replica that does not get it asks again once a second. When it has the lock, it reads the history again, finds the migrations applied and applies nothing.
+- The smoke test starts two replicas together on an empty database. It requires that one of them logged the migration as applied, that the other logged `No migration necessary`, and that neither was restarted.
+- A replica asks 50 times after its first try and then gives up, which ends its start. Kubernetes starts it again, and it waits again. A migration that holds the lock for longer than those 50 s therefore shows as restarts of the replicas that wait for it, and they start once it is done.
+- The lock ends with its transaction. A replica that dies while it holds the lock leaves no lock behind.
+
+**A rolling update.** The rollout starts one new replica while the old ones run, so the new release migrates the database under the replicas of the old one, and they go on using it until the rollout has replaced them.
+
+- A migration therefore has to leave the old release working. It may add to the schema, and it must not remove or rename what the old release reads or writes. What a release has stopped using is removed by a later one.
+- A migration is not cut off by the time bounds of the pools, because Flyway has connections of its own (section 2). The statements of the running replicas are. While a migration holds a lock on a table, a statement that needs the table waits for at most the lock timeout of its pool, which is 2 s for the API and 5 s for the worker (section 12). A request is then answered with `503 database_busy` (row 31 of the failure table), and a claim fails and is made again.
+- A migration has the time of the startup probe. A replica that is still migrating when the 5 minutes are over is restarted, and its migration with it. A migration that needs longer is given a larger `startupProbe.failureThreshold` for its release.
+
+**A rollback of the image.** `helm rollback` puts the image of the earlier release back and changes nothing in the database. Flyway does not undo a migration, and the service has no script that would.
+
+- A replica of the earlier image finds a history with a migration that it does not have. Flyway logs that the schema is newer than the latest migration it knows, applies nothing and lets the replica start.
+- The smoke test shows that start: it adds the row of a migration that the image does not have to the history, as a later release leaves it, and deletes a replica. The replica that the Deployment starts in its place logs the warning and becomes Ready. No `helm rollback` is run in it.
+- Whether the earlier release then works is the question of the rule above. If every migration since left it working, a rollback of the image is safe and the schema stays ahead of it. If one did not, the way back is a new release that repairs the schema, or the backup of the database.
+
+## Scaling
+
+`replicaCount` sets the number of replicas. With `autoscaling.enabled` the chart leaves it to a HorizontalPodAutoscaler, which keeps the average CPU use of the replicas near `targetCPUUtilizationPercentage` of their request, between `minReplicas` and `maxReplicas`. It needs a metrics server in the cluster.
+
+- The autoscaler is off by default because its target is not a measured number: the service has not been run under load. CPU is a signal that needs nothing but a metrics server. The age of the oldest due delivery (`webhooks_oldest_due_age_seconds`, section 10) says more about a backlog, and scaling on it takes a metrics adapter that the chart does not assume.
+- Every replica is 32 more connections to the database.
+- What the design bounds for each replica grows with their number: 4 requests in flight to one endpoint and 16 for one tenant (section 7), and 8 open requests of one tenant (section 12). The rate limit of a tenant does not grow. It is one bucket in the database for all replicas.
+- A replica that the autoscaler removes is stopped like any other.
+
+The HorizontalPodAutoscaler and the ServiceMonitor are rendered and held against their schemas by `scripts/check-chart.sh`. Neither has been installed on a cluster: the cluster of the smoke test has no metrics server and no Prometheus Operator.
+
+## Tracing
+
+A replica exports its spans once it is told where to (section 10). In the chart that is one entry of `extraEnv`:
+
+```yaml
+extraEnv:
+  - name: MANAGEMENT_OPENTELEMETRY_TRACING_EXPORT_OTLP_ENDPOINT
+    value: http://collector.observability:4318/v1/traces
+```
+
+A replica samples a tenth of its traces. A further entry, `MANAGEMENT_TRACING_SAMPLING_PROBABILITY`, changes that share. `compose.yaml` gives its replicas both entries, the second with `1.0`.
+
+## What the chart leaves to the cluster
+
+- **Publishing the API.** The chart has no Ingress. `/actuator` is served on the port of the API, and the scrape and the health probes take no key. Whatever publishes the Service has to keep that path from the public (limitation 34), and it is also where unauthenticated floods are stopped (limitation 9). The `/admin` routes are for the operator and take one static token (limitation 18). Nothing needs them outside the cluster.
+- **The network.** The chart has no NetworkPolicy. A replica needs the database, and the subscribers wherever they are. It refuses addresses that are not public by itself (section 11.4), and the `unsafe-local` profile that lifts this is for tests: a replica that is started without the profile and with one of its allowances does not start (section 15).
+- **The database**, its backups and its failover (limitation 3).
+
+## The smoke test
+
+```
+scripts/check-chart.sh
+scripts/kind-smoke.sh
+```
+
+The first needs `helm` and `kubeconform`. The second needs `docker`, `kind`, `kubectl`, `helm`, `curl` 7.82 or later and `jq`. The job `helm-chart` of the CI workflow runs both.
+
+`scripts/check-chart.sh` needs no cluster. It runs `helm lint` and renders the chart three times: with the values of the smoke test, with those and the autoscaler and the ServiceMonitor turned on, and with the five values of [Installing](#installing) and nothing else, which is the chart at its defaults with a `ClusterIP` Service. Each time `kubeconform` holds every manifest against the schema of its kind for Kubernetes 1.37, and the kinds have to be the four of every release, with the HorizontalPodAutoscaler and the ServiceMonitor only where they were turned on. Then it gives the chart what it has to refuse:
+
+- its own values alone, which are refused for each of the five values that an install names;
+- an image tag that is a number;
+- no replica at all;
+- a password among the values, and one in the database URL;
+- each of the five variables that the chart sets, as an entry of `extraEnv`;
+- a Service of the type `LoadBalancer`;
+- a grace period that leaves the drain 29 s;
+- a cluster of Kubernetes 1.29.
+
+`scripts/kind-smoke.sh` starts from nothing and uses what is in `deploy/kind`:
+
+| File | What it is |
+|---|---|
+| `cluster.yaml` | The kind cluster: one node of Kubernetes 1.37, which publishes two node ports on ports of the loopback address that kind chooses. |
+| `namespace.yaml` | The namespace of the test, which enforces the `restricted` Pod Security Standard. |
+| `credentials.yaml` | The Secret, with the development values of `compose.yaml`. |
+| `postgres.yaml` | The PostgreSQL of the test. Production uses a managed database. |
+| `subscriber.yaml` | The subscriber of `examples/subscriber`, as `compose.yaml` runs it. |
+| `values.yaml` | The values of the chart for the test: the image that the script builds, the database and the Secret above, a node port for the Service, and the `unsafe-local` profile with its allowance for `http` and for the addresses of the Services of the cluster, where the subscriber is. |
+
+The script builds the image, creates the cluster and loads the image into its node. It installs PostgreSQL and the subscriber, waits for them, installs the chart with two replicas and waits for the rollout. Then it checks:
+
+- **The migration was applied once.** Of the two replicas that started together, one logged the migration as applied and the other that none was necessary.
+- **The replicas have a read-only root filesystem and no token.** The script reads from each that its root filesystem is read-only and that nothing is mounted in it but `/tmp`, which leaves no token for the API of Kubernetes.
+- **The PodDisruptionBudget counts two healthy replicas,** so its selector finds them.
+- **The API works through the Service.** `scripts/walkthrough.sh` is the run that `scripts/demo.sh` makes on the stack of `compose.yaml` (section 15): a tenant, an endpoint, a delivery that the subscriber verifies, a forged request that it refuses, and a delivery that fails once and succeeds with its retry. Every request to the API goes to the node port of the Service of the chart, which hands it to either replica.
+- **Deliveries that are pending outlast a replica.** The subscriber is told to answer `503` and five events are sent. Their five failures open the circuit of the endpoint, so the five deliveries are pending and nothing is sent for them until a probe is due, 30 s later. The script deletes one of the two replicas, reads the five deliveries as still pending and tells the subscriber to answer `200` again. All five succeed.
+- **A replica starts on a schema that is newer than its image.** Before it deletes the replica, the script adds the history row of a later migration. The replica that takes the place of the deleted one logs the warning of Flyway and becomes Ready.
+- **No container of a replica was restarted.** A replica takes its restart count with it when it goes, so the script reads the counts twice. Before it deletes a replica, it reads those of the two that started together. At the end it reads those of the replica that stayed and of the one that took the place of the deleted one. A replica that lost the race for the migration and failed, or a probe that restarted a replica that works, would show in one of the two.
+
+Deleting the replica does not depend on timing. The deliveries are pending for as long as the subscriber answers `503`, and it does until the replica is gone. It is also less than the failure table proves: no request is in flight when the replica is deleted. What a replica that dies in the middle of a request leaves is proven by rows 1 to 3 of the failure table with a SIGKILL, and what a replica that is stopped does by row 20. The smoke test shows that pending deliveries belong to no replica, on a cluster and through the chart.
+
+The cluster stays when the script ends. `kind export kubeconfig --name reliable-webhooks-smoke` gives `kubectl` access to it, and `kind delete cluster --name reliable-webhooks-smoke` removes it. The next run removes it as well.

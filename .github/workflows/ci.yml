@@ -65,3 +65,37 @@ jobs:
 
       - if: always()
         run: docker compose down --volumes
+
+  helm-chart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.3.0
+
+      # No action installs kubeconform. This is the archive of its release for the runner, held
+      # to the checksum that the release lists for it.
+      - run: |
+          curl --silent --show-error --fail --location \
+            --output "$RUNNER_TEMP/kubeconform.tar.gz" \
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  $RUNNER_TEMP/kubeconform.tar.gz" \
+            | sha256sum --check
+          sudo tar --extract --gzip --file "$RUNNER_TEMP/kubeconform.tar.gz" \
+            --directory /usr/local/bin kubeconform
+
+      - run: scripts/check-chart.sh
+
+      # Installs kind and kubectl and creates no cluster. The script creates it, as it does on
+      # any other machine, and the action deletes the cluster of this name when the job ends.
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          kubectl_version: v1.37.0
+          install_only: true
+          cluster_name: reliable-webhooks-smoke
+
+      - run: scripts/kind-smoke.sh

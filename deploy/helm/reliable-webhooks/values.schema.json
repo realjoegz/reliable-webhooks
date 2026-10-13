@@ -1,0 +1,215 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "replicaCount",
+    "image",
+    "database",
+    "secret",
+    "extraEnv",
+    "resources",
+    "startupProbe",
+    "preStopSleepSeconds",
+    "terminationGracePeriodSeconds",
+    "service",
+    "podDisruptionBudget",
+    "autoscaling",
+    "serviceMonitor"
+  ],
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pullPolicy": {
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "username"],
+      "properties": {
+        "url": {
+          "type": "string",
+          "pattern": "^jdbc:postgresql://",
+          "not": {
+            "pattern": "[?&]password="
+          }
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "extraEnv": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "not": {
+              "enum": [
+                "WEBHOOKS_DATABASE_URL",
+                "WEBHOOKS_DATABASE_USERNAME",
+                "WEBHOOKS_DATABASE_PASSWORD",
+                "WEBHOOKS_ADMINTOKEN",
+                "WEBHOOKS_SECRETENCRYPTIONKEY"
+              ]
+            }
+          },
+          "value": {
+            "type": "string"
+          },
+          "valueFrom": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "$ref": "#/definitions/quantities"
+        },
+        "limits": {
+          "$ref": "#/definitions/quantities"
+        }
+      }
+    },
+    "startupProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["periodSeconds", "failureThreshold"],
+      "properties": {
+        "periodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "failureThreshold": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "preStopSleepSeconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "port"],
+      "properties": {
+        "type": {
+          "enum": ["ClusterIP", "NodePort"]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "nodePort": {
+          "type": ["integer", "null"],
+          "minimum": 30000,
+          "maximum": 32767
+        }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxUnavailable"],
+      "properties": {
+        "maxUnavailable": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "autoscaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "minReplicas", "maxReplicas", "targetCPUUtilizationPercentage"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "minReplicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxReplicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "targetCPUUtilizationPercentage": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "labels"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "quantities": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number"]
+      }
+    }
+  }
+}

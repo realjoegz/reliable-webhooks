@@ -1,0 +1,34 @@
+# The values that scripts/kind-smoke.sh installs the chart with. They name what the chart has no
+# default for, and they are not values for production.
+
+# The default of the chart, repeated because the smoke test deletes one replica of two.
+replicaCount: 2
+
+# The image that the script builds and loads into the node.
+image:
+  repository: reliable-webhooks
+  tag: smoke
+
+database:
+  url: jdbc:postgresql://postgres:5432/webhooks
+  username: webhooks
+
+secret:
+  name: reliable-webhooks-credentials
+
+# A node port, so that the script reaches the Service from outside the cluster.
+service:
+  type: NodePort
+  nodePort: 30080
+
+# The subscriber of the smoke test speaks plain http and is reached at the address of its
+# Service. The replicas therefore run with the unsafe-local profile and allow http and the
+# address range of the Services of the cluster, which deploy/kind/cluster.yaml names. A replica
+# in production runs without the profile, and then refuses to start with either allowance set.
+extraEnv:
+  - name: SPRING_PROFILES_ACTIVE
+    value: unsafe-local
+  - name: WEBHOOKS_SSRF_ALLOWHTTP
+    value: "true"
+  - name: WEBHOOKS_SSRF_ALLOWCIDRS
+    value: 10.96.0.0/16

@@ -10,7 +10,7 @@ What it does today:
 - **It keeps running when the database does not.** While the database restarts, a replica answers an event with `503` and goes on. A result that it could not record is recorded if the database is back within 55 seconds of the claim. After that the result is given up, and the delivery is sent again once its lease has run out.
 - **It keeps endpoints and tenants apart, and connects to public addresses only.** A slow endpoint, a host whose lookup never answers, a tenant with a deep backlog or a tenant that floods the API does not keep another tenant waiting.
 
-Every feature of the service that the design describes is built, and [Current state](#current-state) lists them. What remains lies outside the service: a deployment and load testing. The design is in [docs/design.md](docs/design.md).
+Every feature of the service that the design describes is built, and [Current state](#current-state) lists them. What remains lies outside the service: the infrastructure for a deployment and load testing. The design is in [docs/design.md](docs/design.md).
 
 ## Failure table
 
@@ -90,7 +90,7 @@ Built and tested:
 - **Log fields.** The line that records an attempt carries the ids of its tenant, event, delivery and endpoint, the number of the attempt, its outcome and reason, the state that it left the delivery in, the replica, and the trace id and span id of the span of that attempt. A line that is logged while a route handles a request carries the trace id and span id of the request, the replica and, on a tenant route, the tenant. Of a subscriber URL, a line and a span hold the host and nothing else. A marker in the path and the query of such a URL is in no line that a replica wrote, in no span that it exported and in no scrape, and no line holds the API key, the admin token, the signing secret, a signature or the payload. This is row 32.
 - **The failure-table check.** The build deletes the old test reports, runs the tests and then fails unless every test linked from a failure table ran and passed.
 
-Not built, and outside the service: a deployment and load tests. There is a container image and a stack for one machine ([Run it locally](#run-it-locally)), but no deployment to a cluster, and the service has not been run under load.
+Not built, and outside the service: the infrastructure for a deployment and load tests. There is a container image, a stack for one machine ([Run it locally](#run-it-locally)) and a Helm chart that CI installs on a kind cluster ([Run it on Kubernetes](#run-it-on-kubernetes)). Nothing here provides the cluster or the database of a deployment that lasts, and the service has not been run under load.
 
 ## Guarantees
 
@@ -149,6 +149,10 @@ The first command needs Docker with Compose. It builds the image and starts Post
 - Jaeger, <http://localhost:16686>: the spans that the replicas export, under the service `reliable-webhooks`.
 
 The stack is for a development machine. Its credentials are written in `compose.yaml`, and its replicas run with the `unsafe-local` profile: they deliver over plain `http` and to the private addresses of the compose network, where the subscriber is. A replica in production runs without that profile and then refuses to start with either allowance. `docker compose down --volumes` removes the stack with its data.
+
+## Run it on Kubernetes
+
+`deploy/helm/reliable-webhooks` is a Helm chart for the service. It is given an image, a PostgreSQL database and a Secret with the credentials, and [docs/deploy.md](docs/deploy.md) describes its values, its probes, how a replica is stopped and how database migrations behave in a rollout. `scripts/kind-smoke.sh` installs the chart with two replicas on a kind cluster, runs the API through its Service and deletes a replica while deliveries are pending. CI runs it.
 
 ## Requirements
 
@@ -261,6 +265,7 @@ A subscriber also has to expect the same delivery more than once. Every attempt 
 
 - [docs/design.md](docs/design.md): the design, with the SQL, the failure analysis and the limitations.
 - [docs/failure-table.md](docs/failure-table.md): the kill table and the full failure table, as far as tests prove them.
+- [docs/deploy.md](docs/deploy.md): the Helm chart, its values, and what a rollout and a rollback mean for the database.
 
 ## License
 

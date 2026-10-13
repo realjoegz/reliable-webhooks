@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: reliable-webhooks
+  labels:
+    # The API server refuses a pod in this namespace that falls short of the restricted Pod
+    # Security Standard: one that may run as root, may escalate its privileges, keeps a
+    # capability or has no seccomp profile. That the replicas of the chart run here is the check
+    # that the chart gives them a security context without any of these.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.37

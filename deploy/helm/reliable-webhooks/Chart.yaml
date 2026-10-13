@@ -1,0 +1,8 @@
+apiVersion: v2
+name: reliable-webhooks
+description: Webhook delivery service on PostgreSQL
+type: application
+version: 0.1.0
+# The preStop hook of the Deployment is the sleep action of Kubernetes, which a cluster has on by
+# default from this version.
+kubeVersion: ">=1.30.0-0"

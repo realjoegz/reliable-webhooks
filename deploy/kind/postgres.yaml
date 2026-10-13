@@ -1,0 +1,81 @@
+# A PostgreSQL for the smoke test and for nothing else: one pod that keeps its data in a volume
+# of that pod, so the data is gone with it. Production uses a managed database, which the chart
+# is given by its URL.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: reliable-webhooks
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        # The user postgres of the image. As that user the image sets the database up without
+        # the step that it needs root for.
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:18.6-alpine
+          # While a replica is replaced there are three of them for a moment, each with up to 32
+          # connections. That is all but four of the 100 that PostgreSQL allows unless it is
+          # told otherwise.
+          args:
+            - -c
+            - max_connections=200
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: POSTGRES_DB
+              value: webhooks
+            - name: POSTGRES_USER
+              value: webhooks
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: reliable-webhooks-credentials
+                  key: database-password
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            # Over TCP: while the image sets the database up, a server answers on the socket
+            # file only, and is stopped again before the one that stays is started.
+            exec:
+              command:
+                - pg_isready
+                - --host=127.0.0.1
+                - --username=webhooks
+                - --dbname=webhooks
+            periodSeconds: 2
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: reliable-webhooks
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

@@ -1,0 +1,72 @@
+# docs/deploy.md says what each value is for. The image, the database and the Secret have no
+# default, and the chart does not render until they are named.
+
+replicaCount: 2
+
+image:
+  # No image of the service is published. It is built from the Dockerfile of the repository and
+  # pushed to a registry that the cluster pulls from.
+  repository: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+
+database:
+  # A JDBC URL such as jdbc:postgresql://host:5432/webhooks, without a user and without a
+  # password.
+  url: ""
+  username: ""
+
+secret:
+  # A Secret in the namespace of the release, which has to exist before the chart is installed,
+  # with the keys database-password, admin-token and secret-encryption-key. The chart takes none
+  # of the three from values.
+  name: ""
+
+# Further environment variables of a replica, each with a name and a value or a valueFrom. Any
+# setting of the service can be given this way, apart from the five that the chart sets itself.
+extraEnv: []
+
+# A starting point and not a measurement: the service has not been run under load.
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# A replica that has not started after the period times the threshold, which is 5 minutes, is
+# restarted. It migrates the database when it starts, so this is also the time that a migration
+# has.
+startupProbe:
+  periodSeconds: 2
+  failureThreshold: 150
+
+# A replica that is being removed gets its SIGTERM this much later, so that the cluster has
+# stopped sending it requests by then.
+preStopSleepSeconds: 5
+
+# The sleep above and the 30 s that a replica has to be given to drain after its SIGTERM. The
+# chart does not render with less.
+terminationGracePeriodSeconds: 35
+
+service:
+  type: ClusterIP
+  port: 8080
+  # For the type NodePort. Without it Kubernetes chooses the port.
+  nodePort: null
+
+podDisruptionBudget:
+  maxUnavailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+# For a cluster with the Prometheus Operator. The labels are the ones that its Prometheus selects
+# a ServiceMonitor by.
+serviceMonitor:
+  enabled: false
+  labels: {}

@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "reliable-webhooks.fullname" . }}
+  labels:
+    {{- include "reliable-webhooks.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "reliable-webhooks.selectorLabels" . | nindent 6 }}

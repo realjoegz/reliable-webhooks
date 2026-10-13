@@ -1,0 +1,108 @@
+{{- $drainSeconds := sub (int .Values.terminationGracePeriodSeconds) (int .Values.preStopSleepSeconds) -}}
+{{- if lt $drainSeconds 30 -}}
+{{- fail (printf "terminationGracePeriodSeconds must be at least preStopSleepSeconds plus 30: a replica needs 30 s to drain after its SIGTERM, and these values leave it %d." $drainSeconds) -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "reliable-webhooks.fullname" . }}
+  labels:
+    {{- include "reliable-webhooks.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  # A new replica has to be Ready before an old one is stopped. A release whose replicas do not
+  # start therefore stops at its first replica and leaves the old ones running.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "reliable-webhooks.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "reliable-webhooks.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "reliable-webhooks.fullname" . }}
+      # The service does not call the API of Kubernetes, so it gets no token for it.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        # The image names its user by number, which is what the kubelet checks this against.
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reliable-webhooks
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: WEBHOOKS_DATABASE_URL
+              value: {{ .Values.database.url | quote }}
+            - name: WEBHOOKS_DATABASE_USERNAME
+              value: {{ .Values.database.username | quote }}
+            - name: WEBHOOKS_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secret.name | quote }}
+                  key: database-password
+            - name: WEBHOOKS_ADMINTOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secret.name | quote }}
+                  key: admin-token
+            - name: WEBHOOKS_SECRETENCRYPTIONKEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secret.name | quote }}
+                  key: secret-encryption-key
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+          # Until this probe has passed, the other two do not run. A replica that is still
+          # migrating the database is therefore not restarted by the liveness probe.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Tomcat keeps a working directory under /tmp. Nothing else of the root filesystem is
+        # written to.
+        - name: tmp
+          emptyDir: {}

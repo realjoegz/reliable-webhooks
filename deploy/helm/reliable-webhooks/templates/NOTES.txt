@@ -1,0 +1,21 @@
+{{- $name := include "reliable-webhooks.fullname" . -}}
+{{- $namespace := .Release.Namespace -}}
+The replicas of {{ $name }} are starting. One of them migrates the database if it needs it.
+
+1. Wait until they are Ready:
+
+   kubectl --namespace {{ $namespace }} rollout status deployment/{{ $name }}
+
+2. Reach the API from this machine, in a second terminal:
+
+   kubectl --namespace {{ $namespace }} port-forward service/{{ $name }} 8080:{{ .Values.service.port }}
+
+3. Create a tenant with the admin token of the Secret {{ .Values.secret.name }}. The answer shows
+   the API key of the tenant this once:
+
+   curl http://127.0.0.1:8080/admin/tenants \
+     --header "Authorization: Bearer $(kubectl --namespace {{ $namespace }} get secret {{ .Values.secret.name }} --output jsonpath='{.data.admin-token}' | base64 --decode)" \
+     --json '{"name": "first-tenant"}'
+
+The chart has no Ingress. Whatever publishes the Service has to keep /actuator from the public,
+because the scrape and the health probes take no key. docs/deploy.md has the rest.
