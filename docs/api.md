@@ -99,7 +99,7 @@ Returns an event with its deliveries, at most 50, in the order of their endpoint
 }
 ```
 
-`state` is `pending`, `succeeded`, `dead` or `cancelled`. `attempts` counts the attempts of the current run of the delivery. The answer is `200`, or `404` for an id that the tenant does not have.
+`state` is `pending`, `succeeded`, `dead` or `cancelled`. `attempts` counts the attempts of the current run of the delivery, as in the [delivery object](#deliveries). The answer is `200`, or `404` for an id that the tenant does not have.
 
 ## Endpoints
 
@@ -184,7 +184,8 @@ A delivery is read as this object:
 ```
 
 - `id` is what a subscriber receives as `webhook-id`.
-- `attempts` counts the attempts of the current run, and `replays` is the number of that run. A delivery that was never replayed is in run 0.
+- `attempts` counts the attempts of the current run, the one in progress included. An attempt is counted when its delivery is claimed (section 7). A thirteenth claim sends nothing and makes the delivery `dead`, so such a delivery reads 13 and has twelve attempts in its log.
+- `replays` is the number of the current run. A delivery that was never replayed is in run 0.
 - `dead_reason` is `exhausted` or `expired` for a dead delivery and `endpoint_deleted` for a cancelled one.
 - `completed_at` is set once the delivery is no longer pending.
 

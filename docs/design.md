@@ -226,7 +226,7 @@ A named problem type such as `rate_limited` is sent as the `type` member, as a r
 | `POST /v1/endpoints/{id}/secret/rotate` | New secret; the old one stays valid for 24 h (section 11.3). Returns `200 {"secret"}`. The new secret is shown this once. |
 | `POST /v1/endpoints/{id}/replay` | `{limit}`; re-arms up to `limit` dead deliveries (section 8). Returns `200 {replayed, remaining}`. |
 | `GET /v1/deliveries?endpoint_id=&state=` | Both filters are required. Keyset pages on `(created_at, id)`, `limit` at most 100, with a `next` cursor. The endpoint is resolved under the tenant first (404 otherwise). `limit` is 1 to 100, and 100 when it is absent. A page that another page follows carries `next`, and the request for that page sends it back as `cursor`. A deleted endpoint still resolves, so its deliveries can be listed. |
-| `GET /v1/deliveries/{id}` | The delivery and the attempt log of its current run (at most 13 rows). `?run=n` selects an earlier run, and a run that the delivery does not have answers `404`. An attempt is shown with its number, its outcome, its status or error, its start and its duration. The address it went to and the replica that made it are not shown. An `unknown` attempt has no duration, and its start is the time at which it was logged. |
+| `GET /v1/deliveries/{id}` | The delivery and the attempt log of its current run: up to 12 rows, and one more for each claim after the twelfth that ended without a record (section 7). `?run=n` selects an earlier run, and a run that the delivery does not have answers `404`. An attempt is shown with its number, its outcome, its status or error, its start and its duration. The address it went to and the replica that made it are not shown. An `unknown` attempt has no duration, and its start is the time at which it was logged. |
 | `POST /v1/deliveries/{id}/replay` | Re-arms one dead delivery. Returns `204`. A delivery that is not dead answers `409`, and one whose endpoint is deleted answers `404`. |
 
 **Derived circuit state.** An endpoint reads as `closed`, `open` or `half_open`. Only `closed` and `open` are stored (section 9). `half_open` is an open circuit whose `next_probe_at` has passed, which means the next claim may take one delivery to the endpoint as a probe. The read statement decides it with the database clock.
@@ -787,7 +787,7 @@ WHERE id = :id AND tenant_id = :t AND status = 'active';
 | Response headers | 100 |
 | Response body read | 64 KiB, then the connection is aborted |
 | List page | 100 rows |
-| Attempt log per read | One run (at most 13 rows) |
+| Attempt log per read | One run: up to 12 rows, and one more for each claim after the twelfth that ended without a record |
 
 `RequestBodyLimit` enforces the limit on a request body where a route reads its body, which is the only place where the service reads one. Left as they ship, Spring Boot and Tomcat read a body in three more places, each ahead of that one and none with its limit. No route takes a form or a multipart body, so all three are turned off:
 
