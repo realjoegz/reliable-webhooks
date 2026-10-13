@@ -26,7 +26,7 @@ docker compose up --build --detach --wait
 scripts/demo.sh
 ```
 
-You need Docker with Compose, `curl` 7.82 or later and `jq`. The first command starts PostgreSQL, two replicas, an example subscriber, Prometheus, Grafana and Jaeger. The second walks through the API: a verified delivery, a forged request that the subscriber refuses and a failed attempt that succeeds on its retry. Then open [Grafana](http://localhost:3000/d/reliable-webhooks), [Prometheus](http://localhost:9090/targets) or [Jaeger](http://localhost:16686). The stack is for development: its credentials are in `compose.yaml`. `docker compose down --volumes` removes it with its data.
+You need Docker with Compose, `curl` 7.82 or later and `jq`. The stack also needs ports 3000, 9090 and 16686 free on the loopback address, and no other Docker network in 172.28.0.0/24. The first command starts PostgreSQL, two replicas, an example subscriber, Prometheus, Grafana and Jaeger. The second walks through the API: a verified delivery, a forged request that the subscriber refuses and a failed attempt that succeeds on its retry. Then open [Grafana](http://localhost:3000/d/reliable-webhooks), [Prometheus](http://localhost:9090/targets) or [Jaeger](http://localhost:16686). The stack is for development: its credentials are in `compose.yaml`. `docker compose down --volumes` removes it with its data.
 
 ## How it works
 
