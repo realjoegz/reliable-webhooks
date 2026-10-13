@@ -8,25 +8,27 @@ Ten rows, cut to their main claims. [docs/failure-table.md](docs/failure-table.m
 
 | # | Failure | Proven behaviour | Test |
 |---|---|---|---|
-| 1 | Worker killed mid-delivery | Redelivered after the lease; attempt 1 `unknown`, attempt 2 `success` | `WorkerKillIT#killedMidRequest` |
-| 2 | Crash after subscriber 200, before commit | Exactly two requests with the same `webhook-id`; one `succeeded` | `WorkerKillIT#killedAfterResponseBeforeCommit` |
-| 5 | Duplicate submit | One event; same id returned; different body gets 422 | `IdempotencyIT#sameKeyReturnsSameEvent`, `#concurrentSameKeyCreatesOneEvent`, `#sameKeyDifferentBodyIsRejected` |
-| 6 | Two claims race for one delivery | One claim gets it; the other skips it without waiting | `ClaimRaceIT#secondClaimerSkipsLockedRow` |
-| 8 | Database restart | No delivery lost; the delivery in flight across the restart is recorded once from one request; replicas stay up | `DatabaseRestartIT#inFlightAndQueuedSurviveRestart` |
-| 9 | Endpoint down for hours | Circuit opens after 5 failures; deliveries held behind the open circuit use no attempts; one probe per interval, however many claims run at once | `EndpointOutageIT#circuitOpensAndHolds`, `#oneProbeAdmittedAcrossConcurrentClaimers` |
-| 13 | Slow endpoint starving others | At most 4 concurrent requests per replica to it; other endpoints complete meanwhile | `SlowEndpointIsolationIT#slowEndpointDoesNotDelayOthers` |
-| 16 | Tenant floods ingest | Four replicas together admit exactly the tenant's limit, not four times it; another tenant is served | `RateLimitIT#limitIsExactAcrossReplicas`, `#floodingTenantDoesNotBlockOtherTenant` |
-| 18 | Subscriber URL points at, or rebinds to, a private address | Rejected at registration; blocked at connect with zero accepted connections | `SsrfIT#registrationRejectsPrivateTargets`, `#rebindingIsBlockedAtConnect` |
-| 20 | Rolling deploy (SIGTERM) | Nothing is claimed after the poller stopped; in-flight attempts finish and are recorded; the process exits by itself with code 143 | `GracefulShutdownIT#drainsInFlightAndExits` |
+| 1 | Worker killed mid-delivery | Redelivered after the lease; attempt 1 `unknown`, attempt 2 `success` | [`WorkerKillIT#killedMidRequest`](src/test/java/io/github/realjoegz/reliablewebhooks/delivery/WorkerKillIT.java) |
+| 2 | Crash after subscriber 200, before commit | Exactly two requests with the same `webhook-id`; one `succeeded` | [`WorkerKillIT#killedAfterResponseBeforeCommit`](src/test/java/io/github/realjoegz/reliablewebhooks/delivery/WorkerKillIT.java) |
+| 5 | Duplicate submit | One event; same id returned; different body gets 422 | [`IdempotencyIT#sameKeyReturnsSameEvent`](src/test/java/io/github/realjoegz/reliablewebhooks/ingest/IdempotencyIT.java), `#concurrentSameKeyCreatesOneEvent`, `#sameKeyDifferentBodyIsRejected` |
+| 6 | Two claims race for one delivery | One claim gets it; the other skips it without waiting | [`ClaimRaceIT#secondClaimerSkipsLockedRow`](src/test/java/io/github/realjoegz/reliablewebhooks/delivery/ClaimRaceIT.java) |
+| 8 | Database restart | No delivery lost; the delivery in flight across the restart is recorded once from one request; replicas stay up | [`DatabaseRestartIT#inFlightAndQueuedSurviveRestart`](src/test/java/io/github/realjoegz/reliablewebhooks/DatabaseRestartIT.java) |
+| 9 | Endpoint down for hours | Circuit opens after 5 failures; deliveries held behind the open circuit use no attempts; one probe per interval, however many claims run at once | [`EndpointOutageIT#circuitOpensAndHolds`](src/test/java/io/github/realjoegz/reliablewebhooks/delivery/EndpointOutageIT.java), `#oneProbeAdmittedAcrossConcurrentClaimers` |
+| 13 | Slow endpoint starving others | At most 4 concurrent requests per replica to it; other endpoints complete meanwhile | [`SlowEndpointIsolationIT#slowEndpointDoesNotDelayOthers`](src/test/java/io/github/realjoegz/reliablewebhooks/delivery/SlowEndpointIsolationIT.java) |
+| 16 | Tenant floods ingest | Four replicas together admit exactly the tenant's limit, not four times it; another tenant is served | [`RateLimitIT#limitIsExactAcrossReplicas`](src/test/java/io/github/realjoegz/reliablewebhooks/RateLimitIT.java), `#floodingTenantDoesNotBlockOtherTenant` |
+| 18 | Subscriber URL points at, or rebinds to, a private address | Rejected at registration; blocked at connect with zero accepted connections | [`SsrfIT#registrationRejectsPrivateTargets`](src/test/java/io/github/realjoegz/reliablewebhooks/http/SsrfIT.java), `#rebindingIsBlockedAtConnect` |
+| 20 | Rolling deploy (SIGTERM) | Nothing is claimed after the poller stopped; in-flight attempts finish and are recorded; the process exits by itself with code 143 | [`GracefulShutdownIT#drainsInFlightAndExits`](src/test/java/io/github/realjoegz/reliablewebhooks/ops/GracefulShutdownIT.java) |
 
 ## Run it locally
+
+You need Docker with Compose, `curl` 7.82 or later and `jq`. The stack also needs ports 3000, 9090 and 16686 free on the loopback address, and no other Docker network in 172.28.0.0/24.
 
 ```
 docker compose up --build --detach --wait
 scripts/demo.sh
 ```
 
-You need Docker with Compose, `curl` 7.82 or later and `jq`. The stack also needs ports 3000, 9090 and 16686 free on the loopback address, and no other Docker network in 172.28.0.0/24. The first command starts PostgreSQL, two replicas, an example subscriber, Prometheus, Grafana and Jaeger. The second walks through the API: a verified delivery, a forged request that the subscriber refuses and a failed attempt that succeeds on its retry. Then open [Grafana](http://localhost:3000/d/reliable-webhooks), [Prometheus](http://localhost:9090/targets) or [Jaeger](http://localhost:16686). The stack is for development: its credentials are in `compose.yaml`. `docker compose down --volumes` removes it with its data.
+The first command starts PostgreSQL, two replicas, an example subscriber, Prometheus, Grafana and Jaeger. The second walks through the API: a verified delivery, a forged request that the subscriber refuses and a failed attempt that succeeds on its retry. [docs/api.md](docs/api.md) has every route and what a subscriber receives. Then open [Grafana](http://localhost:3000/d/reliable-webhooks), [Prometheus](http://localhost:9090/targets) or [Jaeger](http://localhost:16686). The stack is for development: its credentials are in `compose.yaml`. `docker compose down --volumes` removes it with its data.
 
 ## How it works
 
@@ -48,7 +50,7 @@ sequenceDiagram
 
 - **Ingest.** One transaction stores the event and one delivery row per matching endpoint. A repeat under the same `Idempotency-Key` returns the same event.
 - **Claim.** Every replica polls. One statement leases due deliveries for 60 seconds under a random token and skips rows that another replica has locked.
-- **Send.** An attempt is one signed `POST` with a 15-second deadline, to public addresses only.
+- **Send.** An attempt is one `POST`, signed in the Standard Webhooks format, with a 15-second deadline, to public addresses only.
 - **Finalize.** One transaction records the outcome. It needs the lease token, so a replica that lost its lease changes nothing.
 - **Retry.** Anything but a 2xx is retried with backoff. After twelve attempts or 72 hours a delivery is `dead`, and you can replay it.
 
@@ -102,6 +104,8 @@ It also describes the Terraform module in `infra/terraform` for EKS and PostgreS
 - `docs`: the documents, indexed in [docs/README.md](docs/README.md).
 - `compose.yaml`, `observability`, `examples`, `scripts`: the local stack, its demo and the checks that CI runs.
 - `deploy`, `infra`, `loadtest`: the Helm chart, the Terraform module and the load tests.
+
+To read the code, start with [`V1__schema.sql`](src/main/resources/db/migration/V1__schema.sql) (the data model), [`DeliveryRepository`](src/main/java/io/github/realjoegz/reliablewebhooks/delivery/DeliveryRepository.java) (the claim and the fenced finalize, as SQL), [`DeliveryWorker`](src/main/java/io/github/realjoegz/reliablewebhooks/delivery/DeliveryWorker.java) (one attempt) and [`WorkerKillIT`](src/test/java/io/github/realjoegz/reliablewebhooks/delivery/WorkerKillIT.java) (how a kill is placed).
 
 ## Build and test
 
