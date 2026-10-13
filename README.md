@@ -1,6 +1,6 @@
 # reliable-webhooks
 
-A webhook delivery service in Java 21 on Spring Boot 4.1 and PostgreSQL 18. A producer posts an event once, and the service sends it as a signed HTTP request to every subscribed endpoint, with retries, a dead letter and replay. Two things are unusual. PostgreSQL is the queue and the only stateful dependency: there is no broker, and replicas coordinate through the database alone. Every failure claim is tied to a test: each row below links the tests that prove it, and the build fails if a linked test did not run and pass.
+A webhook delivery service in Java 21 on Spring Boot 4.1 and PostgreSQL 18. A producer posts an event once, and the service sends it as a signed HTTP request to every subscribed endpoint, with retries, dead-lettering and replay. Two things are unusual. PostgreSQL is the queue and the only stateful dependency: there is no broker, and replicas coordinate through the database alone. Every failure claim is tied to a test: each row below links the tests that prove it, and the build fails if a linked test did not run and pass.
 
 ## Failure table
 
@@ -11,11 +11,11 @@ Ten rows, cut to their main claims. [docs/failure-table.md](docs/failure-table.m
 | 1 | Worker killed mid-delivery | Redelivered after the lease; attempt 1 `unknown`, attempt 2 `success` | `WorkerKillIT#killedMidRequest` |
 | 2 | Crash after subscriber 200, before commit | Exactly two requests with the same `webhook-id`; one `succeeded` | `WorkerKillIT#killedAfterResponseBeforeCommit` |
 | 5 | Duplicate submit | One event; same id returned; different body gets 422 | `IdempotencyIT#sameKeyReturnsSameEvent`, `#concurrentSameKeyCreatesOneEvent`, `#sameKeyDifferentBodyIsRejected` |
-| 6 | Two claimers race for one delivery | One claimer gets it; the other skips it without waiting | `ClaimRaceIT#secondClaimerSkipsLockedRow` |
+| 6 | Two claims race for one delivery | One claim gets it; the other skips it without waiting | `ClaimRaceIT#secondClaimerSkipsLockedRow` |
 | 8 | Database restart | No delivery lost; the delivery in flight across the restart is recorded once from one request; replicas stay up | `DatabaseRestartIT#inFlightAndQueuedSurviveRestart` |
-| 9 | Endpoint down for hours | Circuit opens after 5 failures; held deliveries use no attempts; one probe per interval across concurrent claimers | `EndpointOutageIT#circuitOpensAndHolds`, `#oneProbeAdmittedAcrossConcurrentClaimers` |
+| 9 | Endpoint down for hours | Circuit opens after 5 failures; deliveries held behind the open circuit use no attempts; one probe per interval, however many claims run at once | `EndpointOutageIT#circuitOpensAndHolds`, `#oneProbeAdmittedAcrossConcurrentClaimers` |
 | 13 | Slow endpoint starving others | At most 4 concurrent requests per replica to it; other endpoints complete meanwhile | `SlowEndpointIsolationIT#slowEndpointDoesNotDelayOthers` |
-| 16 | Tenant floods ingest | Admitted units equal the bucket exactly across replicas; tenant B is served | `RateLimitIT#limitIsExactAcrossReplicas`, `#floodingTenantDoesNotBlockOtherTenant` |
+| 16 | Tenant floods ingest | Four replicas together admit exactly the tenant's limit, not four times it; another tenant is served | `RateLimitIT#limitIsExactAcrossReplicas`, `#floodingTenantDoesNotBlockOtherTenant` |
 | 18 | Subscriber URL points at, or rebinds to, a private address | Rejected at registration; blocked at connect with zero accepted connections | `SsrfIT#registrationRejectsPrivateTargets`, `#rebindingIsBlockedAtConnect` |
 | 20 | Rolling deploy (SIGTERM) | Nothing is claimed after the poller stopped; in-flight attempts finish and are recorded; the process exits by itself with code 143 | `GracefulShutdownIT#drainsInFlightAndExits` |
 
@@ -68,8 +68,9 @@ sequenceDiagram
 - **No ordering.** Retries, held deliveries and replays reorder deliveries.
 - **No exactly-once.** A subscriber can get a delivery twice and must deduplicate on `webhook-id`.
 - **No high availability.** PostgreSQL is the single point of failure, and a failover to an asynchronous standby can lose accepted events.
-- **No bound on delivery time.** A claim costs more with every active endpoint, and with every pending delivery of every tenant until PostgreSQL has analysed a queue that grew deep.
-- **No check that a tenant owns an endpoint, and no storage quota.** At the default rate a tenant can store about 16 GiB of event bodies a day.
+- **No bound on delivery time.** A claim costs more with every active endpoint. With stale planner statistics PostgreSQL can also choose a plan that reads every pending delivery of every tenant, and a backlog then drains slowly until the table is analysed again.
+- **No check that a tenant owns an endpoint.** A tenant can aim signed requests at any public host, up to its rate limit.
+- **No storage quota.** At the default rate a tenant can store about 16 GiB of event bodies a day.
 - **No cloud deployment.** The service has run on one laptop and in CI.
 
 [Section 14](docs/design.md#14-limitations) lists all 38.
@@ -79,12 +80,12 @@ sequenceDiagram
 Measured on one laptop. [docs/performance.md](docs/performance.md) has the method and what limits each number.
 
 - **Ingest.** The 99th percentile of `POST /v1/events` stayed under 100 ms without an error up to 250 events a second in both runs. At 500 a second it was 46.77 ms with one request refused in one run, and 517.26 ms in the other.
-- **Delivery.** At 500 events a second over 100 endpoints, half of the deliveries were recorded as made within 0.016 s, and 99 in 100 within 0.194 s in one run and 0.272 s in the other. One endpoint with a backlog got 1984.2 to 2429.2 deliveries a second from two replicas, and 108.8 to 131.2 until PostgreSQL had analysed the queue.
-- **Kill.** With one of two replicas killed under 900 deliveries a second, all 36001 accepted events were delivered to each of their three endpoints in both runs, and the subscriber received 39 and 12 requests twice.
+- **Delivery.** At 500 events a second over 100 endpoints, the median time from accepting an event to recording its 2xx was 0.016 s, and the 99th percentile was 0.194 s in one run and 0.272 s in the other. One endpoint with a backlog got 1984.2 to 2429.2 deliveries a second from two replicas, and 108.8 to 131.2 until PostgreSQL had analysed the table.
+- **Kill.** With one of two replicas killed under 900 deliveries a second, all 36001 accepted events were delivered to each of their three endpoints in both runs. The subscriber received 39 requests twice in one run and 12 in the other.
 
 ## How the claims are tested
 
-- **Kills are placed, not timed.** A test runs the packaged jar as a process and kills it at a point that it can see: the replica waits for a lock the test holds, the receiver of the test holds its request, or the database shows the commit.
+- **Kills are placed, not timed.** A test runs the packaged jar as a process and kills it at a point that it can see: the replica waits for a lock the test holds, the test's receiver holds the request, or the database shows the commit.
 - **Real PostgreSQL.** A replica under test runs against PostgreSQL 18 in a container, with the retry, breaker, lease and timeout settings that ship.
 - **The failure-table check.** A linked test that is renamed, disabled, skipped or failing fails the build. Old test reports are deleted first, so an earlier run cannot count.
 
