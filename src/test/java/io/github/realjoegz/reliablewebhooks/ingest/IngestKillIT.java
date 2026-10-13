@@ -6,12 +6,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.realjoegz.reliablewebhooks.harness.FaultReceiver;
 import io.github.realjoegz.reliablewebhooks.harness.PgWait;
 import io.github.realjoegz.reliablewebhooks.harness.ReplicaProcess;
+import io.github.realjoegz.reliablewebhooks.harness.Rows;
 import io.github.realjoegz.reliablewebhooks.harness.TestDatabase;
 import io.github.realjoegz.reliablewebhooks.harness.TestTenant;
 import io.github.realjoegz.reliablewebhooks.harness.UnsafeLocalReplica;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -39,6 +41,7 @@ class IngestKillIT {
       """
       {"type":"order.created","data":{"order":17}}""";
   private static final String IDEMPOTENT_REPLAY = "Idempotent-Replay";
+  private static final int BURST = 10;
   private static final String KILLED = "replica-killed-in-ingest";
   private static final String OTHER = "replica-that-takes-the-retry";
 
@@ -50,6 +53,10 @@ class IngestKillIT {
   // The backend that outlives it finds nobody to answer and rolls back. The producer got no
   // answer. Its second try finds no event under the key and stores one, with a delivery for each
   // endpoint.
+  //
+  // The charge is no part of that transaction. The bucket of the tenant does not refill here, so
+  // its row shows what was charged: the two units of an event for two endpoints once the replica
+  // is gone, although nothing is stored, and two more for the second try.
   @Test
   void killedBeforeCommit() throws Exception {
     try (FaultReceiver receiver = FaultReceiver.start();
@@ -58,6 +65,7 @@ class IngestKillIT {
       TestTenant tenant = TestTenant.create(http, "killed-before-commit");
       UUID first = register(tenant, receiver, "/first");
       UUID second = register(tenant, receiver, "/second");
+      tenant.patch(http, Map.of("rate_per_sec", 0, "burst", BURST));
       String key = TestTenant.newIdempotencyKey();
 
       try (ExecutorService producer = Executors.newVirtualThreadPerTaskExecutor();
@@ -80,6 +88,7 @@ class IngestKillIT {
       PgWait.untilGone(KILLED);
       assertThat(tenant.eventRows()).isZero();
       assertThat(tenant.deliveryRows()).isZero();
+      assertThat(Rows.bucketTokens(tenant.id())).isEqualTo(BURST - 2);
 
       ExchangeResult retried = tenant.send(other.http(), key, EVENT).returnResult();
 
@@ -87,6 +96,7 @@ class IngestKillIT {
       assertThat(retried.getResponseHeaders().get(IDEMPOTENT_REPLAY)).isNull();
       assertThat(eventsOf(tenant)).containsExactly(eventIdIn(retried));
       assertThat(endpointsWithADeliveryOf(tenant)).containsExactlyInAnyOrder(first, second);
+      assertThat(Rows.bucketTokens(tenant.id())).isEqualTo(BURST - 4);
     }
   }
 

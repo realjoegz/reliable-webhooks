@@ -84,15 +84,16 @@ Each row is a SIGKILL of a real replica process, landed at a chosen point and ne
 
 | # | SIGKILL lands | State left | Recovery | Visible effect | Test |
 |---|---|---|---|---|---|
-| K1 | In the ingest transaction, before commit | Nothing; Postgres rolls back | Producer retries with the same key | One event, one delivery per endpoint | `IngestKillIT#killedBeforeCommit` |
+| K1 | In the ingest transaction, before commit | No event and no delivery; Postgres rolls back. The bucket charge stays | Producer retries with the same key | One event, one delivery per endpoint | `IngestKillIT#killedBeforeCommit` |
 | K2 | After ingest commit, before the response | Event and deliveries committed | Retry returns the original event id with `Idempotent-Replay: true` | One event | `IngestKillIT#killedAfterCommitBeforeResponse` |
 | K3 | After claim commit, inside the load of an ordinary closed-circuit delivery, before any byte is sent | Row leased, attempt consumed, no request | Lease expires, another replica reclaims | Attempt 1 logged `unknown`; subscriber sees one request | `WorkerKillIT#killedAfterClaimBeforeSend` |
 | K4 | Mid-request | Row leased; subscriber may have processed | Same as K3 | Up to two requests, same `webhook-id` | `WorkerKillIT#killedMidRequest` |
 | K5 | After the subscriber's 2xx, before finalize commits | Row leased; subscriber has processed | Same as K3 | Exactly two requests, same `webhook-id`; one `succeeded` | `WorkerKillIT#killedAfterResponseBeforeCommit` |
 | K6 | Mid-request of a probe, holding the probe slot of an open circuit | `next_probe_at` pushed 60 s ahead; probing delivery leased | Slot reopens when that time passes; no stuck state | Next probe 60 s after the gate | `EndpointOutageIT#probeSlotReopensAfterProberKilled` |
 
+- K1 leaves the charge of the request. The bucket is charged in a statement of its own before the transaction begins, and a failed ingest is not refunded (section 12), so the retry pays again.
 - K2 is state-equivalent to a lost response. The test discards the first response, kills the replica and retries on another.
-- A SIGKILL during graceful drain is K4 or K5.
+- A SIGKILL during graceful drain leaves what one of K3 to K6 leaves. An attempt that is in flight then has its request ahead of it, is inside it or has its answer, and it can be a probe. The drain adds no state of its own.
 - **Orphaned statements.** Killing a replica does not cancel the statement its backend is running. That statement may still execute, and an autocommit statement may still commit. Safety relies on the lease token and on every autocommit write being harmless when orphaned, not on the statement having stopped. The autocommit writes are the gate, the release, the bucket charge, the delete flip, the admin patches, the endpoint patch, the key rotation and the secret rotation. Each of the first five leaves a state another row of this table or the strict-side limiter already covers. An orphaned endpoint patch sets the event types the tenant asked for, and repeating the call changes nothing. A rotation whose response was lost leaves a key that nobody holds, and the operator repeats the call. A secret rotation whose response was lost leaves a secret that nobody holds, and the tenant repeats that call too. The repeat ends the overlap of the first rotation (section 11.3).
 - **Lost response of a create.** `POST /v1/endpoints` and `POST /admin/tenants` are transactions, so one that outlives its replica does not commit by itself. A response that is lost after the commit leaves the row, and the secret or the key in it was shown to nobody. The repeat of the call creates a second row (limitation 37).
 
@@ -201,7 +202,7 @@ dead    --replay-----------------------------> pending (attempts = 0, replays + 
 Three derived terms, each defined once:
 
 - **Leased** means `state = 'pending' AND lease_token IS NOT NULL AND next_attempt_at > now()`. The lease is the retry timer: if the holder dies, the row becomes due again by itself, so there is no reaper.
-- **Abandoned** means a `pending` row with a non-null `lease_token` whose `next_attempt_at` has passed. Its holder recorded nothing. Whoever touches it next (a claim or `ExpiryJob`) logs that attempt as `unknown`.
+- **Abandoned** means a `pending` row with a non-null `lease_token` whose `next_attempt_at` has passed. Its holder recorded nothing. A claim or `ExpiryJob` that touches it next logs that attempt as `unknown`. `CancelJob` does not: it cancels the row of a deleted endpoint as it is, with the attempt counted and no attempt row (limitation 15).
 - **Held** means `pending` and due, but not claimable because the endpoint's circuit is open or the tenant is suspended. It is derived by the claim predicate and costs zero writes.
 
 Every writer other than the claim sets `lease_token = NULL`: finalize, release, expiry, cancel and replay. A `dead` or `cancelled` row therefore never carries a stale token into its next run.
