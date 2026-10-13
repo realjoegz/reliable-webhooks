@@ -1357,7 +1357,7 @@ How each proof is forced.
   - `Class#method` must match at least one `testcase` of that class named `method`, `method[...]` or `method(...)`. Every match must have passed.
   - `#method` inherits the class named before it in the same cell.
   - A bare `Class` means every `testcase` of that class: at least one, all passed.
-  - Passed means no `skipped`, `failure`, `error`, `flakyFailure` or `rerunFailure` child. The POM does not enable reruns.
+  - Passed means no `skipped`, `failure`, `error`, `flakyFailure`, `flakyError`, `rerunFailure` or `rerunError` child, so a test that passed only when it was run again does not count. The POM does not enable reruns.
 - It fails on a row with no link, on a missing method, and on a linked test that did not run. That covers `@Disabled`, an excluded tag, `-DskipITs` and a renamed method with one rule.
 - `FailureTableCheckTest` feeds it one fixture report per rule above.
 - It does not parse this document. `FailureTableCopiesTest` compares the kill table of section 3 and the failure table of section 13 with the two tables of `docs/failure-table.md`, the kill table in full and the failure table in all but its last column. A test that one of them links is therefore a test that the check has looked for.

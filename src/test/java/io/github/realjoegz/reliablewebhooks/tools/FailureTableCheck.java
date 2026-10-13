@@ -34,7 +34,14 @@ public final class FailureTableCheck {
   private static final Pattern LINK =
       Pattern.compile("(?<class>[A-Z][A-Za-z0-9_]*)?(?:#(?<method>[A-Za-z_][A-Za-z0-9_]*))?");
   private static final Set<String> NOT_PASSED =
-      Set.of("skipped", "failure", "error", "flakyFailure", "rerunFailure");
+      Set.of(
+          "skipped",
+          "failure",
+          "error",
+          "flakyFailure",
+          "flakyError",
+          "rerunFailure",
+          "rerunError");
 
   /**
    * A file and the number of checked tables it must contain. A table whose column was renamed is no

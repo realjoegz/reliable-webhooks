@@ -89,7 +89,9 @@ class FailureTableCheckTest {
             "table.md:3: OutcomesIT did not pass (failed)",
             "table.md:3: OutcomesIT did not pass (errored)",
             "table.md:3: OutcomesIT did not pass (flaky)",
-            "table.md:3: OutcomesIT did not pass (rerun)");
+            "table.md:3: OutcomesIT did not pass (rerun)",
+            "table.md:3: OutcomesIT did not pass (flakyError)",
+            "table.md:3: OutcomesIT did not pass (rerunError)");
   }
 
   @Test
@@ -97,8 +99,11 @@ class FailureTableCheckTest {
     assertThat(violationsOf("| 1 | passed | `OutcomesIT#passed` |")).isEmpty();
   }
 
+  // A test that passed only when it was run again has a flakyFailure or a flakyError, by how its
+  // first run ended, and one that did not pass then either a rerunFailure or a rerunError.
   @ParameterizedTest
-  @ValueSource(strings = {"skipped", "failed", "errored", "flaky", "rerun"})
+  @ValueSource(
+      strings = {"skipped", "failed", "errored", "flaky", "rerun", "flakyError", "rerunError"})
   void testcaseWithThisOutcomeDidNotPass(String method) throws Exception {
     assertThat(violationsOf("| 1 | outcome | `OutcomesIT#%s` |".formatted(method)))
         .containsExactly("table.md:3: OutcomesIT#%s did not pass (%s)".formatted(method, method));

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report.xsd" version="3.0.2" name="fixture.OutcomesIT" time="0.06" tests="6" errors="1" skipped="1" failures="2" flakes="1">
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report.xsd" version="3.0.2" name="fixture.OutcomesIT" time="0.06" tests="8" errors="2" skipped="1" failures="2" flakes="2">
   <testcase name="passed" classname="fixture.OutcomesIT" time="0.01">
     <system-out><![CDATA[output of a passing test]]></system-out>
   </testcase>
@@ -21,5 +21,15 @@
     <rerunFailure message="expected: 1 but was: 2" type="org.opentest4j.AssertionFailedError">
       <stackTrace><![CDATA[org.opentest4j.AssertionFailedError: expected: 1 but was: 2]]></stackTrace>
     </rerunFailure>
+  </testcase>
+  <testcase name="flakyError" classname="fixture.OutcomesIT" time="0.01">
+    <flakyError message="boom" type="java.lang.IllegalStateException">
+      <stackTrace><![CDATA[java.lang.IllegalStateException: boom]]></stackTrace>
+    </flakyError>
+  </testcase>
+  <testcase name="rerunError" classname="fixture.OutcomesIT" time="0.01">
+    <rerunError message="boom" type="java.lang.IllegalStateException">
+      <stackTrace><![CDATA[java.lang.IllegalStateException: boom]]></stackTrace>
+    </rerunError>
   </testcase>
 </testsuite>
