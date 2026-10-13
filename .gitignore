@@ -9,7 +9,6 @@ target/
 .factorypath
 
 .DS_Store
-.claude/
 .env
 
 .terraform/
