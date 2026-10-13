@@ -35,15 +35,30 @@ public final class DatabaseFailures {
       if (cause instanceof SQLException sql && isTransient(sql.getSQLState())) {
         return true;
       }
-      // A statement that fails because its connection is gone is followed by a rollback that
-      // fails as well. Spring then throws the failure of the rollback, which the pool reports
-      // without a state, and keeps the failure of the statement beside it and not as its cause.
       if (cause instanceof TransactionSystemException rollbackFailed
-          && isTransient(rollbackFailed.getApplicationException())) {
+          && followsATransientFailure(rollbackFailed)) {
         return true;
       }
     }
     return false;
+  }
+
+  // A statement or a commit that fails because its connection is gone is followed by a rollback
+  // that fails as well: the pool has closed the connection by then, and reports that without a
+  // state. Spring throws the failure of the rollback in both cases.
+  //
+  // After a statement it keeps the failure of the statement beside that of the rollback, and not
+  // as its cause. The failure of the statement decides.
+  //
+  // After a commit it only logs the failure of the commit, so nothing is beside the failure of
+  // the rollback. The pool closes a connection that is in use only after a failure that broke it,
+  // so a rollback that found its connection closed is transient.
+  private static boolean followsATransientFailure(TransactionSystemException rollbackFailed) {
+    Throwable ofTheStatement = rollbackFailed.getApplicationException();
+    if (ofTheStatement != null) {
+      return isTransient(ofTheStatement);
+    }
+    return rollbackFailed.getCause() instanceof SQLException closed && closed.getSQLState() == null;
   }
 
   // Class 08 is how the driver reports a connection that failed and a socket read that timed out.

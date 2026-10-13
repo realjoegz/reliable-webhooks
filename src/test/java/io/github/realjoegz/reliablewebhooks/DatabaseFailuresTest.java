@@ -65,14 +65,29 @@ class DatabaseFailuresTest {
         .isFalse();
   }
 
-  // A commit that failed has no failure of a statement beside it. Its own state decides.
+  // What a transaction throws whose commit ran on a connection that the database had closed. The
+  // pool closes the connection, and the rollback that Spring sends after a commit that failed
+  // fails on it without a state. Spring throws the failure of that rollback and only logs the
+  // failure of the commit, so nothing is beside it.
   @Test
   void commitThatFailedOnItsConnectionIsTransient() {
     assertThat(
             DatabaseFailures.isTransient(
                 new TransactionSystemException(
-                    "JDBC commit failed", new SQLException("I/O error", "08006"))))
+                    "JDBC rollback failed", new SQLException("Connection is closed"))))
         .isTrue();
+  }
+
+  // A failure of the transaction that names a state was reported by the database on a connection
+  // that was open. That state decides, as it does for a statement.
+  @Test
+  void transactionFailureWithAStateIsDecidedByThatState() {
+    assertThat(
+            DatabaseFailures.isTransient(
+                new TransactionSystemException(
+                    "Could not roll back to JDBC savepoint",
+                    new SQLException("savepoint does not exist", "3B001"))))
+        .isFalse();
   }
 
   @Test

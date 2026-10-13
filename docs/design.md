@@ -466,6 +466,8 @@ Timing rules:
 
   A statement that fails because its connection is gone is followed by a rollback that fails as well. What the transaction then throws is the failure of the rollback, which the pool reports without an SQLSTATE. In that case the failure of the statement decides. `FinalizeRetryIT` ends the backend of a finalize that waits for its row, as a database that shuts down does, and the result is recorded by the next try from the one request. `IngestMeterIT#requestWhoseConnectionTheDatabaseEndedIsCountedAsBusy` does the same to an ingest, which answers `503`.
 
+  A commit that fails because its connection is gone is followed by a rollback too, and that rollback fails in the same way. The failure of the commit is then only logged, so the failure of the rollback is thrown with no other failure beside it. It counts as transient, because the pool closes a connection that is in use only after a failure that broke it. `FinalizeRetryIT` also ends the backend of a finalize whose commit waits in the database. For that the test installs a deferred trigger, which the database runs as part of the commit and which waits for a lock that the test holds. That commit did not land, and the result is recorded by the next try from the one request. No test loses the answer to a commit that landed. That a finalize which runs again after its commit changes nothing is `LeaseFenceIT#repeatedFinalizeIsNoOp`.
+
   `DatabaseFailures` holds this rule. The API uses it too: a request that fails with a transient error answers `503 database_busy` (section 5).
 
   A retry starts 200 ms after the failure before it, and none starts after the 55 s.
