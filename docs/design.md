@@ -17,7 +17,7 @@ What the service guarantees, how it keeps each guarantee, and what it does not d
 11. [Security](#11-security): [authentication](#111-authentication) (11.1), [tenant scoping](#112-tenant-scoping) (11.2), [signatures](#113-signatures) (11.3), [SSRF and the outbound client](#114-ssrf-and-the-outbound-client) (11.4), [limits](#115-limits) (11.5), [telemetry hygiene](#116-telemetry-hygiene) (11.6), [untrusted trace context](#117-untrusted-trace-context) (11.7)
 12. [Rate limiting, tenant isolation and database time bounds](#12-rate-limiting-tenant-isolation-and-database-time-bounds)
 13. [Failure table](#13-failure-table): 31 failures, each with the tests that prove what happens
-14. [Limitations](#14-limitations): 36 of them
+14. [Limitations](#14-limitations): 37 of them
 15. [Operations](#15-operations): startup invariants, liveness, shutdown, background jobs, the image, the local stack, the load tests, the Helm chart, migrations and the Terraform module
 16. [Test strategy and harness](#16-test-strategy-and-harness): the rules, the harness, how each proof is forced, and the failure-table check
 17. [Rejected alternatives](#17-rejected-alternatives)
@@ -94,6 +94,7 @@ Each row is a SIGKILL of a real replica process, landed at a chosen point and ne
 - K2 is state-equivalent to a lost response. The test discards the first response, kills the replica and retries on another.
 - A SIGKILL during graceful drain is K4 or K5.
 - **Orphaned statements.** Killing a replica does not cancel the statement its backend is running. That statement may still execute, and an autocommit statement may still commit. Safety relies on the lease token and on every autocommit write being harmless when orphaned, not on the statement having stopped. The autocommit writes are the gate, the release, the bucket charge, the delete flip, the admin patches, the endpoint patch, the key rotation and the secret rotation. Each of the first five leaves a state another row of this table or the strict-side limiter already covers. An orphaned endpoint patch sets the event types the tenant asked for, and repeating the call changes nothing. A rotation whose response was lost leaves a key that nobody holds, and the operator repeats the call. A secret rotation whose response was lost leaves a secret that nobody holds, and the tenant repeats that call too. The repeat ends the overlap of the first rotation (section 11.3).
+- **Lost response of a create.** `POST /v1/endpoints` and `POST /admin/tenants` are transactions, so one that outlives its replica does not commit by itself. A response that is lost after the commit leaves the row, and the secret or the key in it was shown to nobody. The repeat of the call creates a second row (limitation 37).
 
 ## 4. Data model
 
@@ -998,6 +999,7 @@ RETURNING b.tokens;
 34. **The scrape is open to whoever reaches the port.** `/actuator/prometheus` takes no key and is served on the port of the API. It holds no tenant, endpoint or delivery, but it does show the state of the queue and the rate of failures. Keeping it from the public belongs to the ingress.
 35. **A delivery can wait up to a second for its claim while the replicas have little to do.** A poller that finds nothing due waits before it claims again, and the wait grows to 1 s (section 7). Attempts that end one after the other, each followed by a claim that finds nothing new, take the wait there within milliseconds. A delivery that becomes due then waits until the poller of one replica wakes. [performance.md](performance.md) has the times that this gave.
 36. **An attempt connects to one address of its host.** The client is given the first address of the lookup, in the order in which the resolver returned them, and does not go on to another when that one fails (section 11.4). A host whose first address is down while another one answers fails the attempt, and the delivery is retried on the schedule.
+37. **Creating an endpoint or a tenant is not idempotent.** `POST /v1/endpoints` and `POST /admin/tenants` take no idempotency key, and a tenant can have several active endpoints with one URL, each with its own secret (`EndpointApiIT#twoEndpointsGetDifferentSecrets`). A registration whose response was lost after its commit, the state of K2, leaves an active endpoint whose secret nobody holds, and the repeat creates a second one. Every matching event then goes to both and is charged for both, under two `webhook-id` values, and a subscriber that verifies rejects the request that is signed with the secret it does not have. The tenant finds the endpoint in `GET /v1/endpoints` and deletes it or rotates its secret. A tenant that was created that way has a key that nobody holds. No route lists it, and it does nothing. No test loses the response of either call.
 
 ## 15. Operations
 

@@ -132,6 +132,8 @@ Registers an endpoint. The body is `{"url": "...", "event_types": ["order.create
 | 422 | `endpoint_url_not_allowed` | The URL breaks a rule above. The answer does not say which, and it is the same for a host that does not resolve |
 | 429 | `lookup_busy` | The replica had no room to look the host up. `Retry-After: 2` |
 
+A registration is not idempotent, and a URL can be registered more than once. When a registration got no answer, read `GET /v1/endpoints` before you send it again: the endpoint may exist, with a secret that was shown to nobody. Delete that endpoint, or rotate its secret (limitation 37 of the design).
+
 ### `GET /v1/endpoints`
 
 Returns the active endpoints of the tenant as a JSON array of the object above, in the order of their creation. There are at most 50.
@@ -261,7 +263,7 @@ These take the admin token and answer `401` without it. They are not counted aga
 
 ### `POST /admin/tenants`
 
-Creates a tenant. The body is `{"name": "..."}` with 1 to 200 characters. The answer is `201` with `{"id": "...", "api_key": "rwh_..."}`, or `400`. A new tenant may send 50 units a second with a burst of 100 and register 20 endpoints.
+Creates a tenant. The body is `{"name": "..."}` with 1 to 200 characters. The answer is `201` with `{"id": "...", "api_key": "rwh_..."}`, or `400`. A new tenant may send 50 units a second with a burst of 100 and register 20 endpoints. The call is not idempotent: if its answer is lost, the tenant may exist with a key that nobody holds, and a repeat creates a second tenant (limitation 37 of the design).
 
 ### `PATCH /admin/tenants/{id}`
 
