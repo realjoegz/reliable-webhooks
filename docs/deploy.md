@@ -177,9 +177,9 @@ scripts/check-chart.sh
 scripts/kind-smoke.sh
 ```
 
-The first needs `helm` and `kubeconform`. The second needs `docker`, `kind`, `kubectl`, `helm`, `curl` 7.82 or later and `jq`. The job `helm-chart` of the CI workflow runs both.
+The first needs `helm` 4, `kubeconform` and the network. The second needs `docker`, `kind`, `kubectl`, `helm`, `curl` 7.82 or later and `jq`. The job `helm-chart` of the CI workflow runs both, with Helm 4.3.0 and kubeconform 0.8.0.
 
-`scripts/check-chart.sh` needs no cluster. It runs `helm lint` and renders the chart three times: with the values of the smoke test, with those and the autoscaler and the ServiceMonitor turned on, and with the five values of [Installing](#installing) and nothing else, which is the chart at its defaults with a `ClusterIP` Service. Each time `kubeconform` holds every manifest against the schema of its kind for Kubernetes 1.37, and the kinds have to be the four of every release, with the HorizontalPodAutoscaler and the ServiceMonitor only where they were turned on. Then it gives the chart what it has to refuse:
+`scripts/check-chart.sh` needs no cluster. It runs `helm lint` and renders the chart three times: with the values of the smoke test, with those and the autoscaler and the ServiceMonitor turned on, and with the five values of [Installing](#installing) and nothing else, which is the chart at its defaults with a `ClusterIP` Service. Each time `kubeconform` holds every manifest against the schema of its kind for Kubernetes 1.37, and the kinds have to be the four of every release, with the HorizontalPodAutoscaler and the ServiceMonitor only where they were turned on. `kubeconform` downloads the schemas from two repositories on GitHub, each at a fixed commit, so a run without the network fails. Then it gives the chart what it has to refuse, and requires the reason in the words that the schema validator of Helm 4 has for it. A Helm before 3.18.5 has another validator, with other words for the same refusals.
 
 - its own values alone, which are refused for each of the five values that an install names;
 - an image tag that is a number;

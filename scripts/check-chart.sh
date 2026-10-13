@@ -4,7 +4,10 @@
 # schema of its kind, and values that the chart has to refuse. CI runs this ahead of
 # scripts/kind-smoke.sh.
 #
-# Needs helm and kubeconform.
+# Needs helm 4 and kubeconform, and the network: kubeconform downloads the schemas from
+# raw.githubusercontent.com. CI runs it with Helm 4.3.0 and kubeconform 0.8.0. A refusal is
+# recognised by the words that the schema validator of Helm 4 has for it. A Helm before 3.18.5
+# has another validator, with other words for the same refusals.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -25,19 +28,26 @@ documented=(
 always="Deployment PodDisruptionBudget Service ServiceAccount"
 on_request="HorizontalPodAutoscaler ServiceMonitor"
 
+# Where kubeconform keeps the schemas that it has downloaded, so that the three renders of a run
+# download each of them once.
+schemas=$(mktemp -d)
+trap 'rm -rf "$schemas"' EXIT
+
 # Renders the chart with the given values and holds every manifest against the schema of its
 # kind. The kinds have to be those of the first argument, no more and no fewer.
 #
-# The schemas are those of Kubernetes 1.37, which is the version of the smoke test. A
-# ServiceMonitor is a resource of the Prometheus Operator, whose schema is read from the CRDs
-# catalog of Datree at a fixed commit. A manifest without a schema fails the check.
+# The schemas are those of Kubernetes 1.37, which is the version of the smoke test, read from
+# the repository that kubeconform reads them from by default. A ServiceMonitor is a resource of
+# the Prometheus Operator, whose schema is read from the CRDs catalog of Datree. Both are read
+# at a fixed commit. A manifest without a schema fails the check, and so does a schema that
+# cannot be downloaded.
 renders() {
   local expected manifests kinds
   expected=$(tr ' ' '\n' <<<"$1" | sort | paste -sd ' ' -)
   shift
   manifests=$(helm template reliable-webhooks "$chart" "$@")
-  kubeconform -strict -verbose -summary -kubernetes-version 1.37.0 \
-    -schema-location default \
+  kubeconform -strict -verbose -summary -kubernetes-version 1.37.0 -cache "$schemas" \
+    -schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/817113f21a2643311cbc3e992bb44ffe1c416c54/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json' \
     -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/63669a570e231d4f1f8396d229a1de512bcf0a34/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
     <<<"$manifests"
   kinds=$(sed -n 's/^kind: //p' <<<"$manifests" | sort | paste -sd ' ' -)
