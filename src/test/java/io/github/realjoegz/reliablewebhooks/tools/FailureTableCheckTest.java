@@ -144,6 +144,51 @@ class FailureTableCheckTest {
         .containsExactly("table.md:3: the row links no test");
   }
 
+  // A blank line ends a table. The rows after it have no header, so nothing says which of their
+  // columns links the tests, and none of them could be checked.
+  @Test
+  void rowsThatABlankLineCutsOffFromTheirHeaderFail() throws Exception {
+    assertThat(
+            violationsOf(
+                """
+                | 1 | checked | `MethodNamesIT#plain` |
+
+                | 2 | cut off | `MethodNamesIT#renamed` |
+                | 3 | cut off | `MethodNamesIT#renamed` |
+                """))
+        .containsExactly("table.md:5: table rows without a header row");
+  }
+
+  // GitHub renders a line with a pipe in it as a row of the table that it follows, also when it
+  // does not begin with one. Read as the end of the table, it would hide itself and the rows
+  // after it from the check.
+  @Test
+  void rowOfACheckedTableThatDoesNotBeginWithAPipeFails() throws Exception {
+    assertThat(
+            violationsOf(
+                """
+                | 1 | checked | `MethodNamesIT#plain` |
+                2 | no first pipe | `MethodNamesIT#renamed` |
+                | 3 | cut off | `MethodNamesIT#renamed` |
+                """))
+        .containsExactly(
+            "table.md:4: a row of a checked table does not begin with a pipe",
+            "table.md:5: table rows without a header row");
+  }
+
+  // Text that follows a table without a blank line between them is no row of it unless it has
+  // a pipe in it.
+  @Test
+  void lineWithoutAPipeEndsACheckedTable() throws Exception {
+    assertThat(
+            violationsOf(
+                """
+                | 1 | checked | `MethodNamesIT#plain` |
+                A sentence about `MethodNamesIT#renamed` right below the table.
+                """))
+        .isEmpty();
+  }
+
   @Test
   void methodThatDoesNotExistFails() throws Exception {
     assertThat(violationsOf("| 1 | renamed | `MethodNamesIT#renamed` |"))

@@ -25,6 +25,11 @@ import org.xml.sax.SAXException;
  * least one test in that column, as {@code Class#method}, {@code #method} (the class named before
  * it in the same cell) or {@code Class} (every test of the class). The outcomes are read from the
  * Surefire and Failsafe XML reports, which the build deletes before it runs any test.
+ *
+ * <p>A table begins with a header row and the divider row below it. Rows that have no such header
+ * fail the check, because nothing says which of their columns links the tests: a blank line in the
+ * middle of a table leaves such rows. So does a line with a pipe in it that follows a row of a
+ * checked table and does not begin with a pipe, which GitHub renders as one more row of it.
  */
 public final class FailureTableCheck {
 
@@ -132,19 +137,28 @@ public final class FailureTableCheck {
       if (line.startsWith("```")) {
         inCodeBlock = !inCodeBlock;
       }
+      String where = "%s:%d".formatted(name, i + 1);
       if (inCodeBlock || !line.startsWith("|")) {
+        if (!inCodeBlock && inTable && testColumn >= 0 && line.contains("|")) {
+          violations.add(
+              "%s: a row of a checked table does not begin with a pipe".formatted(where));
+        }
         inTable = false;
         continue;
       }
       List<String> cells = cells(line);
       if (!inTable) {
         inTable = true;
-        testColumn = cells.indexOf("Test");
-        if (testColumn >= 0) {
-          checkedTables++;
+        testColumn = -1;
+        if (i + 1 == lines.size() || !isDividerRow(lines.get(i + 1).strip())) {
+          violations.add("%s: table rows without a header row".formatted(where));
+        } else {
+          testColumn = cells.indexOf("Test");
+          if (testColumn >= 0) {
+            checkedTables++;
+          }
         }
       } else if (testColumn >= 0 && !isDivider(cells)) {
-        String where = "%s:%d".formatted(name, i + 1);
         String links = testColumn < cells.size() ? cells.get(testColumn) : "";
         violations.addAll(violationsOfRow(where, links, testcases));
       }
@@ -167,6 +181,10 @@ public final class FailureTableCheck {
       cells.add(cell.strip());
     }
     return cells;
+  }
+
+  private static boolean isDividerRow(String line) {
+    return line.startsWith("|") && isDivider(cells(line));
   }
 
   private static boolean isDivider(List<String> cells) {

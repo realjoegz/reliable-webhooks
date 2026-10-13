@@ -1360,6 +1360,7 @@ How each proof is forced.
   - A bare `Class` means every `testcase` of that class: at least one, all passed.
   - Passed means no `skipped`, `failure`, `error`, `flakyFailure`, `flakyError`, `rerunFailure` or `rerunError` child, so a test that passed only when it was run again does not count. The POM does not enable reruns.
 - It fails on a row with no link, on a missing method, and on a linked test that did not run. That covers `@Disabled`, an excluded tag, `-DskipITs` and a renamed method with one rule.
+- A table begins with a header row and the divider row below it. Rows that a blank line has cut off from their header fail the check, and so does a line with a pipe in it that follows a row of a checked table without beginning with one, which GitHub renders as a row of that table. Either would otherwise take itself and every row after it out of the check without changing the number of checked tables.
 - `FailureTableCheckTest` feeds it one fixture report per rule above.
 - It does not parse this document. `FailureTableCopiesTest` compares the kill table of section 3 and the failure table of section 13 with the two tables of `docs/failure-table.md`, the kill table in full and the failure table in all but its last column. A test that one of them links is therefore a test that the check has looked for.
 - The default `mvn verify` runs every tag. `process` and `dbrestart` exist only so a developer can exclude them locally, and then the check fails by design.
