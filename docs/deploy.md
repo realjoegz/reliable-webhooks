@@ -219,11 +219,11 @@ The cluster stays when the script ends. `kind export kubeconfig --name reliable-
 
 ## A cluster and a database on AWS
 
-`infra/terraform` is a Terraform module for what the chart needs on AWS: a network, an EKS cluster and a PostgreSQL instance on RDS. It has never been applied, and nothing in this repository has run on AWS. CI checks its format, validates it, plans it against a mocked provider and lints it ([What CI checks of it](#what-ci-checks-of-it)). None of that calls AWS. Nothing here therefore shows that AWS accepts what the module describes, and what this section says about the behaviour of AWS is taken from its documentation and from the modules that are called, not from a run.
+`infra/terraform` is a Terraform module for what the chart needs on AWS: a network, an EKS cluster and a PostgreSQL instance on RDS. It has never been applied, and nothing in this repository has run on AWS. CI checks its format, validates it, plans it against a mocked provider and lints it ([What CI checks of it](#what-ci-checks-of-it)). None of that calls AWS. Nothing here therefore shows that AWS accepts what the module describes, and what this section says about the behaviour of AWS is taken from its documentation, from that of the AWS provider and from the modules that are called, not from a run.
 
 ### What the module creates
 
-It calls three community modules, each at a fixed version, with the AWS provider 6.68.0: `terraform-aws-modules/vpc` 6.7.3, `terraform-aws-modules/eks` 21.29.0 and `terraform-aws-modules/rds` 7.2.2. The security group and the parameter group of the database are its own. The lock file fixes the further providers that those modules bring.
+It calls three community modules, each at a fixed version, with the AWS provider 6.68.0: `terraform-aws-modules/vpc` 6.7.3, `terraform-aws-modules/eks` 21.29.0 and `terraform-aws-modules/rds` 7.2.2. The security group and the parameter group of the database, and the resource that turns the rotation of its password off, are its own. The lock file fixes the further providers that those modules bring.
 
 - **A VPC** over three availability zones, with a private and a public subnet in each. The nodes, the pods and the database are in the private subnets and have no public address. The public subnets hold the NAT gateways, which are the way out for what the nodes pull and for the deliveries that the service sends to subscribers. Each zone has its own gateway, or all three share one (`single_nat_gateway`).
   - The range of the VPC (`vpc_cidr`) has to lie in 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16. A replica connects to no address of these ranges (section 11.4), so a subscriber URL that resolves to a node, a pod or the database is refused like any other private address.
@@ -233,7 +233,7 @@ It calls three community modules, each at a fixed version, with the AWS provider
   - Whoever applies the module is the administrator of the cluster. No other identity is given access to it.
   - The cluster module encrypts the Secrets of the cluster with a KMS key that it creates, which covers the Secret of the chart.
 - **A PostgreSQL 18.6 instance on RDS** in the private subnets, with encrypted storage, automated backups that are kept for 7 days unless `database_backup_retention_days` says otherwise, deletion protection, and a standby in a second zone unless `database_multi_az` is false. 18.6 is the version that the tests run against. RDS is told not to move the instance to another minor version by itself, so another version is a change to `main.tf`.
-  - **The user.** The master user of the instance is `webhooks`, and it is the user that the service connects as, because that user has to own the schema ([What the chart needs](#what-the-chart-needs)). The module creates no other user. RDS creates the password and keeps it in Secrets Manager. It is in no variable, in no output and not in the state.
+  - **The user.** The master user of the instance is `webhooks`, and it is the user that the service connects as, because that user has to own the schema ([What the chart needs](#what-the-chart-needs)). The module creates no other user. RDS creates the password and keeps it in Secrets Manager. It is in no variable, in no output and not in the state. RDS would also rotate it every seven days, and the module turns that rotation off ([The password of the database](#the-password-of-the-database)).
   - **The parameter group** sets `default_transaction_isolation` to `read committed` and `synchronous_commit` to `on`. These are the two settings of the database that a replica checks when it starts (section 15).
   - **The security group** admits TCP port 5432 from the security group of the nodes and from nothing else. A pod has the security group of its node, so this is what lets the replicas in.
   - **TLS.** The URL that the module hands to the chart says `sslmode=require`, so a replica connects over TLS or not at all, and it does not check the certificate of the instance ([What the chart needs](#what-the-chart-needs)). By the documentation of RDS, PostgreSQL 15 and later refuses a connection without TLS unless `rds.force_ssl` is turned off, and the parameter group leaves that setting alone.
@@ -302,7 +302,83 @@ helm install reliable-webhooks ../../deploy/helm/reliable-webhooks \
 
 These commands have not been run, because the module has not been applied. One thing about them is checked. The test of the CI job plans `database_url` as `jdbc:postgresql://`, the endpoint of the instance with its port, `/webhooks` and `?sslmode=require`, without a user and without a password, which is the form that the schema of the chart takes.
 
-The Secret holds the password as it is when the command runs. RDS rotates that password, and a release that is installed this way stops working about half an hour after the first rotation ([What to check before it is applied](#what-to-check-before-it-is-applied)).
+The Secret holds the password as it is when the command runs. Nothing changes that password afterwards unless somebody rotates it by hand ([The password of the database](#the-password-of-the-database)).
+
+### The password of the database
+
+RDS rotates a master password that it manages, every seven days unless the schedule of its secret is changed. The Secret of the chart holds a copy of the password, a replica reads it once, when it starts, and nothing in this repository carries a new password into the Secret. `main.tf` therefore turns the rotation off: its resource `aws_secretsmanager_secret_rotation.database` sets `rotation_enabled = false` on the secret that `database_password_secret_arn` names. With the rotation off, the password that the Secret holds stays the password of the user.
+
+- **Where the switch comes from.** It is an argument of the AWS provider, whose documentation gives it for the secret of a master password that RDS manages. The RDS module turns a rotation off only by removing a schedule that an earlier apply has set, which is why the resource is in `main.tf`. The user guide of RDS speaks only of changing the schedule. So read the setting from the secret once the module has been applied:
+
+  ```
+  aws secretsmanager describe-secret --region eu-west-1 \
+    --secret-id "$(terraform output -raw database_password_secret_arn)" \
+    --query RotationEnabled
+  ```
+
+  The answer has to be `false`. The provider reads the same setting whenever Terraform plans, so a rotation that is on again shows in `terraform plan` as a change, and `terraform apply` turns it off.
+- **What it costs.** Nothing rotates the password any more. It is as old as the instance until somebody rotates it by hand, and a copy of it that got out is valid for that long. It is the password of the user that owns the schema, and the instance has no other user.
+
+Rotating the password by hand takes four steps, one right after the other, run in `infra/terraform`:
+
+1. RDS gives the user a new password and puts it into the secret as a new version. Read the version that the secret has now:
+
+   ```
+   aws secretsmanager get-secret-value --region eu-west-1 \
+     --secret-id "$(terraform output -raw database_password_secret_arn)" \
+     --query VersionId --output text
+   ```
+
+   Then ask RDS for the rotation. The identifier of the instance is the `name` of the deployment:
+
+   ```
+   aws rds modify-db-instance --region eu-west-1 \
+     --db-instance-identifier reliable-webhooks \
+     --rotate-master-user-password --apply-immediately
+   ```
+
+   By the documentation of RDS the instance reports the secret as `rotating` while that goes on, and as `active` when it is over. `active` is also what it reports before a rotation, so that answer alone does not show that this one is over. Wait until the first command names another version and this one answers `active`:
+
+   ```
+   aws rds describe-db-instances --region eu-west-1 \
+     --db-instance-identifier reliable-webhooks \
+     --query 'DBInstances[0].MasterUserSecret.SecretStatus' --output text
+   ```
+
+2. The new password replaces the key `database-password` of the Secret. The other two keys stay as they are, which the encryption key has to ([What the chart needs](#what-the-chart-needs)):
+
+   ```
+   kubectl --namespace webhooks patch secret reliable-webhooks-credentials --type merge \
+     --patch "$(aws secretsmanager get-secret-value --region eu-west-1 \
+       --secret-id "$(terraform output -raw database_password_secret_arn)" \
+       --query SecretString --output text \
+       | jq '{stringData: {"database-password": .password}}')"
+   ```
+
+3. The replicas are restarted, so that they read the Secret. The Deployment of the release that was installed above is `reliable-webhooks`:
+
+   ```
+   kubectl --namespace webhooks rollout restart deployment/reliable-webhooks
+   kubectl --namespace webhooks rollout status deployment/reliable-webhooks
+   ```
+
+4. The rotation is turned off again. By the documentation of Secrets Manager, the call that starts a rotation is also the one that turns the automatic rotation on, and the user guide of RDS requires the permission for that call of whoever rotates the password. So expect the rotation to be on again after step 1. Terraform finds that as a change of `aws_secretsmanager_secret_rotation.database`, and the target keeps the apply to that resource and to what it depends on. The cluster is not part of that, so the newer version of an add-on or of the node image that a plan of the whole module can hold by then is not applied with it ([What to check before it is applied](#what-to-check-before-it-is-applied)):
+
+   ```
+   terraform apply -target=aws_secretsmanager_secret_rotation.database
+   ```
+
+   The `describe-secret` command above then has to answer `false` again.
+
+The steps belong together because of what a rotation does to the replicas that are running:
+
+- A connection that is open outlasts a rotation, and a new one is refused with the old password. The pools of a replica replace a connection when it is 30 minutes old, which is the default of HikariCP that the service leaves in place.
+- From step 1 on the pools therefore lose their connections one by one, and about half an hour later they are empty. No call of a replica then gets a connection inside its borrow wait. A route answers that with `503 database_busy` (section 5), and nothing is claimed or delivered.
+- Neither probe fails, because neither asks the database ([Probes](#probes)), so nothing restarts a replica, and a restart alone would not help. The replicas work again once the Secret has the new password and they have been restarted.
+- The restart of step 3 is a rollout: a replica with the new password is Ready before a replica with the old one is stopped ([Values](#values)).
+- A rotation that step 4 does not turn off rotates the password again on the schedule of the secret, and nobody follows that rotation with steps 2 and 3.
+
+None of these steps has been run on AWS, because the module has not been applied.
 
 ### What to check before it is applied
 
@@ -312,10 +388,6 @@ The Secret holds the password as it is when the command runs. RDS rotates that p
 - **The nodes against the replicas.** A replica requests half a CPU and 1 GiB ([Values](#values)), a rollout runs one replica more than `replicaCount`, and the add-ons of the cluster run on the same nodes. The node group starts with `node_min_size` nodes, and nothing adds one: with the autoscaler of the chart on, a replica that finds no room stays Pending. The number of nodes is changed with `aws eks update-nodegroup-config`, between `node_min_size` and `node_max_size`. Terraform sets the number once, when the node group is created, and leaves it alone after that. Raise the number before `node_min_size` is raised above it: Terraform does not send the number with the new limit, and EKS refuses a smallest number of nodes above the number that the group has.
 - **`max_connections` against the replicas.** A replica holds 32 connections, and the database needs room for 32 times twice the largest number of replicas, and a few on top ([What the chart needs](#what-the-chart-needs)). For the two replicas of the chart that is 128 and a few. The parameter group does not set `max_connections`, so RDS derives it from the memory of `database_instance_class`. Read it from the instance before the chart is installed (`SHOW max_connections`), and take a larger class if it is too small.
 - **The storage against the tenants.** The bodies that one tenant stores are bounded by its rate, at the default rate by about 16 GiB a day, and they are kept for 30 days (section 12). `database_allocated_storage` is all that the instance has: the module does not let RDS add to it.
-- **The rotation of the password.** RDS rotates a master password that it manages, every seven days unless the schedule of the secret is changed. The Secret of the chart holds a copy, and a replica reads it once, when it starts. Something has to carry each new password over, and this repository has nothing that does. Without it, a release that passed every other check of this list stops working after the first rotation:
-  - A connection that is open outlasts a rotation, and a new one is refused with the old password. The pools of a replica replace a connection when it is 30 minutes old, which is the default of HikariCP that the service leaves in place.
-  - About half an hour after a rotation the pools are therefore empty, and no call of a replica gets a connection inside its borrow wait. A route answers that with `503 database_busy` (section 5), and nothing is claimed or delivered.
-  - Neither probe fails, because neither asks the database ([Probes](#probes)), so nothing restarts a replica, and a restart alone would not help. The replicas work again once the Secret has the new password and they have been restarted.
 - **The architecture of the image.** The nodes are x86_64. An image that is built on another architecture needs `docker build --platform linux/amd64`. The stage of the `Dockerfile` that runs Maven stays on the architecture of the machine that builds, and only the stage that the image is made of is taken for the platform that was asked for. CI builds the image on x86_64, so no job builds it for another architecture than that of its runner.
 
 ### What CI checks of it
@@ -335,10 +407,10 @@ tflint --only aws_db_instance_invalid_type --var database_instance_class=db.t4g.
 - **`terraform init`** installs the three modules and the providers that the lock file names. `-lockfile=readonly` keeps it from rewriting the lock file, so a provider that the file does not name fails the job.
 - **`terraform validate`** holds the module against the schemas of the provider and of the three modules at their fixed versions.
 - **`terraform test`** runs `tests/plan.tftest.hcl`, in which every run is a plan against a mocked provider.
-  - With the values of `example.tfvars` the module is planned. The subnets of the VPC are the six pieces of the range that they have to be, and it has one NAT gateway. The rule of the database is TCP port 5432 from the security group that the cluster module creates for the nodes, and from no address range and no prefix list. The parameter group sets the two settings and no other, and `database_url` has the form above.
+  - With the values of `example.tfvars` the module is planned. The subnets of the VPC are the six pieces of the range that they have to be, and it has one NAT gateway. The rule of the database is TCP port 5432 from the security group that the cluster module creates for the nodes, and from no address range and no prefix list. The parameter group sets the two settings and no other, and `database_url` has the form above. `database_password_secret_arn` names the secret that the instance reports for its master user. The resource of `main.tf` that turns the rotation off names the same secret, sets `rotation_enabled = false` and has no schedule, and the RDS module schedules no rotation of its own.
   - A second run plans the three defaults that the example replaces: an API server without a public endpoint, a NAT gateway in each zone, which the run counts, and a database with a standby.
   - Further runs give the variables a value at each of their limits, which is accepted, and every rule a value beyond its limit or of the wrong form, which is refused. One run answers the module with a region of two availability zones, which is refused as well.
-  - No run asserts what `main.tf` hands to the RDS module and to the cluster module: the encryption, the deletion protection, the backups, the managed password and the private placement of the instance, and the access to the API server. A run reads the resources and the outputs of the module itself, and no resource inside a module that it calls. Those settings are what `main.tf` says and are held to nothing else.
+  - No run asserts what `main.tf` hands to the RDS module and to the cluster module: the encryption, the deletion protection, the backups, the managed password and the private placement of the instance, and the access to the API server. A run reads the resources and the outputs of the module itself, and no resource inside a module that it calls. Those settings are what `main.tf` says and are held to nothing else. The secret of the master user is an answer of the mocked provider, which gives one whatever the instance is planned with.
   - No run reads the tags of a planned resource. A mocked provider does not work out the tags that a resource ends up with, and the run about the tags holds the module to the order in which it merges them.
 - **`tflint`** runs its Terraform rules and the rules of its AWS plugin, version 0.49.0. It is told to follow the values of `example.tfvars` into the three modules, which is where the engine and the instance class of the database are used. The last command shows that it follows a value that far: the database instance is declared two module calls below `main.tf`, and with an instance class that RDS does not have, the rule for instance classes has to refuse it. The step requires the exit code 2, with which tflint reports an issue.
 

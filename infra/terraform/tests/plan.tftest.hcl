@@ -4,8 +4,9 @@
 #   terraform test -var-file=example.tfvars
 #
 # The runs show that the example and the defaults of the module are planned, that the outputs
-# have the form that the Helm chart takes, and that the variables refuse what their messages
-# say. They do not show that AWS accepts the plan.
+# have the form that the Helm chart takes, that the rotation of the database password is turned
+# off, and that the variables refuse what their messages say. They do not show that AWS accepts
+# the plan.
 
 mock_provider "aws" {
   mock_data "aws_availability_zones" {
@@ -41,13 +42,18 @@ mock_provider "aws" {
     }
   }
 
-  # RDS names the endpoint of an instance once it exists. With one that is known to the plan,
-  # the run below can read the output that is built from it.
+  # RDS names the endpoint of an instance and the secret of its master user once the instance
+  # exists. With both known to the plan, the run below can read the outputs that are built from
+  # them, and the secret whose rotation is turned off. The mocked provider answers with a secret
+  # whatever the instance is planned with, so no run shows that RDS manages the password.
   mock_resource "aws_db_instance" {
     override_during = plan
 
     defaults = {
       endpoint = "reliable-webhooks.abcdefghijkl.eu-west-1.rds.amazonaws.com:5432"
+      master_user_secret = [{
+        secret_arn = "arn:aws:secretsmanager:eu-west-1:000000000000:secret:rds!db-00000000-0000-0000-0000-000000000000-abcdef"
+      }]
     }
   }
 }
@@ -117,6 +123,25 @@ run "example_is_planned" {
   assert {
     condition     = output.database_username == "webhooks"
     error_message = "The database user is not the one that the module creates."
+  }
+
+  assert {
+    condition     = output.database_password_secret_arn == "arn:aws:secretsmanager:eu-west-1:000000000000:secret:rds!db-00000000-0000-0000-0000-000000000000-abcdef"
+    error_message = "The output has to name the secret in which RDS keeps the password of the master user."
+  }
+
+  # RDS rotates the password in that secret for as long as the rotation of the secret is on, and
+  # the Secret of the chart would keep the old one. main.tf can give the rotation a schedule in
+  # two places: in its own resource, which has to turn the rotation off, and through the RDS
+  # module, whose output is null as long as the module schedules none.
+  assert {
+    condition = (
+      aws_secretsmanager_secret_rotation.database.secret_id == output.database_password_secret_arn
+      && aws_secretsmanager_secret_rotation.database.rotation_enabled == false
+      && length(aws_secretsmanager_secret_rotation.database.rotation_rules) == 0
+      && module.rds.db_instance_secretsmanager_secret_rotation_enabled == null
+    )
+    error_message = "The rotation of the secret that holds the password of the database has to be turned off, without a schedule."
   }
 }
 

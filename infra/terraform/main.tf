@@ -190,8 +190,7 @@ module "rds" {
   port     = local.database_port
 
   # RDS creates the password of that user and keeps it in Secrets Manager. It is in no variable
-  # and not in the state. RDS also rotates it, every seven days unless the schedule of the
-  # secret is changed, and docs/deploy.md says what that means for the replicas.
+  # and not in the state.
   manage_master_user_password = true
 
   multi_az               = var.database_multi_az
@@ -205,4 +204,14 @@ module "rds" {
 
   create_db_parameter_group = false
   parameter_group_name      = aws_db_parameter_group.database.name
+}
+
+# RDS rotates a password that it manages every seven days, and the Secret of the chart holds a
+# copy that nothing refreshes. The rotation is therefore turned off, and the password changes
+# only when it is rotated by hand, as docs/deploy.md describes. The RDS module turns a rotation
+# off only by removing a schedule that an earlier apply has set, so this is a resource of this
+# module.
+resource "aws_secretsmanager_secret_rotation" "database" {
+  secret_id        = module.rds.db_instance_master_user_secret_arn
+  rotation_enabled = false
 }
