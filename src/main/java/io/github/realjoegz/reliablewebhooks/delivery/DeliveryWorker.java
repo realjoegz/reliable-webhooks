@@ -129,7 +129,8 @@ class DeliveryWorker {
       }
     } catch (RuntimeException failure) {
       // A database that restarts fails the gate and the load of every attempt in flight. That
-      // passes, and the lease brings each delivery back. Any other failure is a fault.
+      // failure is transient: the lease runs out and each delivery is claimed again. Any other
+      // failure is a fault.
       LoggingEventBuilder line =
           DatabaseFailures.isTransient(failure) ? log.atWarn() : log.atError();
       fields.about(delivery, line).setCause(failure).log("attempt_left_for_reclaim");
@@ -211,6 +212,8 @@ class DeliveryWorker {
     return new Result(attempt, reason, null);
   }
 
+  // The finalize of an attempt: one transaction records the result, and FinalizeRetry repeats it
+  // over a transient failure of the database.
   private void record(Claimed delivery, Loaded loaded, long claimStartedNanos, Result result) {
     NextState next = nextState(delivery, result);
     Verdict verdict = verdict(delivery, result);
@@ -229,7 +232,7 @@ class DeliveryWorker {
       } else if (next.equals(NextState.exhausted())) {
         meters.exhausted();
       }
-      // Of the URL of the endpoint, a line names the host and nothing else.
+      // The line carries the host of the endpoint's URL and nothing else of it.
       fields
           .about(delivery, log.atInfo())
           .addKeyValue("outcome", result.attempt().outcome())

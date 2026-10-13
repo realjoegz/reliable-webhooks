@@ -6,11 +6,11 @@ import java.util.Set;
 import org.springframework.transaction.TransactionSystemException;
 
 /**
- * Tells a failure of a database call that can pass from one that cannot. A failure that can pass
- * says nothing against the statement: the database was busy, was restarting or could not be
- * reached, and the same call can succeed a moment later. The worker tries a finalize again after
- * one, and the API asks its caller to come back. Any other failure is a fault in the service or in
- * the data, and trying again would not change it.
+ * Tells a transient failure of a database call from a permanent one. A transient failure says
+ * nothing against the statement: the database was busy, was restarting or could not be reached, and
+ * the same call can succeed a moment later. The worker tries a finalize again after one, and the
+ * API asks its caller to come back. Any other failure is a fault in the service or in the data, and
+ * trying again would not change it.
  */
 public final class DatabaseFailures {
 

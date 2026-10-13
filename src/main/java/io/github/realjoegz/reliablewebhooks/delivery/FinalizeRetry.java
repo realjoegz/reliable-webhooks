@@ -9,8 +9,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Runs the finalize of a delivery until the database has answered it. A failure that can pass, such
- * as a restart of the database, is tried again until the cutoff, which lies before the end of the
+ * Runs the finalize of a delivery until the database has answered it. A transient failure, such as
+ * a restart of the database, is tried again until the cutoff, which lies before the end of the
  * lease. Any other failure is a fault in the service or in the data, and trying again would not
  * change it. A delivery whose finalize is given up keeps its lease and is reclaimed when the lease
  * has run out.

@@ -48,9 +48,9 @@ public class IngestService {
       EventRequest request,
       Optional<SpanContext> callerContext) {
     // The span of the request is the ingest span of the event. It is the root of a trace of its
-    // own, because the trace context that the caller sent was kept from the filter that started
-    // the span. What the caller sent becomes a link on it. Its own context is stored with the
-    // event, where every attempt to deliver the event finds its parent.
+    // own, because UntrustedTraceContextFilter hid the trace context that the caller sent from the
+    // filter that started the span. What the caller sent becomes a link on it. Its own context is
+    // stored with the event, where every attempt to deliver the event finds its parent.
     Span ingest = Span.current();
     callerContext.ifPresent(ingest::addLink);
 

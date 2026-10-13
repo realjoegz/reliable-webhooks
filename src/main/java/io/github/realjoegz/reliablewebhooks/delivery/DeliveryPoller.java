@@ -84,8 +84,8 @@ public class DeliveryPoller {
    * at once. After any other claim the loop waits, at most for the backoff and no longer than until
    * an attempt has finished, because that is when there is room for a row again.
    *
-   * <p>Every pass beats the heartbeat, also one whose claim failed. A database that is down
-   * therefore does not make the replica look stuck. Only a loop that no longer comes by does.
+   * <p>Every pass updates the heartbeat, including one whose claim failed, so a database that is
+   * down does not make the replica look stuck. Only a loop that has stopped iterating does.
    */
   public void run() {
     while (!stopped) {
