@@ -93,8 +93,11 @@ endpoint=$(call "$api_1/v1/endpoints" \
   --json '{"url": "http://subscriber:8082/webhooks", "event_types": ["order.created"]}')
 jq '.secret = "(hidden)"' <<<"$endpoint"
 
-echo "3. The subscriber is given the secret that it verifies with."
+# The subscriber keeps the status that it answers with until it is told another. A run that
+# ended between steps 8 and 10 left it at 503, so every run begins by setting it.
+echo "3. The subscriber is given the secret that it verifies with, and is told to answer 200."
 call --request PUT "$subscriber/secret" --data "$(jq --raw-output .secret <<<"$endpoint")"
+call --request PUT "$subscriber/status" --data 200
 
 echo "4. The tenant sends an event."
 event=$(send_event order-1001-created \
