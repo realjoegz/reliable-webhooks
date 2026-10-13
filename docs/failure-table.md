@@ -29,10 +29,12 @@ The kill table has rows K1 to K6, which are all the kills of the design. None of
 
 ## Failure table
 
+The table has 31 rows. A row keeps its number, and number 29 is not in use.
+
 | # | Failure | Proven behaviour | Test | Forced by |
 |---|---|---|---|---|
 | 1 | Worker killed mid-delivery | Redelivered after the lease; attempt 1 `unknown`, attempt 2 `success` | `WorkerKillIT#killedMidRequest` | Receiver holds the request; SIGKILL; lease aged |
-| 2 | Crash after subscriber 200, before commit | Exactly two requests with the same `webhook-id`; one `succeeded` | `WorkerKillIT#killedAfterResponseBeforeCommit` | Receiver holds the request while the test locks the delivery row, then answers 200; F1 blocks; SIGKILL once the block is seen |
+| 2 | Crash after subscriber 200, before commit | Exactly two requests with the same `webhook-id`; one `succeeded` | `WorkerKillIT#killedAfterResponseBeforeCommit` | Receiver holds the request while the test locks the delivery row, then answers 200; the first statement of the finalize, which is its fence, blocks; SIGKILL once the block is seen |
 | 3 | Worker killed after claim, before send | Zero requests from the dead replica; delivered by a replica started after the kill; attempt 1 `unknown` | `WorkerKillIT#killedAfterClaimBeforeSend` | Test `ACCESS EXCLUSIVE` lock on `event` blocks the load of an ordinary closed-circuit delivery, which the test makes due only once it holds the lock |
 | 4 | Replica killed during ingest | Nothing or everything; retry with the same key yields one event | `IngestKillIT#killedBeforeCommit`, `#killedAfterCommitBeforeResponse` | Test lock on the endpoint row blocks fan-out; for the kill after the commit the first answer is thrown away |
 | 5 | Duplicate submit | One event; same id returned; different body gets 422 | `IdempotencyIT#sameKeyReturnsSameEvent`, `#concurrentSameKeyCreatesOneEvent`, `#sameKeyDifferentBodyIsRejected` | Request 1 blocked in its transaction; request 2 seen waiting on the unique index |
