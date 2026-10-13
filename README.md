@@ -1,5 +1,7 @@
 # reliable-webhooks
 
+[![CI](https://github.com/realjoegz/reliable-webhooks/actions/workflows/ci.yml/badge.svg)](https://github.com/realjoegz/reliable-webhooks/actions/workflows/ci.yml)
+
 A webhook delivery service in Java 21 on Spring Boot 4.1 and PostgreSQL 18. A producer posts an event once, and the service sends it as a signed HTTP request to every subscribed endpoint, with retries, dead-lettering and replay. Two things are unusual. PostgreSQL is the queue and the only stateful dependency: there is no broker, and replicas coordinate through the database alone. Every failure claim is tied to a test: each row below links the tests that prove it, and the build fails if a linked test did not run and pass.
 
 ## Failure table
