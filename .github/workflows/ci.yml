@@ -99,3 +99,49 @@ jobs:
           cluster_name: reliable-webhooks-smoke
 
       - run: scripts/kind-smoke.sh
+
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.16.5
+
+      - run: terraform fmt -check -recursive -diff
+
+      # Without a backend and without credentials: the providers and the modules are all that
+      # the steps below need. The lock file is read and not rewritten, so a provider that it
+      # does not name fails the job.
+      - run: terraform init -backend=false -lockfile=readonly -input=false
+
+      - run: terraform validate
+
+      # Plans against a mocked provider. No step of this job calls AWS.
+      - run: terraform test -var-file=example.tfvars
+
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.64.0
+
+      # The plugin with the AWS rules is a release on GitHub, which limits how often a runner
+      # may ask for one without a token.
+      - run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - run: tflint
+
+      # A lint that passes does not show how far the rules reach. The database instance is
+      # declared two module calls below main.tf, so the rules refuse an instance class that
+      # RDS does not have only if they follow the values that far. tflint ends with 2 when it
+      # has found an issue and nothing else went wrong.
+      - run: |
+          status=0
+          tflint --only aws_db_instance_invalid_type --var database_instance_class=db.t4g.none || status=$?
+          test "$status" = 2

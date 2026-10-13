@@ -13,7 +13,7 @@ docker build --tag registry.example.com/reliable-webhooks:1 .
 docker push registry.example.com/reliable-webhooks:1
 ```
 
-**A PostgreSQL database.** The tests run against PostgreSQL 18. The chart is given a JDBC URL and a user name, and a deployment that is meant to last points them at a managed database. The PostgreSQL in `deploy/kind` is for the smoke test only: one pod whose data is gone with it.
+**A PostgreSQL database.** The tests run against PostgreSQL 18. The chart is given a JDBC URL and a user name, and a deployment that is meant to last points them at a managed database. [A cluster and a database on AWS](#a-cluster-and-a-database-on-aws) describes one. The PostgreSQL in `deploy/kind` is for the smoke test only: one pod whose data is gone with it.
 
 - The user owns the schema. The first replica that starts creates the tables ([Database migrations](#database-migrations)).
 - A replica refuses to start unless the database runs at `read committed` and does not have `synchronous_commit` off (section 15).
@@ -209,3 +209,129 @@ The script builds the image, creates the cluster and loads the image into its no
 Deleting the replica does not depend on timing. The deliveries are pending for as long as the subscriber answers `503`, and it does until the replica is gone. It is also less than the failure table proves: no request is in flight when the replica is deleted. What a replica that dies in the middle of a request leaves is proven by rows 1 to 3 of the failure table with a SIGKILL, and what a replica that is stopped does by row 20. The smoke test shows that pending deliveries belong to no replica, on a cluster and through the chart.
 
 The cluster stays when the script ends. `kind export kubeconfig --name reliable-webhooks-smoke` gives `kubectl` access to it, and `kind delete cluster --name reliable-webhooks-smoke` removes it. The next run removes it as well.
+
+## A cluster and a database on AWS
+
+`infra/terraform` is a Terraform module for what the chart needs on AWS: a network, an EKS cluster and a PostgreSQL instance on RDS. It has never been applied, and nothing in this repository has run on AWS. CI checks its format, validates it, plans it against a mocked provider and lints it ([What CI checks of it](#what-ci-checks-of-it)). None of that calls AWS. Nothing here therefore shows that AWS accepts what the module describes, and what this section says about the behaviour of AWS is taken from its documentation and from the modules that are called, not from a run.
+
+### What the module creates
+
+It calls three community modules, each at a fixed version, with the AWS provider 6.68.0: `terraform-aws-modules/vpc` 6.7.3, `terraform-aws-modules/eks` 21.29.0 and `terraform-aws-modules/rds` 7.2.2. The security group and the parameter group of the database are its own. The lock file fixes the further providers that those modules bring.
+
+- **A VPC** over three availability zones, with a private and a public subnet in each. The nodes, the pods and the database are in the private subnets and have no public address. The public subnets hold the NAT gateways, which are the way out for what the nodes pull and for the deliveries that the service sends to subscribers. Each zone has its own gateway, or all three share one (`single_nat_gateway`).
+  - The range of the VPC (`vpc_cidr`) has to lie in 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16. A replica connects to no address of these ranges (section 11.4), so a subscriber URL that resolves to a node, a pod or the database is refused like any other private address.
+- **An EKS cluster** of Kubernetes 1.37, which is the version that the smoke test installs the chart on, with one managed node group in the private subnets, on the Amazon Linux 2023 image for x86_64, and with the three add-ons that a node needs: the VPC CNI, kube-proxy and CoreDNS.
+  - The API server is reached from outside the VPC only from the address ranges that `cluster_endpoint_public_access_cidrs` names. It names none unless it is set, and the API server then has no public endpoint.
+  - Inside the VPC the API server admits the nodes of the cluster and no other machine. The security group that the cluster module gives it has one rule, for port 443 from the security group of the nodes, and `main.tf` adds none. `kubectl` and `helm` on another machine in the VPC therefore need a rule on that security group, which is made by hand.
+  - Whoever applies the module is the administrator of the cluster. No other identity is given access to it.
+  - The cluster module encrypts the Secrets of the cluster with a KMS key that it creates, which covers the Secret of the chart.
+- **A PostgreSQL 18.6 instance on RDS** in the private subnets, with encrypted storage, automated backups that are kept for 7 days unless `database_backup_retention_days` says otherwise, deletion protection, and a standby in a second zone unless `database_multi_az` is false. 18.6 is the version that the tests run against. RDS is told not to move the instance to another minor version by itself, so another version is a change to `main.tf`.
+  - **The user.** The master user of the instance is `webhooks`, and it is the user that the service connects as, because that user has to own the schema ([What the chart needs](#what-the-chart-needs)). The module creates no other user. RDS creates the password and keeps it in Secrets Manager. It is in no variable, in no output and not in the state.
+  - **The parameter group** sets `default_transaction_isolation` to `read committed` and `synchronous_commit` to `on`. These are the two settings of the database that a replica checks when it starts (section 15).
+  - **The security group** admits TCP port 5432 from the security group of the nodes and from nothing else. A pod has the security group of its node, so this is what lets the replicas in.
+- **Tags.** The provider puts `Deployment`, with the name of the deployment, `ManagedBy` and the tags of `tags` on every resource that it creates and that can carry tags. The instances, volumes and network interfaces of the nodes get them from the launch template of the node group.
+
+It creates no registry for the image, no ingress and no load balancer, nothing that adds nodes, and neither the Secret nor the release of the chart. The role of the nodes may pull from a registry of ECR in the same account. Publishing the API stays what [What the chart leaves to the cluster](#what-the-chart-leaves-to-the-cluster) says it is.
+
+### The values and the state
+
+`variables.tf` has the variables, each with what it is for. All but the two switches, `single_nat_gateway` and `database_multi_az`, have a rule that refuses a value outside it. The region and the sizes have no default, so nothing is planned until they are chosen: the instance types and the two limits of the node group, and the class and the storage of the database. `example.tfvars` is a small deployment, with two nodes, one NAT gateway and a database without a standby.
+
+```
+cd infra/terraform
+cp example.tfvars terraform.tfvars
+terraform init
+terraform plan
+```
+
+git ignores `terraform.tfvars`, the `.terraform` directory and state files. No credential belongs in any of them: Terraform takes the credentials for AWS from its environment.
+
+The module names no backend. Left like that, Terraform keeps the state in a file next to the module, on the machine that applied it. A deployment that lasts keeps its state where it is shared and locked, which for a bucket of S3 is a file `backend.tf` next to `main.tf`:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "the-bucket-of-the-state"
+    key          = "reliable-webhooks/terraform.tfstate"
+    region       = "eu-west-1"
+    use_lockfile = true
+  }
+}
+```
+
+The state holds no password. It does name the account and every resource of the deployment.
+
+### From the outputs to the chart
+
+| Output | Where it goes |
+|---|---|
+| `cluster_name` | `aws eks update-kubeconfig --name`, which gives `kubectl` and `helm` the cluster |
+| `database_url` | The value `database.url` of the chart |
+| `database_username` | The value `database.username` of the chart |
+| `database_password_secret_arn` | The secret in Secrets Manager whose member `password` becomes the key `database-password` of the Secret |
+
+With them, the commands of [What the chart needs](#what-the-chart-needs) and of [Installing](#installing) become these, run in `infra/terraform`, with the region of `terraform.tfvars` in place of `eu-west-1`:
+
+```
+aws eks update-kubeconfig --region eu-west-1 --name "$(terraform output -raw cluster_name)"
+
+kubectl create namespace webhooks
+kubectl --namespace webhooks create secret generic reliable-webhooks-credentials \
+  --from-literal=database-password="$(aws secretsmanager get-secret-value --region eu-west-1 \
+    --secret-id "$(terraform output -raw database_password_secret_arn)" \
+    --query SecretString --output text | jq --raw-output .password)" \
+  --from-literal=admin-token="$(openssl rand -hex 32)" \
+  --from-literal=secret-encryption-key="$(openssl rand -base64 32)"
+
+helm install reliable-webhooks ../../deploy/helm/reliable-webhooks \
+  --namespace webhooks \
+  --set image.repository=registry.example.com/reliable-webhooks \
+  --set-string image.tag=1 \
+  --set database.url="$(terraform output -raw database_url)" \
+  --set database.username="$(terraform output -raw database_username)" \
+  --set secret.name=reliable-webhooks-credentials
+```
+
+These commands have not been run, because the module has not been applied. One thing about them is checked. The test of the CI job plans `database_url` as `jdbc:postgresql://`, the endpoint of the instance with its port, and `/webhooks`, without a user and without a password, which is the form that the schema of the chart takes.
+
+The Secret holds the password as it is when the command runs. RDS rotates that password, and a release that is installed this way stops working about half an hour after the first rotation ([What to check before it is applied](#what-to-check-before-it-is-applied)).
+
+### What to check before it is applied
+
+- **The quotas of the account in the region.** The nodes count against the vCPUs of running On-Demand instances, each NAT gateway takes an Elastic IP address, and a region has a limit on its VPCs. An apply that meets a quota stops halfway.
+- **The versions.** Kubernetes 1.37 and PostgreSQL 18.6 are written in `main.tf`, and AWS has to offer both in the region (`aws eks describe-cluster-versions`, `aws rds describe-db-engine-versions --engine postgres`). Two versions are not written there, because they depend on the Kubernetes version: each add-on has the version that EKS names as its default for it, and the nodes have the newest release of their image for it. Both are looked up when the module is planned, so a later plan can bring a newer one.
+- **The way to the API server.** `kubectl` and `helm` have to reach it before anything is installed. From outside the VPC that takes the range that they are run from in `cluster_endpoint_public_access_cidrs`. From a machine inside the VPC it takes a rule on the security group of the cluster that the module does not create ([What the module creates](#what-the-module-creates)). With the variable left as it is and no such rule, nothing but the nodes reaches the API server.
+- **The nodes against the replicas.** A replica requests half a CPU and 1 GiB ([Values](#values)), a rollout runs one replica more than `replicaCount`, and the add-ons of the cluster run on the same nodes. The node group starts with `node_min_size` nodes, and nothing adds one: with the autoscaler of the chart on, a replica that finds no room stays Pending. The number of nodes is changed with `aws eks update-nodegroup-config`, between `node_min_size` and `node_max_size`. Terraform sets the number once, when the node group is created, and leaves it alone after that. Raise the number before `node_min_size` is raised above it: Terraform does not send the number with the new limit, and EKS refuses a smallest number of nodes above the number that the group has.
+- **`max_connections` against the replicas.** A replica holds 32 connections, and the database needs room for 32 times twice the largest number of replicas, and a few on top ([What the chart needs](#what-the-chart-needs)). For the two replicas of the chart that is 128 and a few. The parameter group does not set `max_connections`, so RDS derives it from the memory of `database_instance_class`. Read it from the instance before the chart is installed (`SHOW max_connections`), and take a larger class if it is too small.
+- **The storage against the tenants.** The bodies that one tenant stores are bounded by its rate, at the default rate by about 16 GiB a day, and they are kept for 30 days (section 12). `database_allocated_storage` is all that the instance has: the module does not let RDS add to it.
+- **The rotation of the password.** RDS rotates a master password that it manages, every seven days unless the schedule of the secret is changed. The Secret of the chart holds a copy, and a replica reads it once, when it starts. Something has to carry each new password over, and this repository has nothing that does. Without it, a release that passed every other check of this list stops working after the first rotation:
+  - A connection that is open outlasts a rotation, and a new one is refused with the old password. The pools of a replica replace a connection when it is 30 minutes old, which is the default of HikariCP that the service leaves in place.
+  - About half an hour after a rotation the pools are therefore empty, and no call of a replica gets a connection inside its borrow wait. A route answers that with `503 database_busy` (section 5), and nothing is claimed or delivered.
+  - Neither probe fails, because neither asks the database ([Probes](#probes)), so nothing restarts a replica, and a restart alone would not help. The replicas work again once the Secret has the new password and they have been restarted.
+- **The architecture of the image.** The nodes are x86_64. An image that is built on another architecture needs `docker build --platform linux/amd64`. CI builds the image on x86_64.
+
+### What CI checks of it
+
+The job `terraform` of the CI workflow runs these in `infra/terraform`, without credentials:
+
+```
+terraform fmt -check -recursive -diff
+terraform init -backend=false -lockfile=readonly -input=false
+terraform validate
+terraform test -var-file=example.tfvars
+tflint --init
+tflint
+tflint --only aws_db_instance_invalid_type --var database_instance_class=db.t4g.none
+```
+
+- **`terraform init`** installs the three modules and the providers that the lock file names. `-lockfile=readonly` keeps it from rewriting the lock file, so a provider that the file does not name fails the job.
+- **`terraform validate`** holds the module against the schemas of the provider and of the three modules at their fixed versions.
+- **`terraform test`** runs `tests/plan.tftest.hcl`, in which every run is a plan against a mocked provider.
+  - With the values of `example.tfvars` the module is planned. The subnets of the VPC are the six pieces of the range that they have to be, and it has one NAT gateway. The rule of the database is TCP port 5432 from the security group that the cluster module creates for the nodes, and from no address range and no prefix list. The parameter group sets the two settings and no other, and `database_url` has the form above.
+  - A second run plans the three defaults that the example replaces: an API server without a public endpoint, a NAT gateway in each zone, which the run counts, and a database with a standby.
+  - Further runs give the variables a value at each of their limits, which is accepted, and every rule a value beyond its limit or of the wrong form, which is refused. One run answers the module with a region of two availability zones, which is refused as well.
+  - No run asserts what `main.tf` hands to the RDS module and to the cluster module: the encryption, the deletion protection, the backups, the managed password and the private placement of the instance, and the access to the API server. A run reads the resources and the outputs of the module itself, and no resource inside a module that it calls. Those settings are what `main.tf` says and are held to nothing else.
+  - No run reads the tags of a planned resource. A mocked provider does not work out the tags that a resource ends up with, and the run about the tags holds the module to the order in which it merges them.
+- **`tflint`** runs its Terraform rules and the rules of its AWS plugin, version 0.49.0. It is told to follow the values of `example.tfvars` into the three modules, which is where the engine and the instance class of the database are used. The last command shows that it follows a value that far: the database instance is declared two module calls below `main.tf`, and with an instance class that RDS does not have, the rule for instance classes has to refuse it. The step requires the exit code 2, with which tflint reports an issue.
+
+A mocked provider answers whatever it is asked. The plans show that the module can be evaluated with the example values and with its defaults, and that its rules hold. They do not show that an apply succeeds.

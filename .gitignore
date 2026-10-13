@@ -11,3 +11,9 @@ target/
 .DS_Store
 .claude/
 .env
+
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars

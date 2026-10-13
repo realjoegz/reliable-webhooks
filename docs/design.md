@@ -1172,6 +1172,20 @@ The deletion does not depend on timing: the deliveries are pending for as long a
 
 The job `helm-chart` of the CI workflow runs both scripts. The HorizontalPodAutoscaler and the ServiceMonitor are held against their schemas and are installed on no cluster, because the cluster of the test has neither a metrics server nor the Prometheus Operator. No release is upgraded either: the script installs one, and the pod that takes the place of the deleted one is of the same release. The settings of the rollout are rendered and held against the schema of a Deployment, and no rollout has been run on a cluster.
 
+**Infrastructure on AWS.** `infra/terraform` is a Terraform module for what the chart needs on AWS: a VPC over three availability zones, an EKS cluster with one managed node group in its private subnets, and a PostgreSQL 18 instance on RDS. [deploy.md](deploy.md) describes it. What it takes from this design:
+
+- **Startup invariants.** The parameter group of the instance sets `default_transaction_isolation` to `read committed` and `synchronous_commit` to `on`, the two settings of the database that the startup invariants above check.
+- **Credentials.** RDS creates the password of the database user and keeps it in Secrets Manager. No variable, no output and no state of the module holds it, and the Secret that the chart reads is filled from there. RDS also rotates that password, and nothing in this repository carries a new one into the Secret. A release whose Secret still holds the old password stops working about half an hour after a rotation, when its pools have replaced their connections, and no probe shows it.
+- **Reach.** The database admits TCP port 5432 from the security group of the nodes of the cluster and from nothing else. The nodes have no public address, and a delivery reaches its subscriber through a NAT gateway. The range of the VPC has to be private address space, which the address policy of section 11.4 denies, so a subscriber URL that resolves to a node, a pod or the database is refused.
+- **Connections.** The module does not set `max_connections`. RDS derives it from the instance class, which is chosen with the 32 connections of a replica in mind (above).
+
+The module has never been applied. The job `terraform` of the CI workflow checks its format, validates it, plans it against a mocked provider, with the values of `infra/terraform/example.tfvars` and with the defaults that those replace, and lints it with tflint and its AWS rules.
+
+- The plans read the two settings of the parameter group, the source of the rule of the database and the subnets of the VPC. They also give every rule of a variable a value that it has to refuse.
+- The lint has to refuse an instance class that RDS does not have, which shows that its rules reach the database instance inside the modules that are called.
+- The encryption, the deletion protection, the backups and the private placement of the instance are arguments of the RDS module in `main.tf`, and no step asserts them.
+- No step calls AWS, so nothing shows that AWS accepts what the module describes.
+
 ## 16. Test strategy and harness
 
 Rules:
