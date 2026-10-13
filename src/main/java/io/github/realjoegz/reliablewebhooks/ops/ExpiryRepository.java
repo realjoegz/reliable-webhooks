@@ -35,8 +35,8 @@ public class ExpiryRepository {
       """;
 
   /**
-   * What a run did: the deliveries that it dead-lettered, and how many of them got the attempt row
-   * that their last holder did not write.
+   * What a statement did: the deliveries that it dead-lettered, and how many of them got the
+   * attempt row that their last holder did not write.
    */
   record Expired(int deliveries, int abandonedAttempts) {}
 

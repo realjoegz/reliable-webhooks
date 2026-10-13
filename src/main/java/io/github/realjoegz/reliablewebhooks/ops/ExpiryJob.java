@@ -9,8 +9,9 @@ import org.springframework.stereotype.Component;
 
 /**
  * Dead-letters the deliveries that are still pending when their 72 hours are over. Every replica
- * runs it, once when it starts and then 60 seconds after the end of each run. A run is one
- * statement, which takes up to 1,000 deliveries, those that expired first.
+ * runs it, once when it starts and then 60 seconds after the end of each run. A run dead-letters
+ * 1,000 deliveries in a statement, those that expired first, and goes on for as long as a statement
+ * finds that many.
  */
 @Component
 public class ExpiryJob extends PeriodicJob {
@@ -36,8 +37,13 @@ public class ExpiryJob extends PeriodicJob {
 
   @Override
   void run(BooleanSupplier stopRequested) {
-    Expired run = deliveries.expire();
-    meters.expired(run.deliveries());
-    meters.abandonedAttemptsRecorded(run.abandonedAttempts());
+    inBatches(
+        () -> {
+          Expired statement = deliveries.expire();
+          meters.expired(statement.deliveries());
+          meters.abandonedAttemptsRecorded(statement.abandonedAttempts());
+          return statement.deliveries();
+        },
+        stopRequested);
   }
 }

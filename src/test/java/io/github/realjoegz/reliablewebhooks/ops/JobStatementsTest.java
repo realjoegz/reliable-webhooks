@@ -26,8 +26,9 @@ class JobStatementsTest {
     assertThat(withoutLayout(design)).contains(withoutLayout(statement));
   }
 
-  // The cancel and retention jobs run a statement again when it took a full batch. They know a
-  // full batch by a constant, and the statements hold the size as text, as the design writes it.
+  // The expiry, cancel and retention jobs run a statement again when it took a full batch. They
+  // know a full batch by a constant, and the statements hold the size as text, as the design
+  // writes it.
   @ParameterizedTest(name = "{0}")
   @MethodSource("statementsThatAreRepeated")
   void statementTakesTheBatchThatItsJobCounts(String name, String statement) {
@@ -36,14 +37,12 @@ class JobStatementsTest {
 
   static Stream<Arguments> statements() {
     return Stream.concat(
-        Stream.of(
-            arguments("expiry", ExpiryRepository.EXPIRE),
-            arguments("queue gauges", QueueRepository.COUNT)),
-        statementsThatAreRepeated());
+        Stream.of(arguments("queue gauges", QueueRepository.COUNT)), statementsThatAreRepeated());
   }
 
   static Stream<Arguments> statementsThatAreRepeated() {
     return Stream.of(
+        arguments("expiry", ExpiryRepository.EXPIRE),
         arguments("cancel", CancelRepository.CANCEL),
         arguments("retention, deliveries", RetentionRepository.DELETE_TERMINAL_DELIVERIES),
         arguments("retention, events", RetentionRepository.DELETE_EVENTS_WITHOUT_DELIVERIES),

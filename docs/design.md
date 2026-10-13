@@ -1037,7 +1037,7 @@ The JVM then exits with code 143 (128 + SIGTERM), which is the documented exit c
 - Every statement of a job is a transaction of its own on the `worker` pool. A statement that outlives its replica therefore cannot commit by itself (section 3).
 - A run that fails is logged, and the next run follows after the same interval.
 
-- `ExpiryJob` (every 60 s) dead-letters pending rows past `expires_at` that are not leased. An abandoned row gets its missing attempt row in the same statement:
+- `ExpiryJob` (every 60 s) dead-letters pending rows past `expires_at` that are not leased, 1,000 per statement, those that expired first, repeating while a batch is full. An abandoned row gets its missing attempt row in the same statement:
 
 ```sql
 WITH picked AS (
@@ -1060,7 +1060,7 @@ WITH picked AS (
 SELECT count(*) AS deliveries, count(*) FILTER (WHERE abandoned) AS abandoned FROM expired;
 ```
 
-  A run is this one statement. It answers with the number of deliveries that it dead-lettered and the number of attempt rows that it wrote, which the job counts on the meters of section 10. Postgres runs the insert although nothing reads from it.
+  Each statement answers with the number of deliveries that it dead-lettered and the number of attempt rows that it wrote, which the job counts on the meters of section 10. Postgres runs the insert although nothing reads from it.
 
 - `CancelJob` (every 30 s) cancels the pending rows of deleted endpoints, 1,000 per statement, repeating while a batch is full:
 

@@ -40,7 +40,7 @@ Three of the guarantees also rest on a test that no row links:
 | Ingest and idempotency | 6 | 4, 5 | `EventApiIT`, `FanOutIT`, `IdempotencyIT`, `IngestKillIT`, `EventRequestTest` |
 | Request bodies | 11.5 | | `RequestBodyLimitIT`, `RequestBodyCharsetIT`, `EventRequestTest` |
 | Claim, lease and fence | 7 | 1 to 3, 6, 7, 12 | `ClaimIT`, `ClaimRaceIT`, `LeaseFenceIT`, `WorkerKillIT`, `PoisonDeliveryIT`, `DeliveryWorkerTest`, `DeliveryPollerTest` |
-| Retry, dead letter and replay | 8 | 10, 11, 17, 19 | `DeadLetterReplayIT`, `ReplayIT`, `RetryAfterIT`, `ExpiryIT`, `RetryScheduleTest` |
+| Retry, dead letter and replay | 8, 15 | 10, 11, 17, 19 | `DeadLetterReplayIT`, `ReplayIT`, `RetryAfterIT`, `ExpiryIT`, `ExpiryBatchIT`, `ExpiryJobTest`, `RetryScheduleTest` |
 | Circuit breaker | 9 | 9, 10 | `EndpointOutageIT` |
 | Outbound client and SSRF | 11.4 | 18, 27, 28 | `SsrfIT`, `OutboundRequestIT`, `WebhookHttpClientIT`, `AddressPolicyTest`, `DnsLookupsTest`, `ArchitectureTest` |
 | Signatures | 11.3 | 23, 24 | `SignatureIT`, `ReferenceVerifierTest` |
