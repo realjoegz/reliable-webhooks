@@ -169,6 +169,8 @@ A replica samples a tenth of its traces. A further entry, `MANAGEMENT_TRACING_SA
 - **Publishing the API.** The chart has no Ingress. A replica serves plain HTTP on port 8080, and every credential of the API is a bearer token, so whatever publishes the Service also has to end TLS (limitation 38). `/actuator` is served on the port of the API, and the scrape and the health probes take no key. Whatever publishes the Service has to keep that path from the public (limitation 34), and it is also where unauthenticated floods are stopped (limitation 9). The `/admin` routes are for the operator and take one static token (limitation 18). Nothing needs them outside the cluster.
 - **The network.** The chart has no NetworkPolicy. A replica needs the database, and the subscribers wherever they are. It refuses addresses that are not public by itself (section 11.4), and the `unsafe-local` profile that lifts this is for tests: a replica that is started without the profile and with one of its allowances does not start (section 15).
 - **The database**, its backups and its failover (limitation 3).
+- **Pulling the image.** The chart has no value for an image pull secret, and `values.schema.json` refuses one. The replicas run under a ServiceAccount of their own, so a pull secret of the default account of the namespace does not reach them either. The nodes therefore have to be able to pull the image by themselves. The image is named by its tag, and the chart has no value for a digest.
+- **Placing the replicas.** The chart has no value for a node selector, for tolerations, for affinity or for topology spread constraints, and the Deployment sets none of them. Nothing in the chart keeps two replicas off the same node.
 
 ## The smoke test
 
