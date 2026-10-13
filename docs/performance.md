@@ -39,7 +39,7 @@ A result has these parts:
 | Meters | What the meters of each replica counted during the scenario: the scrape after it less the scrape before it. A run that kills a replica has no such part |
 | Sink | The requests that the sink received during the scenario, the `webhook-id`s among them and how many of those arrived more than once |
 
-The commit in a result is the one that the image of the replicas was built from, and `loadtest/run.sh` marks it when the service has changes that are not committed. The load tests themselves were added by the commit after it, which changes nothing of the service. A result does not say which state of the load tests wrote it, and it does not record the settings of the replicas: that they ran as they ship is what `loadtest/compose.yaml` says.
+The commit in a result is the one that the image of the replicas was built from, and `loadtest/run.sh` marks it when the service has changes that are not committed. The load tests themselves were added by the commit after it, which changes nothing of the service. Every result in `loadtest/results` was measured at commit `b735e65`, and the load tests were not run again after the changes that the service has had since. Those changes are: the expiry job repeats its statement while a run takes a full batch, an attempt connects to one address of its host only, a transaction whose commit fails on its connection counts as a transient failure, and a class was renamed. A result does not say which state of the load tests wrote it, and it does not record the settings of the replicas: that they ran as they ship is what `loadtest/compose.yaml` says.
 
 To run them again:
 
